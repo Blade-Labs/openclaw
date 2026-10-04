@@ -9,6 +9,10 @@ import { bindIngressLifecycleToReplyOptions } from "openclaw/plugin-sdk/channel-
 import { createChannelHistoryWindow, type HistoryEntry } from "openclaw/plugin-sdk/reply-history";
 import { sliceUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import type { RuntimeEnv } from "../../runtime-api.js";
+import {
+  isMSTeamsRequesterOnlyApprovals,
+  recordMSTeamsRequesterTurnRun,
+} from "../approval-requester.js";
 import { formatUnknownError } from "../errors.js";
 import type { MSTeamsMessageHandlerDeps } from "../monitor-handler.types.js";
 import { resolveMSTeamsAllowlistMatch, resolveMSTeamsReplyPolicy } from "../policy.js";
@@ -317,6 +321,23 @@ export async function dispatchMSTeamsInboundTurn(params: {
             ...replyOptions,
             ...(facts.turnAdoptionLifecycle
               ? bindIngressLifecycleToReplyOptions(facts.turnAdoptionLifecycle)
+              : {}),
+            ...(isDirectMessage && isMSTeamsRequesterOnlyApprovals(cfg)
+              ? {
+                  // Requester-only approvals: remember which runs this user's own 1:1 message
+                  // started, so approvals raised by those runs can be attributed to them.
+                  onAgentRunStart: (runId: string, ...rest: unknown[]) => {
+                    recordMSTeamsRequesterTurnRun({
+                      runId,
+                      sessionKey: route.sessionKey,
+                      aadObjectId: senderId,
+                    });
+                    const chained = (
+                      replyOptions as { onAgentRunStart?: (...args: unknown[]) => unknown }
+                    ).onAgentRunStart;
+                    return chained?.(runId, ...rest);
+                  },
+                }
               : {}),
           },
         }),

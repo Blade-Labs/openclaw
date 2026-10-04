@@ -18,6 +18,10 @@ export const msTeamsChannelConfigUiHints = {
     label: "MS Teams Service URL",
     help: "Bot Connector service URL for SDK proactive sends/edits/deletes. Set with cloud for USGov/DoD; set alone for GCC.",
   },
+  "approvals.requesterOnly": {
+    label: "MS Teams Requester-Only Approvals",
+    help: "Send native approval cards only to the person whose own 1:1 chat raised the request, and let only that person resolve them. Group, channel, scheduled, and unattributable requests get no Teams card, and Teams /approve text is refused (default: false).",
+  },
   graphMediaFallback: {
     label: "MS Teams Graph Media Fallback",
     help: "Query Microsoft Graph for unresolved channel or group-chat HTML media. Adds one lookup per matching message when enabled (default: false).",

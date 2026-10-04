@@ -106,6 +106,7 @@ function registerBinding(params: {
   decision?: ExecApprovalDecision;
   allowedDecisions?: readonly ExecApprovalDecision[];
   conversationId?: string;
+  requesterAadObjectId?: string;
 }): void {
   testTokens.add(params.token);
   msTeamsApprovalControls.register({
@@ -118,6 +119,7 @@ function registerBinding(params: {
     conversationId: params.conversationId ?? CONVERSATION_ID,
     activityId: ACTIVITY_ID,
     expiresAtMs: Date.now() + 60_000,
+    ...(params.requesterAadObjectId ? { requesterAadObjectId: params.requesterAadObjectId } : {}),
   });
 }
 
@@ -338,5 +340,150 @@ describe("maybeHandleMSTeamsApprovalCardSubmit", () => {
 
     await expect(maybeHandleMSTeamsApprovalCardSubmit({ context, deps })).resolves.toBe(true);
     expect(resolveApprovalOverGateway).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("maybeHandleMSTeamsApprovalCardSubmit with requester-only approvals", () => {
+  const REQUESTER_ID = APPROVER_ID;
+  const COLLEAGUE_ID = "99999999-2222-4333-8444-555555555555";
+
+  function createRequesterOnlyDeps(requesterOnly = true): MSTeamsMessageHandlerDeps {
+    return createMSTeamsMessageHandlerDeps({
+      cfg: {
+        channels: {
+          msteams: {
+            allowFrom: [REQUESTER_ID, COLLEAGUE_ID],
+            approvals: { requesterOnly },
+          },
+        },
+      },
+    });
+  }
+
+  beforeEach(() => {
+    resolveApprovalOverGateway
+      .mockReset()
+      .mockImplementation(
+        (params: {
+          approvalId: string;
+          approvalKind: ChannelApprovalKind;
+          decision: ExecApprovalDecision;
+        }) => Promise.resolve(createResolution(params)),
+      );
+  });
+
+  afterEach(() => {
+    msTeamsApprovalControls.unregister(Array.from(testTokens));
+    testTokens.clear();
+  });
+
+  it.each(["exec", "plugin", "system-agent"] as const)(
+    "rejects another approver's %s click without consuming the requester's card",
+    async (approvalKind) => {
+      const token = `requester-only-${approvalKind}`;
+      registerBinding({ token, approvalKind, requesterAadObjectId: REQUESTER_ID });
+      const deps = createRequesterOnlyDeps();
+
+      await expect(
+        maybeHandleMSTeamsApprovalCardSubmit({
+          context: createContext({ token, senderId: COLLEAGUE_ID }),
+          deps,
+        }),
+      ).resolves.toBe(true);
+      expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
+      expect(msTeamsApprovalControls.get(token)).not.toBeNull();
+      expect(deps.log.info).toHaveBeenCalledWith("msteams approval ignored", {
+        reason: `requester-only: actor ${COLLEAGUE_ID} is not the requester`,
+      });
+
+      await expect(
+        maybeHandleMSTeamsApprovalCardSubmit({
+          context: createContext({ token, senderId: REQUESTER_ID.toUpperCase() }),
+          deps,
+        }),
+      ).resolves.toBe(true);
+      // The requester check is the authorization; core channel custody is bypassed because it
+      // only knows the requestless roster.
+      expect(resolveApprovalOverGateway).toHaveBeenCalledWith({
+        cfg: deps.cfg,
+        approvalId: `approval-${token}`,
+        approvalKind,
+        decision: "allow-once",
+        clientDisplayName: `Microsoft Teams approval (${REQUESTER_ID.toUpperCase()})`,
+      });
+      expect(msTeamsApprovalControls.get(token)).toBeNull();
+    },
+  );
+
+  it("rejects another approver's sibling decision token while the requester's click settles", async () => {
+    registerBinding({ token: "sibling-allow", requesterAadObjectId: REQUESTER_ID });
+    registerBinding({
+      token: "sibling-deny",
+      decision: "deny",
+      requesterAadObjectId: REQUESTER_ID,
+    });
+    const deps = createRequesterOnlyDeps();
+
+    await Promise.all([
+      maybeHandleMSTeamsApprovalCardSubmit({
+        context: createContext({ token: "sibling-allow", senderId: REQUESTER_ID }),
+        deps,
+      }),
+      maybeHandleMSTeamsApprovalCardSubmit({
+        context: createContext({ token: "sibling-deny", senderId: COLLEAGUE_ID }),
+        deps,
+      }),
+    ]);
+
+    expect(resolveApprovalOverGateway).toHaveBeenCalledTimes(1);
+    expect(resolveApprovalOverGateway).toHaveBeenCalledWith(
+      expect.objectContaining({ decision: "allow-once" }),
+    );
+  });
+
+  it("rejects cards without a bound requester while the option is on", async () => {
+    const token = "requester-only-unbound";
+    registerBinding({ token });
+
+    await expect(
+      maybeHandleMSTeamsApprovalCardSubmit({
+        context: createContext({ token, senderId: REQUESTER_ID }),
+        deps: createRequesterOnlyDeps(),
+      }),
+    ).resolves.toBe(true);
+    expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
+    expect(msTeamsApprovalControls.get(token)).not.toBeNull();
+  });
+
+  it("keeps requester-bound cards requester-only after the option is turned off", async () => {
+    const token = "requester-only-sticky";
+    registerBinding({ token, requesterAadObjectId: REQUESTER_ID });
+    const deps = createRequesterOnlyDeps(false);
+
+    await maybeHandleMSTeamsApprovalCardSubmit({
+      context: createContext({ token, senderId: COLLEAGUE_ID }),
+      deps,
+    });
+    expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
+
+    await maybeHandleMSTeamsApprovalCardSubmit({
+      context: createContext({ token, senderId: REQUESTER_ID }),
+      deps,
+    });
+    expect(resolveApprovalOverGateway).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects the requester once they are removed from the approver roster", async () => {
+    const token = "requester-only-removed";
+    registerBinding({ token, requesterAadObjectId: REQUESTER_ID });
+
+    await maybeHandleMSTeamsApprovalCardSubmit({
+      context: createContext({ token, senderId: REQUESTER_ID }),
+      deps: createMSTeamsMessageHandlerDeps({
+        cfg: { channels: { msteams: { allowFrom: [], approvals: { requesterOnly: true } } } },
+      }),
+    });
+    expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
+    expect(msTeamsApprovalControls.get(token)).not.toBeNull();
   });
 });

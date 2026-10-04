@@ -24,7 +24,20 @@ vi.mock("./send.js", async () => ({
   sendMessageMSTeams,
 }));
 
+const storedConversations = vi.hoisted(
+  () => new Map<string, import("./conversation-store.js").StoredConversationReference>(),
+);
+
+vi.mock("./conversation-store-state.js", () => ({
+  createMSTeamsConversationStoreState: () => ({
+    get: async (conversationId: string) => storedConversations.get(conversationId) ?? null,
+    findPreferredDmByUserId: async () => null,
+  }),
+}));
+
 const { msTeamsApprovalNativeRuntime } = await import("./approval-handler.runtime.js");
+const { clearMSTeamsRequesterTurnRuns, recordMSTeamsRequesterTurnRun } =
+  await import("./approval-requester.js");
 
 const cfg: OpenClawConfig = {
   channels: {
@@ -449,5 +462,230 @@ describe("msTeamsApprovalNativeRuntime", () => {
       expect(msTeamsApprovalControls.get(token)).toBeNull();
     }
     msTeamsApprovalControls.unregister(binding);
+  });
+});
+
+describe("msTeamsApprovalNativeRuntime with requester-only approvals", () => {
+  const REQUESTER_ID = "00000000-0000-4000-8000-000000000001";
+  const COLLEAGUE_ID = "00000000-0000-4000-8000-000000000002";
+  const REQUESTER_CHAT = "a:1requester-chat";
+  const requesterOnlyCfg: OpenClawConfig = {
+    channels: {
+      msteams: {
+        ...cfg.channels?.msteams,
+        allowFrom: [REQUESTER_ID, COLLEAGUE_ID],
+        approvals: { requesterOnly: true },
+      },
+    },
+  };
+
+  async function createRequesterScenario(to = `conversation:${REQUESTER_CHAT}`) {
+    const view = createExecPendingView();
+    const base = createRequest(view) as ExecApprovalRequest;
+    const request: ExecApprovalRequest = {
+      ...base,
+      request: {
+        ...base.request,
+        runId: "run-1",
+        sessionKey: `agent:main:msteams:direct:${REQUESTER_ID}`,
+        turnSourceChannel: "msteams",
+        turnSourceTo: `conversation:${REQUESTER_CHAT}`,
+      },
+    };
+    const pendingPayload = await msTeamsApprovalNativeRuntime.presentation.buildPendingPayload({
+      cfg: requesterOnlyCfg,
+      accountId: "default",
+      request,
+      approvalKind: "exec",
+      nowMs: Date.now(),
+      view,
+    });
+    const plannedTarget = {
+      surface: "origin" as const,
+      target: { to, threadId: null },
+      reason: "preferred" as const,
+    };
+    const prepared = await msTeamsApprovalNativeRuntime.transport.prepareTarget({
+      cfg: requesterOnlyCfg,
+      accountId: "default",
+      plannedTarget,
+      request,
+      approvalKind: "exec",
+      view,
+      pendingPayload,
+    });
+    if (!prepared) {
+      throw new Error("Expected prepared Microsoft Teams approval target");
+    }
+    return { view, request, pendingPayload, plannedTarget, prepared };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearMSTeamsRequesterTurnRuns();
+    recordMSTeamsRequesterTurnRun({
+      runId: "run-1",
+      sessionKey: `agent:main:msteams:direct:${REQUESTER_ID}`,
+      aadObjectId: REQUESTER_ID,
+    });
+    storedConversations.clear();
+    storedConversations.set(REQUESTER_CHAT, {
+      aadObjectId: REQUESTER_ID,
+      user: { aadObjectId: REQUESTER_ID },
+      conversation: { id: REQUESTER_CHAT, conversationType: "personal" },
+    });
+    sendAdaptiveCardMSTeams.mockResolvedValue({
+      messageId: "approval-activity-1",
+      conversationId: REQUESTER_CHAT,
+    });
+  });
+
+  it("binds every card token to the requester", async () => {
+    const { view, request, pendingPayload, plannedTarget, prepared } =
+      await createRequesterScenario();
+    const entry = await msTeamsApprovalNativeRuntime.transport.deliverPending({
+      cfg: requesterOnlyCfg,
+      accountId: "default",
+      plannedTarget,
+      preparedTarget: prepared.target,
+      request,
+      approvalKind: "exec",
+      view,
+      pendingPayload,
+    });
+    expect(sendAdaptiveCardMSTeams).toHaveBeenCalledWith({
+      cfg: requesterOnlyCfg,
+      to: `conversation:${REQUESTER_CHAT}`,
+      card: pendingPayload.card,
+    });
+    expect(entry).toMatchObject({ requesterAadObjectId: REQUESTER_ID });
+    if (!entry) {
+      throw new Error("Expected delivered Microsoft Teams approval card");
+    }
+    const binding = await msTeamsApprovalNativeRuntime.interactions?.bindPending?.({
+      cfg: requesterOnlyCfg,
+      accountId: "default",
+      entry,
+      request,
+      approvalKind: "exec",
+      view,
+      pendingPayload,
+    });
+    expect(binding).toHaveLength(2);
+    for (const token of binding ?? []) {
+      expect(msTeamsApprovalControls.get(token)).toMatchObject({
+        requesterAadObjectId: REQUESTER_ID,
+      });
+    }
+    msTeamsApprovalControls.unregister(binding ?? []);
+  });
+
+  it.each([
+    { name: "a group chat", to: "conversation:19:team@thread.v2" },
+    { name: "a user alias", to: `user:${REQUESTER_ID}` },
+  ])("refuses to send to $name at the send boundary", async ({ to }) => {
+    const { view, request, pendingPayload, plannedTarget, prepared } =
+      await createRequesterScenario(to);
+    await expect(
+      msTeamsApprovalNativeRuntime.transport.deliverPending({
+        cfg: requesterOnlyCfg,
+        accountId: "default",
+        plannedTarget,
+        preparedTarget: prepared.target,
+        request,
+        approvalKind: "exec",
+        view,
+        pendingPayload,
+      }),
+    ).resolves.toBeNull();
+    expect(sendAdaptiveCardMSTeams).not.toHaveBeenCalled();
+  });
+
+  it("refuses to send into a personal chat owned by someone else", async () => {
+    storedConversations.set(REQUESTER_CHAT, {
+      aadObjectId: COLLEAGUE_ID,
+      conversation: { id: REQUESTER_CHAT, conversationType: "personal" },
+    });
+    const { view, request, pendingPayload, plannedTarget, prepared } =
+      await createRequesterScenario();
+    await expect(
+      msTeamsApprovalNativeRuntime.transport.deliverPending({
+        cfg: requesterOnlyCfg,
+        accountId: "default",
+        plannedTarget,
+        preparedTarget: prepared.target,
+        request,
+        approvalKind: "exec",
+        view,
+        pendingPayload,
+      }),
+    ).resolves.toBeNull();
+    expect(sendAdaptiveCardMSTeams).not.toHaveBeenCalled();
+  });
+
+  it("does not advertise /approve in the delivery-error fallback", async () => {
+    const { view, request, pendingPayload, plannedTarget } = await createRequesterScenario();
+    sendMessageMSTeams.mockResolvedValue({
+      messageId: "fallback-1",
+      conversationId: REQUESTER_CHAT,
+    });
+
+    msTeamsApprovalNativeRuntime.observe?.onDeliveryError?.({
+      cfg: requesterOnlyCfg,
+      accountId: "default",
+      error: new Error("card send failed"),
+      plannedTarget,
+      request,
+      approvalKind: "exec",
+      view,
+      pendingPayload,
+    });
+
+    await vi.waitFor(() => expect(sendMessageMSTeams).toHaveBeenCalledTimes(1));
+    const fallback = sendMessageMSTeams.mock.calls[0]?.[0];
+    expect(fallback?.to).toBe(`conversation:${REQUESTER_CHAT}`);
+    expect(fallback?.text).not.toContain("/approve");
+    expect(fallback?.text).toContain("has not been approved");
+  });
+});
+
+describe("msTeamsApprovalNativeRuntime requester-only delivery-error notices", () => {
+  const REQUESTER_ID = "00000000-0000-4000-8000-000000000001";
+  const requesterOnlyCfg: OpenClawConfig = {
+    channels: {
+      msteams: {
+        ...cfg.channels?.msteams,
+        allowFrom: [REQUESTER_ID],
+        approvals: { requesterOnly: true },
+      },
+    },
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearMSTeamsRequesterTurnRuns();
+    storedConversations.clear();
+  });
+
+  it("sends no notice when the destination cannot be re-verified", async () => {
+    const { view, request, pendingPayload } = await createPendingScenario();
+    msTeamsApprovalNativeRuntime.observe?.onDeliveryError?.({
+      cfg: requesterOnlyCfg,
+      accountId: "default",
+      error: new Error("card send failed"),
+      plannedTarget: {
+        surface: "origin",
+        target: { to: "conversation:19:team@thread.v2", threadId: null },
+        reason: "preferred",
+      },
+      request,
+      approvalKind: "exec",
+      view,
+      pendingPayload,
+    });
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20);
+    });
+    expect(sendMessageMSTeams).not.toHaveBeenCalled();
   });
 });

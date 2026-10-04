@@ -152,4 +152,12 @@ export type MSTeamsConfig = Omit<
     };
     /** Bot Framework OAuth SSO (signin/tokenExchange + signin/verifyState) settings. */
     sso?: MSTeamsSsoConfig;
+    /** Native approval card policy. */
+    approvals?: {
+      /**
+       * Deliver approval cards only to the user whose own 1:1 chat raised the request and let only
+       * that user resolve them. Unattributable requests get no Teams card. Default: false.
+       */
+      requesterOnly?: boolean;
+    };
   };

@@ -67,6 +67,31 @@ Enable the existing top-level approval forwarding settings for each approval typ
 
 No Teams-specific approval configuration is required. The existing `/approve <id> <decision>` command remains available as a text fallback when native delivery is unavailable. For forwarding modes and supported decisions, see [Approval forwarding to chat channels](/tools/exec-approvals-advanced#approval-forwarding-to-chat-channels).
 
+### Requester-only approvals
+
+By default every approver in `allowFrom`/`defaultTo` may resolve any Teams approval, and when the originating chat cannot be used the card is sent to every approver's DM. When `allowFrom` lists everyone who may chat with the bot, set:
+
+```json5
+{
+  channels: {
+    msteams: {
+      approvals: { requesterOnly: true },
+    },
+  },
+}
+```
+
+With `requesterOnly` enabled:
+
+- A card is sent only for requests raised in a user's own 1:1 chat with the bot (direct-peer `session.dmScope`: `per-channel-peer`, `per-account-channel-peer`, or `per-peer`). It goes only to that chat, after OpenClaw confirms the stored conversation is personal and belongs to that user. The card is never sent to other approvers.
+- Only that user can resolve the card. The user must also be listed in `allowFrom` or `defaultTo`, so this option narrows who can approve and never widens it. Clicks from anyone else are ignored and do not use up the card.
+- The request must come from an agent run that the user's own Teams message started. OpenClaw records which runs each 1:1 message starts, so runs started by scheduled jobs, heartbeats, or subagents never qualify, even in the user's own session.
+- Requests that cannot be tied to one user get no Teams card and no Teams text prompt. These include group chats, channels, scheduled jobs, subagents, `dmScope: "main"`, configured `session.identityLinks`, and a missing turn source. They wait for an operator (Control UI or CLI) or expire.
+- `/approve` typed in Teams is refused. Teams users cannot resolve an approval through gateway channel custody.
+- Operators can still resolve any approval from the Control UI or CLI.
+
+Turning `requesterOnly` off lowers the security policy for approvals that are still pending: roster members can use `/approve` on them again. Cards that were already sent stay limited to their requester. Let pending approvals finish or expire before you turn the option off.
+
 ## Polls (Adaptive Cards)
 
 OpenClaw sends Teams polls as Adaptive Cards (there is no native Teams poll API).

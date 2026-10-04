@@ -7,6 +7,10 @@ import {
   readMSTeamsApprovalActionToken,
 } from "./approval-card-actions.js";
 import { buildMSTeamsCanonicalApprovalTerminalCard } from "./approval-card.js";
+import {
+  isMSTeamsApprovalRequesterSender,
+  isMSTeamsRequesterOnlyApprovals,
+} from "./approval-requester.js";
 import { normalizeMSTeamsConversationId } from "./inbound.js";
 import type { MSTeamsMessageHandlerDeps } from "./monitor-handler.types.js";
 import type { MSTeamsTurnContext } from "./sdk-types.js";
@@ -64,16 +68,34 @@ export async function maybeHandleMSTeamsApprovalCardSubmit(params: {
   }
 
   const senderId = context.activity.from?.aadObjectId;
-  const authorization = msTeamsApprovalAuth.authorizeActorAction?.({
-    cfg: deps.cfg,
-    accountId: DEFAULT_ACCOUNT_ID,
-    senderId,
-    action: "approve",
-    approvalKind: binding.approvalKind,
-  });
-  if (!authorization?.authorized) {
-    ignored(`unauthorized actor ${senderId || "unknown"}`);
-    return true;
+  // Requester-only binds the card to the user whose own turn raised it. Enforce it while the option
+  // is on, and for any card minted with a requester even if the option was turned off since.
+  const requesterOnly =
+    isMSTeamsRequesterOnlyApprovals(deps.cfg) || binding.requesterAadObjectId !== undefined;
+  if (requesterOnly) {
+    // Checked before settle(): a non-requester can neither resolve nor consume the token.
+    if (
+      !isMSTeamsApprovalRequesterSender({
+        cfg: deps.cfg,
+        requesterAadObjectId: binding.requesterAadObjectId,
+        senderId,
+      })
+    ) {
+      ignored(`requester-only: actor ${senderId || "unknown"} is not the requester`);
+      return true;
+    }
+  } else {
+    const authorization = msTeamsApprovalAuth.authorizeActorAction?.({
+      cfg: deps.cfg,
+      accountId: DEFAULT_ACCOUNT_ID,
+      senderId,
+      action: "approve",
+      approvalKind: binding.approvalKind,
+    });
+    if (!authorization?.authorized) {
+      ignored(`unauthorized actor ${senderId || "unknown"}`);
+      return true;
+    }
   }
 
   const outcome = await msTeamsApprovalControls.settle(token, async (consumed) => {
@@ -82,9 +104,12 @@ export async function maybeHandleMSTeamsApprovalCardSubmit(params: {
       approvalId: consumed.approvalId,
       approvalKind: consumed.approvalKind,
       decision: consumed.decision,
-      channel: "msteams",
-      accountId: DEFAULT_ACCOUNT_ID,
-      senderId,
+      // Requester-only: core channel custody re-checks only the requestless roster (which
+      // requester-only denies for every Teams identity), so the requester check above is the
+      // authorization and the plugin resolves as the operator approvals client.
+      ...(requesterOnly
+        ? { clientDisplayName: `Microsoft Teams approval (${senderId})` }
+        : { channel: "msteams", accountId: DEFAULT_ACCOUNT_ID, senderId }),
     });
     await context.updateActivity({
       type: "message",

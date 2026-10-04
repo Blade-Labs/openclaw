@@ -13,6 +13,12 @@ import {
   isMSTeamsNativeApprovalClientEnabled,
   shouldHandleMSTeamsNativeApprovalRequest,
 } from "./approval-native.js";
+import {
+  isMSTeamsRequesterDeliveryTarget,
+  isMSTeamsRequesterOnlyApprovals,
+  resolveMSTeamsApprovalRequester,
+} from "./approval-requester.js";
+import { createMSTeamsConversationStoreState } from "./conversation-store-state.js";
 import { extractMSTeamsConversationMessageId } from "./inbound.js";
 import { normalizeMSTeamsMessagingTarget } from "./resolve-allowlist.js";
 import { editAdaptiveCardMSTeams, sendAdaptiveCardMSTeams, sendMessageMSTeams } from "./send.js";
@@ -27,6 +33,8 @@ type MSTeamsPendingEntry = {
   conversationId: string;
   activityId: string;
   actionTokens: readonly MSTeamsApprovalActionToken[];
+  /** Requester-only: the only Entra object id allowed to act on this card. */
+  requesterAadObjectId?: string;
 };
 
 export const msTeamsApprovalNativeRuntime = createChannelApprovalNativeRuntimeAdapter<
@@ -74,7 +82,26 @@ export const msTeamsApprovalNativeRuntime = createChannelApprovalNativeRuntimeAd
         target: { to },
       };
     },
-    deliverPending: async ({ cfg, accountId, preparedTarget, pendingPayload }) => {
+    deliverPending: async ({ cfg, accountId, preparedTarget, pendingPayload, request }) => {
+      let requesterAadObjectId: string | undefined;
+      if (isMSTeamsRequesterOnlyApprovals(cfg)) {
+        // Send boundary: deliver only into the requester's own, store-verified personal chat.
+        const requester = resolveMSTeamsApprovalRequester({ cfg, request });
+        if (
+          !requester ||
+          !(await isMSTeamsRequesterDeliveryTarget({
+            to: preparedTarget.to,
+            aadObjectId: requester.aadObjectId,
+            store: createMSTeamsConversationStoreState(),
+          }))
+        ) {
+          log.warn(
+            `msteams approvals: requester-only refused delivery of ${request.id} to an unverified target`,
+          );
+          return null;
+        }
+        requesterAadObjectId = requester.aadObjectId;
+      }
       const sent = await sendAdaptiveCardMSTeams({
         cfg,
         to: preparedTarget.to,
@@ -88,6 +115,7 @@ export const msTeamsApprovalNativeRuntime = createChannelApprovalNativeRuntimeAd
         conversationId: sent.conversationId,
         activityId: sent.messageId,
         actionTokens: pendingPayload.actionTokens,
+        ...(requesterAadObjectId ? { requesterAadObjectId } : {}),
       };
     },
     updateEntry: async ({ cfg, entry, payload }) => {
@@ -114,6 +142,9 @@ export const msTeamsApprovalNativeRuntime = createChannelApprovalNativeRuntimeAd
             conversationId: entry.conversationId,
             activityId: entry.activityId,
             expiresAtMs: view.expiresAtMs,
+            ...(entry.requesterAadObjectId
+              ? { requesterAadObjectId: entry.requesterAadObjectId }
+              : {}),
           })
         ) {
           tokens.push(actionToken.token);
@@ -132,6 +163,36 @@ export const msTeamsApprovalNativeRuntime = createChannelApprovalNativeRuntimeAd
       // card send must still surface a visible approval path (#130040 tracks
       // the shared-boundary fix); losing both prompts is a silent failure.
       const decisions = pendingPayload.allowedDecisions.join("|");
+      if (isMSTeamsRequesterOnlyApprovals(cfg)) {
+        // Requester-only disables Teams text approval, so do not advertise /approve, and only
+        // notify a destination that is still provably the requester's own personal chat.
+        void (async () => {
+          const requester = resolveMSTeamsApprovalRequester({ cfg, request });
+          if (
+            !requester ||
+            !(await isMSTeamsRequesterDeliveryTarget({
+              to: plannedTarget.target.to,
+              aadObjectId: requester.aadObjectId,
+              store: createMSTeamsConversationStoreState(),
+            }))
+          ) {
+            log.warn(
+              `msteams approvals: requester-only skipped the fallback notice for ${request.id}`,
+            );
+            return;
+          }
+          await sendMessageMSTeams({
+            cfg,
+            to: plannedTarget.target.to,
+            text: `⚠️ Could not deliver the ${approvalKind} approval card for ${request.id}. It has not been approved; ask again or have an operator resolve it.`,
+          });
+        })().catch((fallbackError: unknown) => {
+          log.error(
+            `msteams approvals: fallback notice for ${request.id} failed: ${String(fallbackError)}`,
+          );
+        });
+        return;
+      }
       void sendMessageMSTeams({
         cfg,
         to: plannedTarget.target.to,

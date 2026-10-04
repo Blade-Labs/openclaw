@@ -139,6 +139,12 @@ export const MSTeamsConfigSchema = z
       })
       .strict()
       .optional(),
+    approvals: z
+      .object({
+        requesterOnly: z.boolean().optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
   .superRefine((value, ctx) => {

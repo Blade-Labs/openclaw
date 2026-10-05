@@ -36,8 +36,6 @@ vi.mock("./conversation-store-state.js", () => ({
 }));
 
 const { msTeamsApprovalNativeRuntime } = await import("./approval-handler.runtime.js");
-const { clearMSTeamsRequesterTurnRuns, recordMSTeamsRequesterTurnRun } =
-  await import("./approval-requester.js");
 
 const cfg: OpenClawConfig = {
   channels: {
@@ -486,10 +484,61 @@ describe("msTeamsApprovalNativeRuntime with requester-only approvals", () => {
       ...base,
       request: {
         ...base.request,
-        runId: "run-1",
-        sessionKey: `agent:main:msteams:direct:${REQUESTER_ID}`,
+        runId: "queued-follow-up",
+        sessionKey: "agent:main:main",
         turnSourceChannel: "msteams",
         turnSourceTo: `conversation:${REQUESTER_CHAT}`,
+        authorization: {
+          version: 1,
+          source: {
+            version: 1,
+            runId: "queued-follow-up",
+            sessionKey: "agent:main:main",
+            revision: 1,
+            completeness: "complete",
+            inputs: [
+              {
+                inputId: "queued-input",
+                origin: "user",
+                actor: {
+                  channel: "msteams",
+                  accountId: "default",
+                  senderId: REQUESTER_ID,
+                  actorKind: "human",
+                },
+                message: {
+                  messageId: "follow-up-message",
+                  conversationId: REQUESTER_CHAT,
+                  conversationKind: "direct",
+                  eventKind: "message",
+                },
+              },
+            ],
+          },
+          requesterBinding: {
+            state: "bound",
+            inputOrigin: "user",
+            channel: "msteams",
+            accountId: "default",
+            senderId: REQUESTER_ID,
+            runId: "queued-follow-up",
+            sessionKey: "agent:main:main",
+            sourceRevision: 1,
+            sources: [
+              {
+                messageId: "follow-up-message",
+                conversationId: REQUESTER_CHAT,
+                conversationKind: "direct",
+                eventKind: "message",
+              },
+            ],
+          },
+          policy: {
+            requireResolverMatch: true,
+            delivery: "requester",
+            allowedDecisions: ["allow-once", "deny"],
+          },
+        },
       },
     };
     const pendingPayload = await msTeamsApprovalNativeRuntime.presentation.buildPendingPayload({
@@ -522,12 +571,6 @@ describe("msTeamsApprovalNativeRuntime with requester-only approvals", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    clearMSTeamsRequesterTurnRuns();
-    recordMSTeamsRequesterTurnRun({
-      runId: "run-1",
-      sessionKey: `agent:main:msteams:direct:${REQUESTER_ID}`,
-      aadObjectId: REQUESTER_ID,
-    });
     storedConversations.clear();
     storedConversations.set(REQUESTER_CHAT, {
       aadObjectId: REQUESTER_ID,
@@ -540,7 +583,7 @@ describe("msTeamsApprovalNativeRuntime with requester-only approvals", () => {
     });
   });
 
-  it("binds every card token to the requester", async () => {
+  it("delivers a queued follow-up card from the core binding and binds its controls", async () => {
     const { view, request, pendingPayload, plannedTarget, prepared } =
       await createRequesterScenario();
     const entry = await msTeamsApprovalNativeRuntime.transport.deliverPending({
@@ -558,7 +601,7 @@ describe("msTeamsApprovalNativeRuntime with requester-only approvals", () => {
       to: `conversation:${REQUESTER_CHAT}`,
       card: pendingPayload.card,
     });
-    expect(entry).toMatchObject({ requesterAadObjectId: REQUESTER_ID });
+    expect(entry).toMatchObject({ requesterOnly: true });
     if (!entry) {
       throw new Error("Expected delivered Microsoft Teams approval card");
     }
@@ -574,7 +617,8 @@ describe("msTeamsApprovalNativeRuntime with requester-only approvals", () => {
     expect(binding).toHaveLength(2);
     for (const token of binding ?? []) {
       expect(msTeamsApprovalControls.get(token)).toMatchObject({
-        requesterAadObjectId: REQUESTER_ID,
+        approvalId: request.id,
+        requesterOnly: true,
       });
     }
     msTeamsApprovalControls.unregister(binding ?? []);
@@ -623,29 +667,75 @@ describe("msTeamsApprovalNativeRuntime with requester-only approvals", () => {
     expect(sendAdaptiveCardMSTeams).not.toHaveBeenCalled();
   });
 
-  it("does not advertise /approve in the delivery-error fallback", async () => {
-    const { view, request, pendingPayload, plannedTarget } = await createRequesterScenario();
-    sendMessageMSTeams.mockResolvedValue({
-      messageId: "fallback-1",
-      conversationId: REQUESTER_CHAT,
-    });
-
-    msTeamsApprovalNativeRuntime.observe?.onDeliveryError?.({
-      cfg: requesterOnlyCfg,
+  it("rechecks the live roster after awaiting personal-chat ownership", async () => {
+    const { view, request, pendingPayload, plannedTarget, prepared } =
+      await createRequesterScenario();
+    const currentTeams = { ...requesterOnlyCfg.channels?.msteams };
+    const currentCfg: OpenClawConfig = { channels: { msteams: currentTeams } };
+    const delivery = msTeamsApprovalNativeRuntime.transport.deliverPending({
+      cfg: currentCfg,
       accountId: "default",
-      error: new Error("card send failed"),
       plannedTarget,
+      preparedTarget: prepared.target,
       request,
       approvalKind: "exec",
       view,
       pendingPayload,
     });
+    currentTeams.allowFrom = [COLLEAGUE_ID];
+    await expect(delivery).resolves.toBeNull();
+    expect(sendAdaptiveCardMSTeams).not.toHaveBeenCalled();
+  });
 
-    await vi.waitFor(() => expect(sendMessageMSTeams).toHaveBeenCalledTimes(1));
-    const fallback = sendMessageMSTeams.mock.calls[0]?.[0];
-    expect(fallback?.to).toBe(`conversation:${REQUESTER_CHAT}`);
-    expect(fallback?.text).not.toContain("/approve");
-    expect(fallback?.text).toContain("has not been approved");
+  it("leaves a failed strict card's blocked notice to core, including repeated callbacks", async () => {
+    const { view, request, pendingPayload, plannedTarget, prepared } =
+      await createRequesterScenario();
+    const deliveryError = {
+      cfg: requesterOnlyCfg,
+      accountId: "default",
+      error: new Error("card send failed"),
+      plannedTarget,
+      request,
+      approvalKind: "exec" as const,
+      view,
+      pendingPayload,
+    };
+    sendAdaptiveCardMSTeams.mockRejectedValueOnce(deliveryError.error);
+    await expect(
+      msTeamsApprovalNativeRuntime.transport.deliverPending({
+        ...deliveryError,
+        preparedTarget: prepared.target,
+      }),
+    ).rejects.toThrow("card send failed");
+    msTeamsApprovalNativeRuntime.observe?.onDeliveryError?.(deliveryError);
+    msTeamsApprovalNativeRuntime.observe?.onDeliveryError?.(deliveryError);
+    expect(sendMessageMSTeams).not.toHaveBeenCalled();
+  });
+
+  it("keeps stamped delivery private when the option is disabled", async () => {
+    const { view, request, pendingPayload, prepared } = await createRequesterScenario();
+    const optionOffCfg: OpenClawConfig = {
+      channels: {
+        msteams: { ...requesterOnlyCfg.channels?.msteams, approvals: { requesterOnly: false } },
+      },
+    };
+    await expect(
+      msTeamsApprovalNativeRuntime.transport.deliverPending({
+        cfg: optionOffCfg,
+        accountId: "default",
+        plannedTarget: {
+          surface: "approver-dm",
+          target: { to: `user:${COLLEAGUE_ID}` },
+          reason: "preferred",
+        },
+        preparedTarget: { ...prepared.target, to: `user:${COLLEAGUE_ID}` },
+        request,
+        approvalKind: "exec",
+        view,
+        pendingPayload,
+      }),
+    ).resolves.toBeNull();
+    expect(sendAdaptiveCardMSTeams).not.toHaveBeenCalled();
   });
 });
 
@@ -663,7 +753,6 @@ describe("msTeamsApprovalNativeRuntime requester-only delivery-error notices", (
 
   beforeEach(() => {
     vi.clearAllMocks();
-    clearMSTeamsRequesterTurnRuns();
     storedConversations.clear();
   });
 
@@ -682,9 +771,6 @@ describe("msTeamsApprovalNativeRuntime requester-only delivery-error notices", (
       approvalKind: "exec",
       view,
       pendingPayload,
-    });
-    await new Promise((resolve) => {
-      setTimeout(resolve, 20);
     });
     expect(sendMessageMSTeams).not.toHaveBeenCalled();
   });

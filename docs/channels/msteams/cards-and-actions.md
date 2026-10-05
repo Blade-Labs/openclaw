@@ -83,14 +83,16 @@ By default every approver in `allowFrom`/`defaultTo` may resolve any Teams appro
 
 With `requesterOnly` enabled:
 
-- A card is sent only for requests raised in a user's own 1:1 chat with the bot (direct-peer `session.dmScope`: `per-channel-peer`, `per-account-channel-peer`, or `per-peer`). It goes only to that chat, after OpenClaw confirms the stored conversation is personal and belongs to that user. The card is never sent to other approvers.
-- Only that user can resolve the card. The user must also be listed in `allowFrom` or `defaultTo`, so this option narrows who can approve and never widens it. Clicks from anyone else are ignored and do not use up the card.
-- The request must come from an agent run that the user's own Teams message started. OpenClaw records which runs each 1:1 message starts, so runs started by scheduled jobs, heartbeats, or subagents never qualify, even in the user's own session.
-- Requests that cannot be tied to one user get no Teams card and no Teams text prompt. These include group chats, channels, scheduled jobs, subagents, `dmScope: "main"`, configured `session.identityLinks`, and a missing turn source. They wait for an operator (Control UI or CLI) or expire.
-- `/approve` typed in Teams is refused. Teams users cannot resolve an approval through gateway channel custody.
-- Operators can still resolve any approval from the Control UI or CLI.
+- Core binds each approval to the authenticated user messages admitted to its run. Delivery requires one verified human Teams requester on the default account, a valid Entra object ID, and personal-message source scope. Session routing, `dmScope`, and `session.identityLinks` do not establish requester identity.
+- The requester must be explicitly listed in `allowFrom` or `defaultTo`; an empty approver roster denies. OpenClaw checks current membership again when the user resolves the request.
+- The card goes only to that requester's verified personal chat. OpenClaw prefers the source conversation when its stored owner still matches, then checks that same user's stored personal DM. It never tries another approver or destination.
+- Only the authenticated requester can choose **Approve once** or **Deny**, using the card or `/approve <id> <decision>`. Every resolution path applies the same core check. Another user's rejected click leaves the card usable by its requester. Operators, administrators, Control UI, CLI, and RPC clients cannot override this policy.
+- Queued follow-up turns keep their admitted source and can receive cards. Collected messages qualify only when all inputs are user messages from the same authenticated requester. Under strict policy, steering becomes a FIFO follow-up turn instead of changing the running requester's inputs.
+- Mixed, missing, unverified, or non-user sources fail closed, as do group/channel sources and unverifiable personal-chat destinations. No action is approved and approval details are not forwarded elsewhere. When OpenClaw can verify one personal-chat recipient from the admitted source, core sends a brief blocked-request notice asking the user to submit a new request there. If there is no unique verified chat or notice delivery fails, OpenClaw records that outcome and sends nothing to other recipients.
 
-Turning `requesterOnly` off lowers the security policy for approvals that are still pending: roster members can use `/approve` on them again. Cards that were already sent stay limited to their requester. Let pending approvals finish or expire before you turn the option off.
+Already stamped requester-only requests and policies latched to admitted runs remain strict after you turn the option off. Requests without a previously latched strict policy use the current option; with it off, existing default delivery and resolution behavior applies.
+
+This option requires a matching OpenClaw core and Teams plugin version with core requester binding and authenticated channel approval resolution. Updating the Teams plugin alone on an older core is insufficient.
 
 ## Polls (Adaptive Cards)
 

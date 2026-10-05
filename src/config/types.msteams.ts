@@ -152,11 +152,14 @@ export type MSTeamsConfig = Omit<
     };
     /** Bot Framework OAuth SSO (signin/tokenExchange + signin/verifyState) settings. */
     sso?: MSTeamsSsoConfig;
-    /** Native approval card policy. */
+    /** Approval delivery and resolution policy. */
     approvals?: {
       /**
-       * Deliver approval cards only to the user whose own 1:1 chat raised the request and let only
-       * that user resolve them. Unattributable requests get no Teams card. Default: false.
+       * Bind approval delivery and every resolution path, including cards and /approve, to the
+       * verified personal-message requester on the default account. Requires explicit approver
+       * membership and a matching OpenClaw core; operators cannot override. Unverifiable requests
+       * fail closed with a notice when a personal chat is verified. Stamped requests remain strict
+       * after disabling this option. Default: false.
        */
       requesterOnly?: boolean;
     };

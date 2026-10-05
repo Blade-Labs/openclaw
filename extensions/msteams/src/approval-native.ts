@@ -11,6 +11,7 @@ import {
   shouldSuppressLocalNativeExecApprovalPrompt,
 } from "openclaw/plugin-sdk/approval-native-runtime";
 import type {
+  ChannelApprovalResolutionRuntimeV2,
   ExecApprovalRequest,
   PluginApprovalRequest,
   SystemAgentApprovalRequest,
@@ -27,12 +28,15 @@ import { getMSTeamsApprovalApprovers, msTeamsApprovalAuth } from "./approval-aut
 import {
   classifyMSTeamsApprovalRequester,
   isMSTeamsRequesterOnlyApprovals,
+  isMSTeamsRequesterOnlyRequest,
+  resolveMSTeamsApprovalNoticeRequester,
   resolveMSTeamsApprovalRequester,
   verifyMSTeamsRequesterConversation,
 } from "./approval-requester.js";
 import { msteamsConfigAdapter, resolveMSTeamsAccount } from "./channel-config.js";
 import { createMSTeamsConversationStoreState } from "./conversation-store-state.js";
 import { normalizeMSTeamsMessagingTarget } from "./resolve-allowlist.js";
+import { getOptionalMSTeamsRuntime } from "./runtime.js";
 
 const log = createSubsystemLogger("msteams/approvals");
 
@@ -85,6 +89,10 @@ export function isMSTeamsNativeApprovalClientEnabled(params: {
   cfg: OpenClawConfig;
   accountId?: string | null;
 }): boolean {
+  // Blocked requests still need a registered personal-chat notice route without approvers.
+  if (isMSTeamsRequesterOnlyApprovals(params.cfg)) {
+    return isMSTeamsApprovalTransportEnabled(params);
+  }
   return (
     msTeamsApprovalRouteGates.canAnyApprovalPotentiallyRouteToChannel({
       ...params,
@@ -112,12 +120,9 @@ export function shouldHandleMSTeamsNativeApprovalRequest(params: {
   approvalKind?: ChannelApprovalKind;
   request: MSTeamsApprovalRequest;
 }): boolean {
-  return (
-    shouldHandleMSTeamsApprovalRoute(params) &&
-    // Requester-only: handle only requests raised by one identifiable user's own 1:1 turn.
-    (!isMSTeamsRequesterOnlyApprovals(params.cfg) ||
-      resolveMSTeamsApprovalRequester({ cfg: params.cfg, request: params.request }) !== null)
-  );
+  return isMSTeamsRequesterOnlyRequest(params.cfg, params.request)
+    ? isMSTeamsApprovalTransportEnabled(params) && resolveMSTeamsApprovalRequester(params) !== null
+    : shouldHandleMSTeamsApprovalRoute(params);
 }
 
 export function shouldSuppressLocalMSTeamsExecApprovalPrompt(params: {
@@ -126,8 +131,7 @@ export function shouldSuppressLocalMSTeamsExecApprovalPrompt(params: {
   payload: ReplyPayload;
   hint?: ChannelOutboundPayloadHint;
 }): boolean {
-  // Requester-only: text approval is not a Teams resolution path, so an approval-pending text
-  // prompt would only disclose the request; never post it into a Teams chat.
+  // Generic pending prompts do not establish the verified private requester destination.
   if (isMSTeamsRequesterOnlyApprovals(params.cfg) && getExecApprovalReplyMetadata(params.payload)) {
     return true;
   }
@@ -152,7 +156,7 @@ type MSTeamsOriginTargetParams = Parameters<typeof resolveMSTeamsTurnSourceOrigi
  * (explicit personal type and owner AAD id). Never a group/channel or another user's chat.
  */
 async function resolveMSTeamsRequesterOriginTarget(params: MSTeamsOriginTargetParams) {
-  if (!shouldHandleMSTeamsApprovalRoute(params)) {
+  if (!isMSTeamsApprovalTransportEnabled(params)) {
     return null;
   }
   const classified = classifyMSTeamsApprovalRequester({
@@ -169,7 +173,7 @@ async function resolveMSTeamsRequesterOriginTarget(params: MSTeamsOriginTargetPa
     requester: classified.requester,
     store: createMSTeamsConversationStoreState(),
   });
-  if (!conversationId) {
+  if (!conversationId || !resolveMSTeamsApprovalRequester(params)) {
     log.info(
       `msteams approvals: requester-only withheld the card for ${params.request.id} (no verified personal chat)`,
     );
@@ -177,13 +181,13 @@ async function resolveMSTeamsRequesterOriginTarget(params: MSTeamsOriginTargetPa
   }
   return {
     to: `conversation:${conversationId}`,
-    accountId: normalizeOptionalString(params.accountId),
+    accountId: DEFAULT_ACCOUNT_ID,
     threadId: null,
   };
 }
 
 function resolveMSTeamsOriginTarget(params: MSTeamsOriginTargetParams) {
-  return isMSTeamsRequesterOnlyApprovals(params.cfg)
+  return isMSTeamsRequesterOnlyRequest(params.cfg, params.request)
     ? resolveMSTeamsRequesterOriginTarget(params)
     : resolveMSTeamsTurnSourceOriginTarget(params);
 }
@@ -211,7 +215,9 @@ const resolveMSTeamsAllApproverDmTargets = createChannelApproverDmTargetResolver
 
 // Requester-only never fans a card out to the approver roster, not even as a fallback.
 const resolveMSTeamsApproverDmTargets: typeof resolveMSTeamsAllApproverDmTargets = (params) =>
-  isMSTeamsRequesterOnlyApprovals(params.cfg) ? [] : resolveMSTeamsAllApproverDmTargets(params);
+  isMSTeamsRequesterOnlyRequest(params.cfg, params.request)
+    ? []
+    : resolveMSTeamsAllApproverDmTargets(params);
 
 const msTeamsNativeApprovalCapability = createApproverRestrictedNativeApprovalCapability({
   channel: "msteams",
@@ -247,33 +253,96 @@ const msTeamsNativeApprovalCapability = createApproverRestrictedNativeApprovalCa
   nativeRuntime: msTeamsLazyApprovalNativeRuntime,
 });
 
-const MSTEAMS_REQUESTER_ONLY_DENIAL =
-  "❌ Microsoft Teams approvals are requester-only here: use the approval card sent to the person who asked.";
-
 const msTeamsNativeDelivery = msTeamsNativeApprovalCapability.delivery;
+const msTeamsNativeAdapter = msTeamsNativeApprovalCapability.native;
 
 export const msTeamsApprovalCapability: ChannelApprovalCapability = {
   ...msTeamsNativeApprovalCapability,
-  // Preserve implicit same-chat authorization when no explicit approvers exist.
-  // Requester-only: core's actor check carries no approval request, so it cannot tell the
-  // requester from any other approver. Deny every Teams identity there; the plugin's own card
-  // submit handler enforces requester == clicker and resolves without channel custody.
-  authorizeActorAction: (params) =>
-    isMSTeamsRequesterOnlyApprovals(params.cfg)
-      ? { authorized: false, reason: MSTEAMS_REQUESTER_ONLY_DENIAL }
-      : msTeamsApprovalAuth.authorizeActorAction?.(params),
-  resolveApproveCommandBehavior: ({ cfg }) =>
+  resolveRequestPolicy: ({ cfg }) =>
     isMSTeamsRequesterOnlyApprovals(cfg)
-      ? { kind: "reply", text: MSTEAMS_REQUESTER_ONLY_DENIAL }
+      ? {
+          requireResolverMatch: true,
+          delivery: "requester",
+          allowedDecisions: ["allow-once", "deny"],
+        }
       : undefined,
+  // Core enforces requester equality on the authenticated actor; Teams owns live roster policy.
+  authorizeActorAction: (params) => {
+    const strict =
+      isMSTeamsRequesterOnlyApprovals(params.cfg) ||
+      params.authorization?.policy.requireResolverMatch === true;
+    if (
+      strict &&
+      (getMSTeamsApprovalApprovers(params).length === 0 ||
+        (params.accountId != null && params.accountId !== DEFAULT_ACCOUNT_ID))
+    ) {
+      return {
+        authorized: false,
+        reason:
+          "Microsoft Teams requester approvals require an explicit approver roster on the default account.",
+      };
+    }
+    if (
+      strict &&
+      !params.authorization &&
+      getOptionalMSTeamsRuntime()?.channel.runtimeContexts?.get<ChannelApprovalResolutionRuntimeV2>(
+        {
+          channelId: "msteams",
+          accountId: DEFAULT_ACCOUNT_ID,
+          capability: "approval.gateway",
+        },
+      )?.version !== 2
+    ) {
+      return {
+        authorized: false,
+        reason:
+          "Microsoft Teams requester approvals require a matching OpenClaw core version. Upgrade the core and Teams plugin together, then restart the channel.",
+      };
+    }
+    if (
+      strict &&
+      params.authorization &&
+      !classifyMSTeamsApprovalRequester({
+        cfg: params.cfg,
+        authorization: params.authorization,
+      }).ok
+    ) {
+      return {
+        authorized: false,
+        reason: "Microsoft Teams requester approvals require a bound personal-message source.",
+      };
+    }
+    return msTeamsApprovalAuth.authorizeActorAction?.(params) ?? { authorized: false };
+  },
+  ...(msTeamsNativeAdapter
+    ? {
+        native: {
+          ...msTeamsNativeAdapter,
+          resolveRequesterTarget: resolveMSTeamsRequesterOriginTarget,
+          resolveRequesterNoticeTarget: async (params) => {
+            if (!isMSTeamsApprovalTransportEnabled(params)) {
+              return null;
+            }
+            const requester = resolveMSTeamsApprovalNoticeRequester(params.request);
+            if (!requester) {
+              return null;
+            }
+            const conversationId = await verifyMSTeamsRequesterConversation({
+              requester,
+              store: createMSTeamsConversationStoreState(),
+            });
+            return conversationId ? { to: `conversation:${conversationId}`, threadId: null } : null;
+          },
+        },
+      }
+    : {}),
   ...(msTeamsNativeDelivery
     ? {
         delivery: {
           ...msTeamsNativeDelivery,
-          // Requester-only: generic text forwarding into any Teams chat would disclose the
-          // request to everyone in it, and Teams text approval is disabled; suppress it.
+          // Generic forwarding does not prove the requester's private destination.
           shouldSuppressForwardingFallback: (input) =>
-            isMSTeamsRequesterOnlyApprovals(input.cfg) &&
+            isMSTeamsRequesterOnlyRequest(input.cfg, input.request) &&
             normalizeOptionalString(input.target.channel)?.toLowerCase() === "msteams"
               ? true
               : (msTeamsNativeDelivery.shouldSuppressForwardingFallback?.(input) ?? false),

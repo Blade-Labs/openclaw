@@ -20,7 +20,7 @@ export const msTeamsChannelConfigUiHints = {
   },
   "approvals.requesterOnly": {
     label: "MS Teams Requester-Only Approvals",
-    help: "Send native approval cards only to the person whose own 1:1 chat raised the request, and let only that person resolve them. Group, channel, scheduled, and unattributable requests get no Teams card, and Teams /approve text is refused (default: false).",
+    help: "Bind approval delivery and every resolution path to the verified requester of personal Teams messages on the default account. Requires explicit approver membership and a matching OpenClaw core. Cards and /approve allow only that requester; operators cannot override. Unverifiable requests are denied with a notice when a personal chat is verified. Pending requests stay strict if disabled (default: false).",
   },
   graphMediaFallback: {
     label: "MS Teams Graph Media Fallback",

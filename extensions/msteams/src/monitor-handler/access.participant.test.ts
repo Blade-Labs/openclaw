@@ -1,9 +1,39 @@
 import { describe, expect, it, vi } from "vitest";
+import { markMSTeamsReplayedActivity } from "../inbound.js";
 import { installMSTeamsTestRuntime } from "../monitor-handler.test-helpers.js";
 import { getMSTeamsRuntime } from "../runtime.js";
 import { resolveMSTeamsSenderAccess } from "./access.js";
 
 describe("Teams participant domain", () => {
+  it.each(["human", "bot", "replay"] as const)(
+    "projects authenticated source kind for %s",
+    async (kind) => {
+      installMSTeamsTestRuntime({ readAllowFromStore: vi.fn(async () => []) });
+      const observed = vi.spyOn(getMSTeamsRuntime().channel.inbound.ingress, "resolveStable");
+      const activity = {
+        type: "message",
+        id: "synthetic-message",
+        channelId: "msteams",
+        from: {
+          id: "synthetic-account",
+          aadObjectId: "11111111-1111-4111-8111-111111111111",
+          ...(kind === "bot" ? { role: "bot" } : {}),
+        },
+        conversation: { id: "synthetic-dm", conversationType: "personal" },
+      };
+      if (kind === "replay") {
+        markMSTeamsReplayedActivity(activity);
+      }
+      await resolveMSTeamsSenderAccess({
+        cfg: { channels: { msteams: { dmPolicy: "open" } } },
+        activity,
+      });
+      expect(observed.mock.lastCall?.[0].source).toMatchObject({
+        actorKind: kind === "replay" ? "unknown" : kind,
+        eventKind: "message",
+      });
+    },
+  );
   it.each(["entra", "application", "unknown"] as const)(
     "retains %s identity evidence",
     async (kind) => {

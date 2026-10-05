@@ -1,5 +1,16 @@
 import { decodeHtmlEntities } from "openclaw/plugin-sdk/html-entity-runtime";
 
+const replayedActivities = new WeakSet<object>();
+
+/** Raw ingress rows predate authenticated source envelopes; replay cannot reauthenticate them. */
+export function markMSTeamsReplayedActivity(activity: object): void {
+  replayedActivities.add(activity);
+}
+
+export function isMSTeamsReplayedActivity(activity: object): boolean {
+  return replayedActivities.has(activity);
+}
+
 type MSTeamsQuoteInfo = {
   sender: string;
   body: string;

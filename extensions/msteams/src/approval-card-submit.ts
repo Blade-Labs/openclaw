@@ -1,18 +1,20 @@
 import { DEFAULT_ACCOUNT_ID } from "openclaw/plugin-sdk/account-id";
 import { resolveApprovalOverGateway } from "openclaw/plugin-sdk/approval-gateway-runtime";
+import type { ChannelApprovalResolutionRuntimeV2 } from "openclaw/plugin-sdk/approval-runtime";
 import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { msTeamsApprovalAuth } from "./approval-auth.js";
+import { getMSTeamsApprovalApprovers, msTeamsApprovalAuth } from "./approval-auth.js";
 import {
   msTeamsApprovalControls,
   readMSTeamsApprovalActionToken,
 } from "./approval-card-actions.js";
 import { buildMSTeamsCanonicalApprovalTerminalCard } from "./approval-card.js";
 import {
-  isMSTeamsApprovalRequesterSender,
   isMSTeamsRequesterOnlyApprovals,
+  normalizeMSTeamsAadObjectId,
 } from "./approval-requester.js";
-import { normalizeMSTeamsConversationId } from "./inbound.js";
+import { isMSTeamsReplayedActivity, normalizeMSTeamsConversationId } from "./inbound.js";
 import type { MSTeamsMessageHandlerDeps } from "./monitor-handler.types.js";
+import { getOptionalMSTeamsRuntime } from "./runtime.js";
 import type { MSTeamsTurnContext } from "./sdk-types.js";
 
 function isMSTeamsApprovalSubmit(value: unknown): boolean {
@@ -67,50 +69,81 @@ export async function maybeHandleMSTeamsApprovalCardSubmit(params: {
     return true;
   }
 
-  const senderId = context.activity.from?.aadObjectId;
-  // Requester-only binds the card to the user whose own turn raised it. Enforce it while the option
-  // is on, and for any card minted with a requester even if the option was turned off since.
-  const requesterOnly =
-    isMSTeamsRequesterOnlyApprovals(deps.cfg) || binding.requesterAadObjectId !== undefined;
-  if (requesterOnly) {
-    // Checked before settle(): a non-requester can neither resolve nor consume the token.
-    if (
-      !isMSTeamsApprovalRequesterSender({
-        cfg: deps.cfg,
-        requesterAadObjectId: binding.requesterAadObjectId,
-        senderId,
-      })
-    ) {
-      ignored(`requester-only: actor ${senderId || "unknown"} is not the requester`);
-      return true;
-    }
-  } else {
-    const authorization = msTeamsApprovalAuth.authorizeActorAction?.({
-      cfg: deps.cfg,
-      accountId: DEFAULT_ACCOUNT_ID,
-      senderId,
-      action: "approve",
-      approvalKind: binding.approvalKind,
-    });
-    if (!authorization?.authorized) {
-      ignored(`unauthorized actor ${senderId || "unknown"}`);
-      return true;
-    }
+  const requesterOnly = isMSTeamsRequesterOnlyApprovals(deps.cfg) || binding.requesterOnly === true;
+  const aadObjectId = normalizeMSTeamsAadObjectId(context.activity.from?.aadObjectId);
+  const senderId = requesterOnly ? aadObjectId : context.activity.from?.aadObjectId;
+  if (
+    requesterOnly &&
+    (!senderId || !getMSTeamsApprovalApprovers({ cfg: deps.cfg }).includes(senderId))
+  ) {
+    ignored(`unauthorized actor ${senderId || "unknown"}`);
+    return true;
+  }
+  const authorization = msTeamsApprovalAuth.authorizeActorAction?.({
+    cfg: deps.cfg,
+    accountId: DEFAULT_ACCOUNT_ID,
+    senderId,
+    action: "approve",
+    approvalKind: binding.approvalKind,
+  });
+  if (!authorization?.authorized) {
+    ignored(`unauthorized actor ${senderId || "unknown"}`);
+    return true;
   }
 
-  const outcome = await msTeamsApprovalControls.settle(token, async (consumed) => {
-    const result = await resolveApprovalOverGateway({
-      cfg: deps.cfg,
-      approvalId: consumed.approvalId,
-      approvalKind: consumed.approvalKind,
-      decision: consumed.decision,
-      // Requester-only: core channel custody re-checks only the requestless roster (which
-      // requester-only denies for every Teams identity), so the requester check above is the
-      // authorization and the plugin resolves as the operator approvals client.
-      ...(requesterOnly
-        ? { clientDisplayName: `Microsoft Teams approval (${senderId})` }
-        : { channel: "msteams", accountId: DEFAULT_ACCOUNT_ID, senderId }),
+  const resolutionRuntime =
+    getOptionalMSTeamsRuntime()?.channel.runtimeContexts?.get<ChannelApprovalResolutionRuntimeV2>({
+      channelId: "msteams",
+      accountId: DEFAULT_ACCOUNT_ID,
+      capability: "approval.gateway",
     });
+  if (
+    requesterOnly &&
+    (resolutionRuntime?.version !== 2 ||
+      context.activity.conversation?.conversationType !== "personal" ||
+      context.activity.conversation?.isGroup === true ||
+      context.activity.channelData?.team !== undefined ||
+      context.activity.channelData?.channel !== undefined)
+  ) {
+    ignored("requester-only: authenticated personal-chat approval runtime unavailable");
+    return true;
+  }
+  if (
+    requesterOnly &&
+    (!senderId ||
+      !context.activity.id ||
+      context.activity.from?.role === "bot" ||
+      isMSTeamsReplayedActivity(context.activity))
+  ) {
+    ignored("unverified interaction actor");
+    return true;
+  }
+
+  // A resolver rejection releases the claim; only a canonical terminal result consumes it.
+  const outcome = await msTeamsApprovalControls.settle(token, async (consumed) => {
+    const result =
+      resolutionRuntime?.version === 2 && senderId && context.activity.id
+        ? await resolutionRuntime.resolve(
+            { id: consumed.approvalId, kind: consumed.approvalKind, decision: consumed.decision },
+            resolutionRuntime.admitInteractionActor({
+              senderId: aadObjectId ?? senderId,
+              actorKind: isMSTeamsReplayedActivity(context.activity)
+                ? "unknown"
+                : context.activity.from?.role === "bot"
+                  ? "bot"
+                  : "human",
+              interactionId: context.activity.id,
+            }),
+          )
+        : await resolveApprovalOverGateway({
+            cfg: deps.cfg,
+            approvalId: consumed.approvalId,
+            approvalKind: consumed.approvalKind,
+            decision: consumed.decision,
+            channel: "msteams",
+            accountId: DEFAULT_ACCOUNT_ID,
+            senderId,
+          });
     await context.updateActivity({
       type: "message",
       id: consumed.activityId,

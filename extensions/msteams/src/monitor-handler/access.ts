@@ -13,12 +13,13 @@ import {
   resolveDefaultGroupPolicy,
   type OpenClawConfig,
 } from "../../runtime-api.js";
+import { normalizeMSTeamsAadObjectId } from "../approval-requester.js";
 import type {
   StoredConversationReference,
   MSTeamsConversationStore,
 } from "../conversation-store.js";
 import { formatUnknownError } from "../errors.js";
-import { normalizeMSTeamsConversationId } from "../inbound.js";
+import { isMSTeamsReplayedActivity, normalizeMSTeamsConversationId } from "../inbound.js";
 import type { MSTeamsMonitorLogger } from "../monitor-types.js";
 import { resolveMSTeamsAllowlistMatch, resolveMSTeamsRouteConfig } from "../policy.js";
 import { looksLikeMSTeamsConversationId } from "../resolve-allowlist.js";
@@ -162,6 +163,25 @@ export async function resolveMSTeamsSenderAccess(params: {
   const resolved = await core.channel.inbound.ingress.resolveStable({
     channelId: "msteams",
     accountId: pairing.accountId,
+    source: {
+      actorKind: isMSTeamsReplayedActivity(activity)
+        ? "unknown"
+        : activity.from?.role === "bot"
+          ? "bot"
+          : normalizeMSTeamsAadObjectId(activity.from?.aadObjectId)
+            ? "human"
+            : "unknown",
+      eventKind:
+        activity.type === "messageUpdate"
+          ? "edit"
+          : activity.replyToId
+            ? "reply"
+            : activity.type === "message"
+              ? "message"
+              : "unknown",
+      ...(activity.type === "messageUpdate" ? { edited: true } : {}),
+      ...(activity.channelData?.team?.id ? { teamId: activity.channelData.team.id } : {}),
+    },
     identity: {
       ...msteamsIngressIdentity,
       resolveParticipant: () => {

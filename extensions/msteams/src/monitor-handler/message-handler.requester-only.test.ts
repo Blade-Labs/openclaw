@@ -1,11 +1,6 @@
-// Microsoft Teams tests cover requester-only approval provenance recorded at inbound dispatch.
-import type { ExecApprovalRequest } from "openclaw/plugin-sdk/approval-runtime";
+// Microsoft Teams dispatch preserves source facts for core approval provenance.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../runtime-api.js";
-import {
-  classifyMSTeamsApprovalRequester,
-  clearMSTeamsRequesterTurnRuns,
-} from "../approval-requester.js";
 import type { MSTeamsIngressLifecycle } from "../msteams-ingress.js";
 import type { MSTeamsTurnContext } from "../sdk-types.js";
 // Preserve module setup before modules that consume it.
@@ -69,58 +64,38 @@ async function dispatchDirectMessage(cfg: OpenClawConfig) {
   const handler = createMSTeamsMessageHandler(deps);
   await handler(context(directActivity()), lifecycle());
   const dispatch = runtimeApiMockState.dispatchReplyWithBufferedBlockDispatcher;
-  await vi.waitFor(() => expect(dispatch).toHaveBeenCalledTimes(1), { timeout: 5_000 });
+  expect(dispatch).toHaveBeenCalledTimes(1);
   return dispatch.mock.calls[0]?.[0] as
-    | { replyOptions?: { onAgentRunStart?: (runId: string) => unknown } }
+    | {
+        ctx?: {
+          SenderId?: string;
+          ChatType?: string;
+          MessageSid?: string;
+          OriginatingChannel?: string;
+          OriginatingTo?: string;
+        };
+        replyOptions?: { onAgentRunStart?: (runId: string) => unknown };
+      }
     | undefined;
-}
-
-function approvalFromRun(runId: string): ExecApprovalRequest {
-  return {
-    id: "approval-1",
-    request: {
-      command: "deploy",
-      runId,
-      sessionKey: `agent:main:msteams:direct:${REQUESTER_ID}`,
-      turnSourceChannel: "msteams",
-      turnSourceTo: `conversation:${PERSONAL_CHAT}`,
-      turnSourceAccountId: "default",
-    },
-    createdAtMs: 0,
-    expiresAtMs: 60_000,
-  };
 }
 
 describe("Microsoft Teams requester-only turn provenance", () => {
   beforeEach(() => {
     runtimeApiMockState.dispatchReplyWithBufferedBlockDispatcher.mockClear();
-    clearMSTeamsRequesterTurnRuns();
   });
 
-  it("attributes approvals only to runs started by the user's own 1:1 message", async () => {
-    const cfg = createConfig(true);
-    const dispatchParams = await dispatchDirectMessage(cfg);
-    const onAgentRunStart = dispatchParams?.replyOptions?.onAgentRunStart;
-    expect(onAgentRunStart).toBeTypeOf("function");
-
-    // Before the run starts (or for any other run, e.g. a scheduled job) nothing is attributable.
-    expect(classifyMSTeamsApprovalRequester({ cfg, request: approvalFromRun("run-1") })).toEqual({
-      ok: false,
-      reason: "not-a-user-turn",
-    });
-
-    onAgentRunStart?.("run-1");
-
-    expect(
-      classifyMSTeamsApprovalRequester({ cfg, request: approvalFromRun("run-1") }),
-    ).toMatchObject({ ok: true, requester: { aadObjectId: REQUESTER_ID } });
-    expect(
-      classifyMSTeamsApprovalRequester({ cfg, request: approvalFromRun("cron:job:1") }),
-    ).toEqual({ ok: false, reason: "not-a-user-turn" });
-  });
-
-  it("leaves the reply options untouched when the option is off", async () => {
-    const dispatchParams = await dispatchDirectMessage(createConfig(false));
-    expect(dispatchParams?.replyOptions?.onAgentRunStart).toBeUndefined();
-  });
+  it.each([true, false])(
+    "passes the personal message source to core without a plugin run callback (requesterOnly=%s)",
+    async (requesterOnly) => {
+      const dispatchParams = await dispatchDirectMessage(createConfig(requesterOnly));
+      expect(dispatchParams?.ctx).toMatchObject({
+        SenderId: REQUESTER_ID,
+        ChatType: "direct",
+        MessageSid: "activity-1",
+        OriginatingChannel: "msteams",
+        OriginatingTo: `conversation:${PERSONAL_CHAT}`,
+      });
+      expect(dispatchParams?.replyOptions?.onAgentRunStart).toBeUndefined();
+    },
+  );
 });

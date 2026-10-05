@@ -19,8 +19,8 @@ export type MSTeamsApprovalCardBinding = {
   conversationId: string;
   activityId: string;
   expiresAtMs: number;
-  /** Requester-only: the only Entra object id allowed to submit this card. */
-  requesterAadObjectId?: string;
+  /** Prevent legacy resolution when a strict card outlives a configuration change. */
+  requesterOnly?: boolean;
 };
 
 export const msTeamsApprovalControls =

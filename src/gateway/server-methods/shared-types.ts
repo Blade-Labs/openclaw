@@ -229,13 +229,17 @@ type GatewayKernelContext = {
       request: ExecApprovalRequest,
       opts?: {
         isTargetVisible?: (target: { deviceId: string; scopes: readonly string[] }) => boolean;
+        shouldSuppress?: () => boolean;
       },
     ) => Promise<boolean>;
     handleResolved?: (resolved: ExecApprovalResolved) => Promise<void>;
     handleExpired?: (request: ExecApprovalRequest) => Promise<void>;
   };
   approvalWebPushDelivery?: {
-    handleRequested: <TPayload>(record: ExecApprovalRecord<TPayload>) => boolean | Promise<boolean>;
+    handleRequested: <TPayload>(
+      record: ExecApprovalRecord<TPayload>,
+      opts?: { shouldSuppress?: () => boolean },
+    ) => boolean | Promise<boolean>;
     handleResolved: (resolved: { id: string }) => Promise<void>;
     handleExpired: (request: { id: string }) => Promise<void>;
   };
@@ -244,6 +248,7 @@ type GatewayKernelContext = {
       request: PluginApprovalRequest,
       opts?: {
         isTargetVisible?: (target: { deviceId: string; scopes: readonly string[] }) => boolean;
+        shouldSuppress?: () => boolean;
       },
     ) => Promise<boolean>;
     handleExpired?: (request: PluginApprovalRequest) => Promise<void>;

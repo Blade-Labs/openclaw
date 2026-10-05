@@ -6,12 +6,14 @@
  */
 
 import type { PrepareAssistantTranscriptMessage } from "../../config/sessions/transcript-assistant-delivery.js";
+import type { TurnSourceProvenance } from "../../infra/turn-source-provenance.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { cloneHookIsolationValue } from "../../plugins/hook-isolation.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
 import { applyTranscriptSenderIdentityToWrite } from "../../sessions/user-turn-transcript.metadata.js";
 import { extractAssistantTranscriptSourceText } from "../../shared/chat-message-content.js";
 import { consumeAdjustedParamsForToolCall } from "../agent-tools.before-tool-call.js";
+import { consumeSourceForToolCall } from "../agent-tools.before-tool-call.state.js";
 import type { AgentMessage } from "../runtime/index.js";
 
 const log = createSubsystemLogger("agents/harness");
@@ -26,11 +28,13 @@ export async function runAgentHarnessAfterToolCallHook(params: {
   sessionKey?: string;
   channelId?: string;
   startArgs: Record<string, unknown>;
+  source?: TurnSourceProvenance;
   result?: unknown;
   error?: string;
   startedAt?: number;
 }): Promise<void> {
   const adjustedArgs = consumeAdjustedParamsForToolCall(params.toolCallId, params.runId);
+  const source = consumeSourceForToolCall(params.toolCallId, params.runId) ?? params.source;
   // Hooks should see adjusted tool params when before_tool_call rewrote them.
   const resolvedArgs =
     adjustedArgs && typeof adjustedArgs === "object"
@@ -60,6 +64,7 @@ export async function runAgentHarnessAfterToolCallHook(params: {
         ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
         ...(params.runId ? { runId: params.runId } : {}),
         ...(params.channelId ? { channelId: params.channelId } : {}),
+        ...(source ? { source } : {}),
         toolCallId: params.toolCallId,
       },
     );

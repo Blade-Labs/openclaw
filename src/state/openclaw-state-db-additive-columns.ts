@@ -8,6 +8,8 @@ type LazyColumn = readonly [
 
 // Added after v6 shipped; first-use-only columns stay absent until their feature writes.
 const lazyColumns = [
+  ["operator_approvals", "authorization_json", "TEXT"],
+  ["operator_approvals", "resolver_actor_json", "TEXT"],
   ["claw_installs", "bootstrap_content_digest", "TEXT"],
   ["claw_installs", "bootstrap_source_path", "TEXT"],
   ["worker_environments", "desktop_json", "TEXT"],

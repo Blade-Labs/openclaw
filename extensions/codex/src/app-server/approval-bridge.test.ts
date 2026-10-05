@@ -406,6 +406,171 @@ describe("Codex app-server approval bridge", () => {
     expect(mockCallGatewayTool).not.toHaveBeenCalled();
   });
 
+  it.each([false, true])(
+    "keeps direct approval progress private after policy relaxation (strict=%s)",
+    async (strict) => {
+      const params = createParams();
+      let currentStrict = strict;
+      params.hostCapabilities = {
+        ...params.hostCapabilities,
+        requiresRequesterMatch: () => currentStrict,
+        prepareMutableFileApproval: prepareApprovalWithoutMutableFile,
+        requestApproval: async () => {
+          currentStrict = false;
+          return { id: "synthetic-private-approval" };
+        },
+        waitForApproval: async () => ({
+          decision: "allow-once",
+          terminalReason: "user",
+          ...(strict
+            ? {
+                approvalExecutions: [
+                  {
+                    requiresMatch: () => true,
+                    latchRequesterMatch: () => {},
+                    assertCurrent: () => {},
+                    redeem: async () => {},
+                    revalidate: async () => {},
+                  },
+                ],
+              }
+            : {}),
+        }),
+      };
+      await expect(
+        handleCodexAppServerApprovalRequest({
+          method: "item/commandExecution/requestApproval",
+          requestParams: { ...codexTestTurnIds(), command: "node --version" },
+          paramsForRun: params,
+          ...codexTestTurnIds(),
+        }),
+      ).resolves.toEqual({ decision: "accept" });
+      if (strict) {
+        expect(params.onAgentEvent).not.toHaveBeenCalled();
+      } else {
+        expect(params.onAgentEvent).toHaveBeenCalledTimes(2);
+        findApprovalEvent(params, { status: "pending" });
+        findApprovalEvent(params, { status: "approved" });
+      }
+    },
+  );
+
+  it.each([
+    { route: "hook", revoke: false },
+    { route: "hook", revoke: true },
+    { route: "deferred", revoke: false },
+    { route: "deferred", revoke: true },
+    { route: "direct", revoke: false },
+    { route: "direct", revoke: true },
+  ])(
+    "retains $route approval execution custody through mutable operand verification (revoke=$revoke)",
+    async ({ route, revoke }) => {
+      const params = createParams();
+      let current = true;
+      let consumed = false;
+      const assertCurrent = () => {
+        if (!current) {
+          throw new Error("Synthetic approval resolver revoked");
+        }
+      };
+      const execution = {
+        requiresMatch: () => true,
+        latchRequesterMatch: () => {},
+        assertCurrent,
+        redeem: async () => {
+          assertCurrent();
+          if (consumed) {
+            throw new Error("Synthetic approval already consumed");
+          }
+          consumed = true;
+        },
+        revalidate: async () => assertCurrent(),
+      };
+      let enterVerification!: () => void;
+      const verificationEntered = new Promise<void>((resolve) => {
+        enterVerification = resolve;
+      });
+      let releaseVerification!: () => void;
+      const verificationHeld = new Promise<void>((resolve) => {
+        releaseVerification = resolve;
+      });
+      params.hostCapabilities = {
+        ...params.hostCapabilities,
+        requiresRequesterMatch: () => true,
+        prepareMutableFileApproval: async () => ({
+          ok: true,
+          requiresOneShot: true,
+          revalidate: async () => {
+            enterVerification();
+            await verificationHeld;
+            return { ok: true };
+          },
+        }),
+        runBeforeToolCall: async ({ params: toolParams }) => ({
+          blocked: false,
+          params: toolParams,
+          ...(route === "direct"
+            ? {}
+            : { approvalResolution: "allow-once" as const, approvalExecutions: [execution] }),
+        }),
+      };
+      if (route === "direct") {
+        params.hostCapabilities = {
+          ...params.hostCapabilities,
+          requestApproval: async () => ({ id: "synthetic-direct-approval" }),
+          waitForApproval: async () => ({
+            decision: "allow-once",
+            terminalReason: "user",
+            approvalExecutions: [execution],
+          }),
+        };
+      }
+      if (route === "deferred") {
+        mockHasNativeHookRelayInvocation.mockReturnValueOnce(true);
+        mockResolveNativeHookRelayDeferredToolApproval.mockResolvedValueOnce({
+          handled: true,
+          outcome: "approved-once",
+          approvalExecutions: [execution],
+        });
+      }
+      const pending = handleCodexAppServerApprovalRequest({
+        method: "item/commandExecution/requestApproval",
+        requestParams: {
+          ...codexTestTurnIds(),
+          itemId: "synthetic-byte-bound-call",
+          command: "sh synthetic-script",
+        },
+        paramsForRun: params,
+        ...codexTestTurnIds(),
+        ...(route === "deferred"
+          ? {
+              nativeHookRelay: {
+                relayId: "synthetic-deferred-relay",
+                allowedEvents: ["pre_tool_use"] as const,
+              },
+            }
+          : {}),
+      });
+      try {
+        await Promise.race([
+          verificationEntered,
+          pending.then(() => {
+            throw new Error("Approval returned before mutable operand verification");
+          }),
+        ]);
+        current = !revoke;
+        releaseVerification();
+        await expect(pending).resolves.toEqual({ decision: revoke ? "decline" : "accept" });
+        expect(consumed).toBe(!revoke);
+        expect(mockCallGatewayTool).not.toHaveBeenCalled();
+        expect(params.onAgentEvent).not.toHaveBeenCalled();
+      } finally {
+        releaseVerification();
+        await pending;
+      }
+    },
+  );
+
   it("keeps permission grants on the human path under full-auto runtime policy", async () => {
     const params = createParams();
     mockCallGatewayTool
@@ -457,7 +622,7 @@ describe("Codex app-server approval bridge", () => {
       requestParams: {
         ...codexTestTurnIds(),
         itemId: "cmd-1",
-        command: "pnpm test extensions/codex/src/app-server",
+        command: "node --version",
       },
       paramsForRun: params,
       ...codexTestTurnIds(),
@@ -481,11 +646,11 @@ describe("Codex app-server approval bridge", () => {
       expect.objectContaining({
         toolName: "exec",
         params: {
-          command: "pnpm test extensions/codex/src/app-server",
+          command: "node --version",
           approval: {
             ...codexTestTurnIds(),
             itemId: "cmd-1",
-            command: "pnpm test extensions/codex/src/app-server",
+            command: "node --version",
           },
         },
         toolCallId: "cmd-1",
@@ -1408,7 +1573,7 @@ describe("Codex app-server approval bridge", () => {
       requestParams: {
         ...codexTestTurnIds(),
         itemId: "cmd-prefixed",
-        command: "pnpm test extensions/codex/src/app-server",
+        command: "node --version",
       },
       paramsForRun: params,
       ...codexTestTurnIds(),
@@ -1702,7 +1867,7 @@ describe("Codex app-server approval bridge", () => {
       requestParams: {
         ...codexTestTurnIds(),
         itemId: "cmd-native-relay-noop",
-        command: "pnpm test extensions/codex/src/app-server",
+        command: "node --version",
         cwd: "/workspace",
       },
       paramsForRun: params,
@@ -1748,7 +1913,7 @@ describe("Codex app-server approval bridge", () => {
       requestParams: {
         ...codexTestTurnIds(),
         itemId: "cmd-native-relay-observed",
-        command: "pnpm test extensions/codex/src/app-server",
+        command: "node --version",
         cwd: "/workspace",
       },
       paramsForRun: params,
@@ -1791,7 +1956,7 @@ describe("Codex app-server approval bridge", () => {
       requestParams: {
         ...codexTestTurnIds(),
         itemId: "cmd-native-relay-deferred",
-        command: "pnpm test extensions/codex/src/app-server",
+        command: "node --version",
         cwd: "/workspace",
       },
       paramsForRun: params,
@@ -1828,7 +1993,7 @@ describe("Codex app-server approval bridge", () => {
       requestParams: {
         ...codexTestTurnIds(),
         itemId: "cmd-native-relay-deferred-failure",
-        command: "pnpm test extensions/codex/src/app-server",
+        command: "node --version",
         cwd: "/workspace",
       },
       paramsForRun: params,
@@ -1860,7 +2025,7 @@ describe("Codex app-server approval bridge", () => {
       requestParams: {
         ...codexTestTurnIds(),
         itemId: "cmd-native-relay-unreadable",
-        command: "pnpm test extensions/codex/src/app-server",
+        command: "node --version",
         cwd: "/workspace",
       },
       paramsForRun: params,
@@ -1903,7 +2068,7 @@ describe("Codex app-server approval bridge", () => {
       requestParams: {
         ...codexTestTurnIds(),
         itemId: "cmd-native-relay-allow",
-        command: "pnpm test extensions/codex/src/app-server",
+        command: "node --version",
         cwd: "/workspace",
       },
       paramsForRun: params,
@@ -1938,7 +2103,7 @@ describe("Codex app-server approval bridge", () => {
       requestParams: {
         ...codexTestTurnIds(),
         itemId: "cmd-native-relay-exit",
-        command: "pnpm test extensions/codex/src/app-server",
+        command: "node --version",
         cwd: "/workspace",
       },
       paramsForRun: params,
@@ -2139,11 +2304,11 @@ describe("Codex app-server approval bridge", () => {
     mockRunBeforeToolCallHook.mockResolvedValueOnce({
       blocked: false,
       params: {
-        command: "pnpm test",
+        command: "node --version",
         approval: {
           ...codexTestTurnIds(),
           itemId: "cmd-needs-approval",
-          command: "pnpm test",
+          command: "node --version",
         },
       },
       approvalResolution: "allow-always",
@@ -2154,7 +2319,7 @@ describe("Codex app-server approval bridge", () => {
       requestParams: {
         ...codexTestTurnIds(),
         itemId: "cmd-needs-approval",
-        command: "pnpm test",
+        command: "node --version",
       },
       paramsForRun: params,
       ...codexTestTurnIds(),
@@ -2182,7 +2347,7 @@ describe("Codex app-server approval bridge", () => {
       requestParams: {
         ...codexTestTurnIds(),
         itemId: "cmd-needs-approval",
-        command: "pnpm test",
+        command: "node --version",
       },
       paramsForRun: params,
       ...codexTestTurnIds(),
@@ -2214,7 +2379,7 @@ describe("Codex app-server approval bridge", () => {
         requestParams: {
           ...codexTestTurnIds(),
           itemId: "cmd-policy-failure",
-          command: "pnpm test",
+          command: "node --version",
         },
         paramsForRun: params,
         ...codexTestTurnIds(),
@@ -2506,7 +2671,7 @@ describe("Codex app-server approval bridge", () => {
       requestParams: {
         ...codexTestTurnIds(),
         itemId: "cmd-untrusted",
-        command: "pnpm test",
+        command: "node --version",
       },
       paramsForRun: params,
       ...codexTestTurnIds(),
@@ -2538,7 +2703,7 @@ describe("Codex app-server approval bridge", () => {
       requestParams: {
         ...codexTestTurnIds(),
         itemId: "cmd-inherited",
-        command: "pnpm test",
+        command: "node --version",
       },
       paramsForRun: params,
       ...codexTestTurnIds(),
@@ -2569,7 +2734,7 @@ describe("Codex app-server approval bridge", () => {
       requestParams: {
         ...codexTestTurnIds(),
         itemId: "cmd-accessor",
-        command: "pnpm test",
+        command: "node --version",
       },
       paramsForRun: params,
       ...codexTestTurnIds(),
@@ -2600,7 +2765,7 @@ describe("Codex app-server approval bridge", () => {
       requestParams: {
         ...codexTestTurnIds(),
         itemId: "cmd-proxy",
-        command: "pnpm test",
+        command: "node --version",
       },
       paramsForRun: params,
       ...codexTestTurnIds(),
@@ -2696,7 +2861,7 @@ describe("Codex app-server approval bridge", () => {
       requestParams: {
         ...codexTestTurnIds(),
         itemId: "cmd-expired",
-        command: "pnpm test",
+        command: "node --version",
         availableDecisions: ["accept", "cancel"],
       },
       paramsForRun: params,
@@ -2729,7 +2894,7 @@ describe("Codex app-server approval bridge", () => {
       requestParams: {
         ...codexTestTurnIds(),
         itemId: "cmd-mismatch",
-        command: "pnpm test",
+        command: "node --version",
       },
       paramsForRun: params,
       ...codexTestTurnIds(),
@@ -2998,7 +3163,7 @@ describe("Codex app-server approval bridge", () => {
       method: "item/commandExecution/requestApproval",
       requestParams: {
         itemId: "cmd-2",
-        command: "pnpm test",
+        command: "node --version",
       },
       paramsForRun: params,
       ...codexTestTurnIds(),

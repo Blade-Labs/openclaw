@@ -84,6 +84,7 @@ type ApnsRequestParams = {
   priority: "10" | "5";
   signal?: AbortSignal;
   isCurrent?: () => Promise<boolean>;
+  assertCurrent?: () => void;
 };
 
 type ApnsRequestResponse = { status: number; apnsId?: string; body: string };
@@ -162,6 +163,7 @@ async function sendApnsRequest(params: {
   priority: "10" | "5";
   signal?: AbortSignal;
   isCurrent?: () => Promise<boolean>;
+  assertCurrent?: () => void;
 }): Promise<ApnsRequestResponse> {
   const authority =
     params.environment === "production"
@@ -232,6 +234,7 @@ async function sendApnsRequest(params: {
           onAbort();
           return;
         }
+        params.assertCurrent?.();
 
         const req = client.request({
           ":method": "POST",
@@ -379,12 +382,14 @@ async function sendDirectApnsPush(params: {
   priority: "10" | "5";
   signal?: AbortSignal;
   isCurrent?: () => Promise<boolean>;
+  assertCurrent?: () => void;
 }): Promise<ApnsPushResult> {
   const { token, topic, environment, bearerToken } = resolveDirectSendContext({
     auth: params.auth,
     registration: params.registration,
   });
   await requireCurrentApnsSend(params);
+  params.assertCurrent?.();
   const sender = params.requestSender ?? sendApnsRequest;
   const response = await sender({
     token,
@@ -397,6 +402,7 @@ async function sendDirectApnsPush(params: {
     priority: params.priority,
     ...(params.signal ? { signal: params.signal } : {}),
     ...(params.isCurrent ? { isCurrent: params.isCurrent } : {}),
+    ...(params.assertCurrent ? { assertCurrent: params.assertCurrent } : {}),
   });
   return toPushResult({
     registration: params.registration,
@@ -415,6 +421,7 @@ async function sendRelayApnsPush(params: {
   requestSender?: ApnsRelayRequestSender;
   signal?: AbortSignal;
   isCurrent?: () => Promise<boolean>;
+  assertCurrent?: () => void;
 }): Promise<ApnsPushResult> {
   const response = await sendApnsRelayPush({
     relayConfig: params.relayConfig,
@@ -427,6 +434,7 @@ async function sendRelayApnsPush(params: {
     requestSender: params.requestSender,
     ...(params.signal ? { signal: params.signal } : {}),
     ...(params.isCurrent ? { isCurrent: params.isCurrent } : {}),
+    ...(params.assertCurrent ? { assertCurrent: params.assertCurrent } : {}),
   });
   return toPushResult({ registration: params.registration, response });
 }
@@ -434,6 +442,7 @@ async function sendRelayApnsPush(params: {
 type ApnsTransportCommonParams = {
   nodeId: string;
   timeoutMs?: number;
+  assertCurrent?: () => void;
 };
 
 type DirectApnsTransportParams = ApnsTransportCommonParams & {
@@ -527,6 +536,7 @@ async function sendApnsPush(
       priority: params.priority,
       gatewayIdentity: relayParams.relayGatewayIdentity,
       requestSender: relayParams.relayRequestSender,
+      ...(transport.assertCurrent ? { assertCurrent: transport.assertCurrent } : {}),
       ...(controls?.signal ? { signal: controls.signal } : {}),
       ...(controls?.isCurrent ? { isCurrent: controls.isCurrent } : {}),
     });
@@ -538,6 +548,7 @@ async function sendApnsPush(
     payload: params.payload,
     timeoutMs: directParams.timeoutMs,
     requestSender: directParams.requestSender,
+    ...(transport.assertCurrent ? { assertCurrent: transport.assertCurrent } : {}),
     pushType: params.pushType,
     priority: params.priority,
     ...(controls?.signal ? { signal: controls.signal } : {}),

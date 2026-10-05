@@ -60,6 +60,7 @@ public enum ApprovalDeniedReason: String, Codable, Sendable {
     case user = "user"
     case malformedVerdict = "malformed-verdict"
     case noRoute = "no-route"
+    case requesterUnavailable = "requester-unavailable"
     case storageCorrupt = "storage-corrupt"
 }
 
@@ -78,6 +79,7 @@ public enum ApprovalTerminalReason: String, Codable, Sendable {
     case timeout = "timeout"
     case malformedVerdict = "malformed-verdict"
     case noRoute = "no-route"
+    case requesterUnavailable = "requester-unavailable"
     case runAborted = "run-aborted"
     case gatewayRestart = "gateway-restart"
     case storageCorrupt = "storage-corrupt"
@@ -1402,6 +1404,8 @@ public struct AgentsWorkspaceListResult: Codable, Sendable {
 }
 
 public struct AllowedApprovalSnapshot: Codable, Sendable {
+    public let authorization: [String: AnyCodable]?
+    public let resolvedbyactor: AnyCodable?
     public let id: String
     public let urlpath: String
     public let createdatms: Int
@@ -1415,6 +1419,8 @@ public struct AllowedApprovalSnapshot: Codable, Sendable {
     public let reason: ApprovalAllowedReason
 
     public init(
+        authorization: [String: AnyCodable]? = nil,
+        resolvedbyactor: AnyCodable? = nil,
         id: String,
         urlpath: String,
         createdatms: Int,
@@ -1427,6 +1433,8 @@ public struct AllowedApprovalSnapshot: Codable, Sendable {
         decision: ApprovalAllowDecision,
         reason: ApprovalAllowedReason)
     {
+        self.authorization = authorization
+        self.resolvedbyactor = resolvedbyactor
         self.id = id
         self.urlpath = urlpath
         self.createdatms = createdatms
@@ -1441,6 +1449,8 @@ public struct AllowedApprovalSnapshot: Codable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
+        case authorization
+        case resolvedbyactor = "resolvedByActor"
         case id
         case urlpath = "urlPath"
         case createdatms = "createdAtMs"
@@ -3395,6 +3405,8 @@ public struct BoardWidget: Codable, Sendable {
 }
 
 public struct CancelledApprovalSnapshot: Codable, Sendable {
+    public let authorization: [String: AnyCodable]?
+    public let resolvedbyactor: AnyCodable?
     public let id: String
     public let urlpath: String
     public let createdatms: Int
@@ -3407,6 +3419,8 @@ public struct CancelledApprovalSnapshot: Codable, Sendable {
     public let reason: ApprovalCancelledReason
 
     public init(
+        authorization: [String: AnyCodable]? = nil,
+        resolvedbyactor: AnyCodable? = nil,
         id: String,
         urlpath: String,
         createdatms: Int,
@@ -3418,6 +3432,8 @@ public struct CancelledApprovalSnapshot: Codable, Sendable {
         status: String,
         reason: ApprovalCancelledReason)
     {
+        self.authorization = authorization
+        self.resolvedbyactor = resolvedbyactor
         self.id = id
         self.urlpath = urlpath
         self.createdatms = createdatms
@@ -3431,6 +3447,8 @@ public struct CancelledApprovalSnapshot: Codable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
+        case authorization
+        case resolvedbyactor = "resolvedByActor"
         case id
         case urlpath = "urlPath"
         case createdatms = "createdAtMs"
@@ -6084,6 +6102,8 @@ public struct DecisionReceiptV1: Codable, Sendable {
 }
 
 public struct DeniedApprovalSnapshot: Codable, Sendable {
+    public let authorization: [String: AnyCodable]?
+    public let resolvedbyactor: AnyCodable?
     public let id: String
     public let urlpath: String
     public let createdatms: Int
@@ -6097,6 +6117,8 @@ public struct DeniedApprovalSnapshot: Codable, Sendable {
     public let reason: ApprovalDeniedReason
 
     public init(
+        authorization: [String: AnyCodable]? = nil,
+        resolvedbyactor: AnyCodable? = nil,
         id: String,
         urlpath: String,
         createdatms: Int,
@@ -6109,6 +6131,8 @@ public struct DeniedApprovalSnapshot: Codable, Sendable {
         decision: String,
         reason: ApprovalDeniedReason)
     {
+        self.authorization = authorization
+        self.resolvedbyactor = resolvedbyactor
         self.id = id
         self.urlpath = urlpath
         self.createdatms = createdatms
@@ -6123,6 +6147,8 @@ public struct DeniedApprovalSnapshot: Codable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
+        case authorization
+        case resolvedbyactor = "resolvedByActor"
         case id
         case urlpath = "urlPath"
         case createdatms = "createdAtMs"
@@ -7864,6 +7890,8 @@ public struct ExecutionIdentityContextV1: Codable, Sendable {
 }
 
 public struct ExpiredApprovalSnapshot: Codable, Sendable {
+    public let authorization: [String: AnyCodable]?
+    public let resolvedbyactor: AnyCodable?
     public let id: String
     public let urlpath: String
     public let createdatms: Int
@@ -7876,6 +7904,8 @@ public struct ExpiredApprovalSnapshot: Codable, Sendable {
     public let reason: ApprovalExpiredReason
 
     public init(
+        authorization: [String: AnyCodable]? = nil,
+        resolvedbyactor: AnyCodable? = nil,
         id: String,
         urlpath: String,
         createdatms: Int,
@@ -7887,6 +7917,8 @@ public struct ExpiredApprovalSnapshot: Codable, Sendable {
         status: String,
         reason: ApprovalExpiredReason)
     {
+        self.authorization = authorization
+        self.resolvedbyactor = resolvedbyactor
         self.id = id
         self.urlpath = urlpath
         self.createdatms = createdatms
@@ -7900,6 +7932,8 @@ public struct ExpiredApprovalSnapshot: Codable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
+        case authorization
+        case resolvedbyactor = "resolvedByActor"
         case id
         case urlpath = "urlPath"
         case createdatms = "createdAtMs"
@@ -9913,6 +9947,8 @@ public struct PaymentApprovalScope: Codable, Sendable {
 }
 
 public struct PendingApprovalSnapshot: Codable, Sendable {
+    public let authorization: [String: AnyCodable]?
+    public let resolvedbyactor: AnyCodable?
     public let id: String
     public let urlpath: String
     public let createdatms: Int
@@ -9922,6 +9958,8 @@ public struct PendingApprovalSnapshot: Codable, Sendable {
     public let sourcesessionkey: String?
 
     public init(
+        authorization: [String: AnyCodable]? = nil,
+        resolvedbyactor: AnyCodable? = nil,
         id: String,
         urlpath: String,
         createdatms: Int,
@@ -9930,6 +9968,8 @@ public struct PendingApprovalSnapshot: Codable, Sendable {
         status: String,
         sourcesessionkey: String? = nil)
     {
+        self.authorization = authorization
+        self.resolvedbyactor = resolvedbyactor
         self.id = id
         self.urlpath = urlpath
         self.createdatms = createdatms
@@ -9940,6 +9980,8 @@ public struct PendingApprovalSnapshot: Codable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
+        case authorization
+        case resolvedbyactor = "resolvedByActor"
         case id
         case urlpath = "urlPath"
         case createdatms = "createdAtMs"

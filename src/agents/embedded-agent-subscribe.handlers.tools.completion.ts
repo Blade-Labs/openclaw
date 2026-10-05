@@ -4,6 +4,8 @@ import {
   HEARTBEAT_RESPONSE_TOOL_NAME,
   normalizeHeartbeatToolResponse,
 } from "../auto-reply/heartbeat-tool-response.js";
+import { getRuntimeConfig } from "../config/config.js";
+import { requiresApprovalRequesterMatch } from "../gateway/approval-request-policy.js";
 import {
   type AgentCommandOutputEventData,
   projectAgentToolActivity,
@@ -15,6 +17,7 @@ import { projectProgressCardChannelUpdate } from "../session-cards/progress-card
 import { normalizeAcceptedSessionSpawnResult } from "./accepted-session-spawn.js";
 import {
   consumeAdjustedParamsForToolCall,
+  consumeSourceForToolCall,
   consumePreExecutionBlockedToolCall,
   consumeStructuredReplaySafeToolCall,
   consumeTrackedToolExecutionStarted,
@@ -434,6 +437,9 @@ export async function handleToolExecutionEnd(
 
   const endedAt = Date.now();
   const execDetails = readExecToolDetails(sanitizedResult);
+  const privateApproval =
+    execDetails?.approvalRequesterOnly === true ||
+    requiresApprovalRequesterMatch(execDetails?.approvalAuthorization, getRuntimeConfig(), "exec");
   const itemData = {
     ...projectAgentToolActivity({
       toolCallId,
@@ -450,39 +456,41 @@ export async function handleToolExecutionEnd(
     ...(errorMessage ? { error: errorMessage } : {}),
   };
   const hideFromChannelProgress = explicitHideFromChannelProgress;
-  emitAgentEvent({
-    runId: ctx.params.runId,
-    stream: "tool",
-    data: {
-      phase: "result",
-      name: toolName,
-      toolCallId,
-      ...(startData?.parentToolCallId ? { parentToolCallId: startData.parentToolCallId } : {}),
-      meta,
-      isError: isToolError,
-      commandBearing: callSummary.commandBearing,
-      result: eventResult,
-      ...(toolErrorSummary ? { toolErrorSummary } : {}),
-      ...(hideFromChannelProgress ? { hideFromChannelProgress: true } : {}),
-    },
-  });
-  emitTrackedItemEvent(ctx, itemData);
-  emitAgentEventCallbackBestEffort(ctx, {
-    stream: "tool",
-    data: {
-      phase: "result",
-      name: toolName,
-      toolCallId,
-      ...(startData?.parentToolCallId ? { parentToolCallId: startData.parentToolCallId } : {}),
-      meta,
-      isError: isToolError,
-      commandBearing: callSummary.commandBearing,
-      ...(toolErrorSummary ? { toolErrorSummary } : {}),
-      ...(hideFromChannelProgress ? { hideFromChannelProgress: true } : {}),
-    },
-  });
+  if (!privateApproval) {
+    emitAgentEvent({
+      runId: ctx.params.runId,
+      stream: "tool",
+      data: {
+        phase: "result",
+        name: toolName,
+        toolCallId,
+        ...(startData?.parentToolCallId ? { parentToolCallId: startData.parentToolCallId } : {}),
+        meta,
+        isError: isToolError,
+        commandBearing: callSummary.commandBearing,
+        result: eventResult,
+        ...(toolErrorSummary ? { toolErrorSummary } : {}),
+        ...(hideFromChannelProgress ? { hideFromChannelProgress: true } : {}),
+      },
+    });
+    emitTrackedItemEvent(ctx, itemData);
+    emitAgentEventCallbackBestEffort(ctx, {
+      stream: "tool",
+      data: {
+        phase: "result",
+        name: toolName,
+        toolCallId,
+        ...(startData?.parentToolCallId ? { parentToolCallId: startData.parentToolCallId } : {}),
+        meta,
+        isError: isToolError,
+        commandBearing: callSummary.commandBearing,
+        ...(toolErrorSummary ? { toolErrorSummary } : {}),
+        ...(hideFromChannelProgress ? { hideFromChannelProgress: true } : {}),
+      },
+    });
+  }
 
-  if (isExecToolName(toolName)) {
+  if (isExecToolName(toolName) && !privateApproval) {
     // Use sanitizedResult so `aggregated` is redacted before reaching command_output.
     const commandItemId = buildCommandItemId(toolCallId);
     if (
@@ -597,7 +605,7 @@ export async function handleToolExecutionEnd(
     `embedded run tool end: runId=${ctx.params.runId} tool=${toolName} toolCallId=${toolCallId}`,
   );
 
-  if (!planUpdate) {
+  if (!planUpdate && !privateApproval) {
     await emitToolResultOutput({
       ctx,
       toolName,
@@ -613,6 +621,7 @@ export async function handleToolExecutionEnd(
   });
 
   // Run after_tool_call plugin hook (fire-and-forget)
+  const source = consumeSourceForToolCall(toolCallId, runId);
   const hookRunnerAfter = ctx.hookRunner ?? (await loadHookRunnerGlobal()).getGlobalHookRunner();
   if (hookRunnerAfter?.hasHooks("after_tool_call")) {
     const durationMs = startData?.startTime != null ? Date.now() - startData.startTime : undefined;
@@ -633,6 +642,7 @@ export async function handleToolExecutionEnd(
         sessionId: ctx.params.sessionId,
         runId,
         toolCallId,
+        ...(source ? { source } : {}),
       })
       .catch((err: unknown) => {
         ctx.log.warn(`after_tool_call hook failed: tool=${toolName} error=${String(err)}`);

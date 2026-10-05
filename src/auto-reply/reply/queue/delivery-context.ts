@@ -3,6 +3,7 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import { readToolAllowlistIntersection } from "../../../agents/tool-policy.js";
 import { normalizeChatType } from "../../../channels/chat-type.js";
 import { combineChannelAdmissionEvidence } from "../../../channels/message-access/admission-evidence.js";
+import { combineHostTurnSources } from "../../../infra/host-turn-source.js";
 import { channelRouteDedupeKey } from "../../../plugin-sdk/channel-route.js";
 import { resolveGlobalSingleton } from "../../../shared/global-singleton.js";
 import { normalizeMessageChannel } from "../../../utils/message-channel.js";
@@ -181,6 +182,7 @@ export function resolveFollowupReplyAnchor(run: FollowupRun): string | undefined
 
 type FollowupRuntimeMetadata = Pick<
   FollowupRun,
+  | "turnSource"
   | "operatorAuthority"
   | "personalBootstrapEligible"
   | "currentInboundEventKind"
@@ -261,6 +263,7 @@ export function collectRuntimeMetadata(
   ];
   return {
     operatorAuthority: authoritySource?.operatorAuthority,
+    turnSource: combineHostTurnSources(items.map((item) => item.turnSource)),
     ...(items.length > 0 && items.every((item) => item.personalBootstrapEligible === true)
       ? { personalBootstrapEligible: true }
       : {}),
@@ -288,6 +291,7 @@ export function createOverflowSummaryRetrySource(source: FollowupRun): FollowupR
     prompt: source.prompt,
     admissionSessionId: source.admissionSessionId,
     operatorAuthority: source.operatorAuthority,
+    turnSource: source.turnSource,
     personalBootstrapEligible: source.personalBootstrapEligible,
     queueAbortSignal: source.queueAbortSignal,
     transcriptPrompt: source.transcriptPrompt,

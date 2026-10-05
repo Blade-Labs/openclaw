@@ -1,5 +1,6 @@
 import { resolveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import type { AdmittedRunContext } from "../../agents/admitted-run-context.js";
 import { resolveActiveEmbeddedRunRecoveryBlocker } from "../../agents/embedded-agent-runner/run-state.js";
 import { createAbortError } from "../../infra/abort-signal.js";
 import {
@@ -59,6 +60,7 @@ type ReplyRunState = {
   clearOperationByOperation?: WeakMap<ReplyOperation, () => void>;
   executionStartedOperations?: WeakSet<ReplyOperation>;
   lifecycleAdmissionByOperation?: WeakMap<ReplyOperation, ReplyOperationAdmission>;
+  admittedRunByOperation?: WeakMap<ReplyOperation, AdmittedRunContext>;
 };
 
 const REPLY_RUN_STATE_KEY = Symbol.for("openclaw.replyRunRegistry");
@@ -79,6 +81,10 @@ export const replyRunState = resolveGlobalSingleton<ReplyRunState>(REPLY_RUN_STA
 // Admission and the active operation must remain visible across transformed SDK graphs.
 export const lifecycleAdmissionByOperation = (replyRunState.lifecycleAdmissionByOperation ??=
   new WeakMap<ReplyOperation, ReplyOperationAdmission>());
+export const admittedRunByOperation = (replyRunState.admittedRunByOperation ??= new WeakMap<
+  ReplyOperation,
+  AdmittedRunContext
+>());
 replyRunState.followupAdmissionBarriersByKey ??= new Map();
 replyRunState.successorAdmissionBarriersByKey ??= new Map();
 replyRunState.sourceTurnByKey ??= new Map();

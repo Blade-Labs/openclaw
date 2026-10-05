@@ -44,6 +44,7 @@ export const AGENT_SCHEMA_COMPATIBILITY = {
   ],
   allowedMissingColumns: [
     "session_pending_inputs.consumed_event_id",
+    "session_pending_inputs.source_provenance_json",
     "session_transcript_active_events.context_eligible",
     "session_conversations.route_context_json",
     "standing_intents.creator_sender",

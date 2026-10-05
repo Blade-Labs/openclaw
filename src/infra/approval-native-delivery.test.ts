@@ -1,6 +1,7 @@
 // Covers native approval delivery planning.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ChannelApprovalNativeAdapter } from "../channels/plugins/types.adapters.js";
+import { requesterAuthorization } from "../gateway/approval-requester.test-support.js";
 import { resolveChannelNativeApprovalDeliveryPlan } from "./approval-native-delivery.js";
 
 const execRequest = {
@@ -13,6 +14,48 @@ const execRequest = {
 };
 
 describe("resolveChannelNativeApprovalDeliveryPlan", () => {
+  it.for([true, false])(
+    "uses only the verified requester destination (available=%s)",
+    async (available) => {
+      const resolveOriginTarget = vi.fn(async () => ({ to: "synthetic-group" }));
+      const resolveApproverDmTargets = vi.fn(async () => [{ to: "synthetic-roster" }]);
+      const describeDeliveryCapabilities = vi.fn(() => ({
+        enabled: true,
+        preferredSurface: "both" as const,
+        supportsOriginSurface: true,
+        supportsApproverDmSurface: true,
+      }));
+      const resolveRequesterTarget = vi.fn(async () =>
+        available ? { to: "synthetic-personal-chat" } : null,
+      );
+      const plan = await resolveChannelNativeApprovalDeliveryPlan({
+        cfg: {},
+        accountId: "default",
+        approvalKind: "exec",
+        request: {
+          ...execRequest,
+          request: { ...execRequest.request, authorization: requesterAuthorization() },
+        },
+        adapter: {
+          describeDeliveryCapabilities,
+          resolveOriginTarget,
+          resolveApproverDmTargets,
+          resolveRequesterTarget,
+        },
+      });
+      expect(plan.targets).toEqual(
+        available
+          ? [{ surface: "origin", reason: "preferred", target: { to: "synthetic-personal-chat" } }]
+          : [],
+      );
+      expect(plan.notifyOriginWhenDmOnly).toBe(false);
+      expect(resolveRequesterTarget).toHaveBeenCalledOnce();
+      expect(describeDeliveryCapabilities).not.toHaveBeenCalled();
+      expect(resolveOriginTarget).not.toHaveBeenCalled();
+      expect(resolveApproverDmTargets).not.toHaveBeenCalled();
+    },
+  );
+
   it("prefers the origin surface when configured and available", async () => {
     const adapter: ChannelApprovalNativeAdapter = {
       describeDeliveryCapabilities: () => ({

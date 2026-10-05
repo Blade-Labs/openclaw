@@ -27,6 +27,7 @@ export function handlePendingPluginApprovalRequest(
     approvalKind: "plugin",
     deliverRequest: () =>
       runApprovalRequestDeliveries({
+        approvalKind: "plugin",
         context: pending.context,
         record: pending.record,
         forward: forwardRequest
@@ -37,7 +38,8 @@ export function handlePendingPluginApprovalRequest(
           : undefined,
         iosPush: iosPushRequest
           ? [
-              (isTargetVisible) => iosPushRequest(requestEvent, { isTargetVisible }),
+              (isTargetVisible, shouldSuppress) =>
+                iosPushRequest(requestEvent, { isTargetVisible, shouldSuppress }),
               `plugin approvals: iOS push ${logContext}request failed`,
             ]
           : undefined,

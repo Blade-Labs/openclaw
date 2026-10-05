@@ -637,6 +637,7 @@ describe("gateway tool defaults", () => {
     expect(call.method).toBe("exec.approval.waitDecision");
     expect(call.scopes).toEqual(["operator.approvals"]);
     expect(call.approvalRuntimeToken).toEqual(expect.any(String));
+    expect(call).not.toHaveProperty("agentRuntimeIdentityToken");
     expect(call).not.toHaveProperty("deviceIdentity");
   });
 
@@ -649,6 +650,7 @@ describe("gateway tool defaults", () => {
     expect(call.method).toBe("plugin.approval.waitDecision");
     expect(call.scopes).toEqual(["operator.approvals"]);
     expect(call.approvalRuntimeToken).toEqual(expect.any(String));
+    expect(call).not.toHaveProperty("agentRuntimeIdentityToken");
     expect(call).not.toHaveProperty("deviceIdentity");
   });
 

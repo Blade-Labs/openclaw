@@ -1,5 +1,6 @@
-// Covers native approval route reporting behavior.
 import { afterEach, describe, expect, it, vi } from "vitest";
+// Covers native approval route reporting behavior.
+import { requesterAuthorization } from "../gateway/approval-requester.test-support.js";
 import {
   createApprovalNativeRouteCoordinator,
   createApprovalNativeRouteReporter as createApprovalNativeRouteReporterRaw,
@@ -35,6 +36,54 @@ function createGatewayRequestMock() {
 }
 
 describe("createApprovalNativeRouteReporter", () => {
+  it("records blocked requester notice outcomes and uses the existing approval idempotency key", async () => {
+    const coordinator = createApprovalNativeRouteCoordinator();
+    const requestGateway = createGatewayRequestMock();
+    const resolveRequesterNoticeTarget = vi.fn(async () => ({ to: "synthetic-personal-chat" }));
+    const reporter = coordinator.createReporter({
+      ...defaultRouteSelector,
+      channel: "test",
+      accountId: "default",
+      handledKinds: new Set(["exec"]),
+      requestGateway,
+      resolveRequesterNoticeTarget,
+    });
+    const request = {
+      id: "synthetic-blocked-notice",
+      request: {
+        command: "synthetic private command",
+        authorization: requesterAuthorization(),
+        turnSourceTo: "synthetic-forged-group",
+      },
+      createdAtMs: 1,
+      expiresAtMs: 1000,
+    };
+    reporter.start();
+    try {
+      await expect(coordinator.reportBlockedRequest("exec", request)).resolves.toBe("sent");
+      expect(requestGateway).toHaveBeenCalledWith(
+        "send",
+        expect.objectContaining({
+          to: "synthetic-personal-chat",
+          idempotencyKey: "approval-route-notice:blocked:synthetic-blocked-notice",
+        }),
+      );
+      expect(JSON.stringify(requestGateway.mock.calls)).not.toContain("synthetic private command");
+      await coordinator.reportBlockedRequest("exec", request);
+      expect(requestGateway.mock.calls[1]?.[1].idempotencyKey).toBe(
+        requestGateway.mock.calls[0]?.[1].idempotencyKey,
+      );
+      requestGateway.mockRejectedValueOnce(new Error("synthetic send failure"));
+      await expect(coordinator.reportBlockedRequest("exec", request)).resolves.toBe("failed");
+      await reporter.stop();
+      await expect(coordinator.reportBlockedRequest("exec", request)).resolves.toBe(
+        "no-unique-chat",
+      );
+    } finally {
+      coordinator.close();
+    }
+  });
+
   it("keeps the local approval route visible when an unbound request has multiple runtimes", () => {
     const coordinator = createApprovalNativeRouteCoordinator();
     const first = coordinator.createReporter({

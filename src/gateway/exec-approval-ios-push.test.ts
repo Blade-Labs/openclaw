@@ -291,6 +291,40 @@ describe("createExecApprovalIosPushDelivery", () => {
     expect(sendApnsExecApprovalAlertMock).not.toHaveBeenCalled();
   });
 
+  it.each(["registrations", "auth"] as const)(
+    "rechecks requester-only suppression after awaiting iOS %s",
+    async (stage) => {
+      mockPairedIosOperator(["operator.approvals", "operator.read"]);
+      const started = createDeferred();
+      const release = createDeferred();
+      if (stage === "registrations") {
+        loadApnsRegistrationsMock.mockImplementationOnce(async () => {
+          started.resolve();
+          await release.promise;
+          return [{ nodeId: "ios-device-1", registration: apnsRegistration() }];
+        });
+      } else {
+        resolveApnsAuthConfigFromEnvMock.mockImplementationOnce(async () => {
+          started.resolve();
+          await release.promise;
+          return resolvedApnsAuthConfig();
+        });
+      }
+      let strict = false;
+      const delivery = createExecApprovalIosPushDelivery({ log: {} });
+      const requested = delivery.handleRequested(approvalRequest("synthetic-live-ios-push"), {
+        shouldSuppress: () => strict,
+      });
+      await started.promise;
+      strict = true;
+      release.resolve();
+      await expect(requested).resolves.toBe(false);
+      expect(sendApnsExecApprovalAlertMock).not.toHaveBeenCalled();
+      await delivery.handleResolved(approvalResolved("synthetic-live-ios-push"));
+      expect(sendApnsExecApprovalResolvedWakeMock).not.toHaveBeenCalled();
+    },
+  );
+
   it("does not treat iOS as a live approval route when every push fails", async () => {
     const warn = vi.fn();
     mockPairedIosOperator(["operator.approvals", "operator.read"]);

@@ -1067,6 +1067,7 @@ export interface OperatorApprovalStandingGrants {
 export interface OperatorApprovals {
   approval_id: string;
   audience_session_keys_json: string;
+  authorization_json: string | null;
   consumed_at_ms: number | null;
   consumed_by: string | null;
   created_at_ms: number;
@@ -1079,6 +1080,7 @@ export interface OperatorApprovals {
   requested_by_device_token_auth: Generated<number>;
   resolution_ref: string;
   resolved_at_ms: number | null;
+  resolver_actor_json: string | null;
   resolver_id: string | null;
   resolver_kind: string | null;
   reviewer_device_ids_json: string;

@@ -3,6 +3,8 @@ import type {
   GatewayContextResolver,
   GatewayRequestContext,
 } from "../../gateway/server-methods/types.js";
+import { classifyApprovalRequester } from "../../infra/approval-requester-binding.js";
+import { projectHostTurnSource } from "../../infra/host-turn-source.js";
 import {
   buildChannelInboundEventContext,
   buildHostChannelInboundEventContext,
@@ -16,6 +18,7 @@ import {
   consumeChannelAdmissionEvidence,
   copyChannelParticipantAdmissionEvidence,
   readChannelContextAdmissionEvidence,
+  readChannelContextTurnSource,
   readChannelContextGatewayContextResolver,
   type ChannelAdmissionEvidence,
 } from "./admission-evidence.js";
@@ -27,6 +30,7 @@ async function buildAdmittedContext(
   allowFrom = [participantId],
   resolveGatewayContext?: GatewayContextResolver,
   authentication?: "verified" | "asserted" | "unverified" | "mutable",
+  messageId: string | null = "msg-1",
 ) {
   const gateway = {
     channelAdmissionAudit: audit,
@@ -40,6 +44,7 @@ async function buildAdmittedContext(
   const channelIngress = await createHostChannelIngressRuntime(owner).resolveStable({
     channelId: "test",
     accountId: "acct:primary",
+    source: { actorKind: "human", eventKind: "message" },
     identity: authentication ? { authentication: "verified" } : undefined,
     subject: {
       stableId: participantId,
@@ -49,7 +54,7 @@ async function buildAdmittedContext(
     contextBinding: {
       agentId: "main",
       sessionKey: "agent:main:test:dm:dm-1",
-      messageId: "msg-1",
+      ...(messageId ? { messageId } : {}),
       inboundEventKind: "user_request",
     },
     dmPolicy: "allowlist",
@@ -64,7 +69,7 @@ async function buildAdmittedContext(
   return buildContext({
     channel: "test",
     accountId: "acct:primary",
-    messageId: "msg-1",
+    ...(messageId ? { messageId } : {}),
     from: "test:route:dm-1",
     sender: { id: participantId },
     conversation: { kind: "direct", id: "dm-1" },
@@ -80,6 +85,54 @@ function inspectChannelContext(context: object) {
 }
 
 describe("channel admission evidence", () => {
+  it.each([true, false])(
+    "retains authenticated source with audit off (message identity: %s)",
+    async (hasMessageId) => {
+      const audit = createChannelAdmissionAudit({ enabled: false });
+      try {
+        const context = await buildAdmittedContext(
+          audit,
+          "synthetic-sender",
+          undefined,
+          undefined,
+          undefined,
+          hasMessageId ? "msg-1" : null,
+        );
+        const source = projectHostTurnSource(
+          readChannelContextTurnSource(context),
+          "synthetic-run",
+          "synthetic-session",
+        );
+        expect(source).toMatchObject({
+          completeness: hasMessageId ? "complete" : "unavailable",
+          inputs: [
+            {
+              origin: "user",
+              actor: {
+                channel: "test",
+                accountId: "acct:primary",
+                senderId: "synthetic-sender",
+                actorKind: "human",
+              },
+              message: {
+                messageId: hasMessageId ? "msg-1" : "",
+                conversationId: "dm-1",
+                conversationKind: "direct",
+                eventKind: "message",
+              },
+            },
+          ],
+        });
+        expect(readChannelContextTurnSource({ ...context })).toBeUndefined();
+        expect(Object.isFrozen(source.inputs[0])).toBe(true);
+        expect(classifyApprovalRequester(source).state).toBe(
+          hasMessageId ? "bound" : "unavailable",
+        );
+      } finally {
+        audit.close();
+      }
+    },
+  );
   it("keeps Gateway routing instance-bound when audit collection is disabled", async () => {
     const audit = createChannelAdmissionAudit({ enabled: false });
     const gatewayContext = { owner: "gateway-a" } as never;

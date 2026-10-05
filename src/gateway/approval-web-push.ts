@@ -115,10 +115,15 @@ function approvalWebPushTopic(approvalId: string): string {
 
 async function deliverBoundApprovalWebPush<TPayload>(params: {
   record: ExecApprovalRecord<TPayload>;
+  shouldSuppress?: () => boolean;
   getRuntimeConfig: () => OpenClawConfig;
   stateDir?: string;
 }): Promise<ApprovalRequestWebPushDelivery | null> {
-  if (params.record.resolvedAtMs !== undefined || params.record.expiresAtMs <= Date.now()) {
+  if (
+    params.shouldSuppress?.() ||
+    params.record.resolvedAtMs !== undefined ||
+    params.record.expiresAtMs <= Date.now()
+  ) {
     return null;
   }
   if (!(await hasBoundWebPushSubscriptions(params.stateDir))) {
@@ -210,6 +215,7 @@ async function deliverBoundApprovalWebPush<TPayload>(params: {
       // the network continuation so revoked or resolved requests never dispatch.
       const now = Date.now();
       if (
+        params.shouldSuppress?.() ||
         currentEligibleSubscriptions.length === 0 ||
         params.record.resolvedAtMs !== undefined ||
         params.record.expiresAtMs <= now
@@ -238,8 +244,11 @@ async function deliverBoundApprovalWebPush<TPayload>(params: {
       return {
         start: () =>
           Promise.all(
-            [...requestGroups.values()].map(({ copy, subscriptions: groupedSubscriptions }) =>
-              sendWebPushNotifications({
+            [...requestGroups.values()].map(({ copy, subscriptions: groupedSubscriptions }) => {
+              if (params.shouldSuppress?.()) {
+                return Promise.resolve([]);
+              }
+              return sendWebPushNotifications({
                 subscriptions: groupedSubscriptions,
                 payload: {
                   ...copy,
@@ -256,19 +265,29 @@ async function deliverBoundApprovalWebPush<TPayload>(params: {
                   timeout: WEB_PUSH_APPROVAL_TIMEOUT_MS,
                   topic: approvalWebPushTopic(params.record.id),
                 },
-              }),
-            ),
+              });
+            }),
           ),
       };
     },
   );
   if (!groupedResults) {
+    if (params.shouldSuppress?.()) {
+      await deleteWebPushApprovalDeliveryTargets({
+        approvalId: params.record.id,
+        subscriptionIds: [...preparedIds],
+        stateDir: params.stateDir,
+      });
+    }
     return null;
   }
   const results = groupedResults.flat();
   const definitelyRejectedSubscriptionIds = results
     .filter((result) => !result.ok && result.statusCode !== undefined)
     .map((result) => result.subscriptionId);
+  if (results.length === 0 && params.shouldSuppress?.()) {
+    definitelyRejectedSubscriptionIds.push(...preparedIds);
+  }
   await deleteWebPushApprovalDeliveryTargets({
     approvalId: params.record.id,
     subscriptionIds: definitelyRejectedSubscriptionIds,
@@ -446,10 +465,14 @@ export function createApprovalWebPushDelivery(params: {
 
   return {
     /** Sends a request notification only when at least one browser has a durable binding. */
-    handleRequested<TPayload>(record: ExecApprovalRecord<TPayload>): Promise<boolean> {
+    handleRequested<TPayload>(
+      record: ExecApprovalRecord<TPayload>,
+      opts?: { shouldSuppress?: () => boolean },
+    ): Promise<boolean> {
       const deliveryState: ApprovalWebPushDeliveryState = {
         requestPushPromise: deliverBoundApprovalWebPush({
           record,
+          shouldSuppress: opts?.shouldSuppress,
           getRuntimeConfig: params.getRuntimeConfig,
           stateDir: params.stateDir,
         }),

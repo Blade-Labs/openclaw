@@ -335,6 +335,7 @@ export interface SessionPendingInputs {
   seq: Generated<number>;
   session_id: string;
   session_key: string;
+  source_provenance_json: string | null;
   state: string;
 }
 

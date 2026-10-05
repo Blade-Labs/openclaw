@@ -313,6 +313,11 @@ stay pending.
 Discord, Telegram, and QQ bot also support same-chat `/approve`, but those channels still use their
 resolved approver list for authorization even when native approval delivery is disabled.
 
+Requester-only policy adds a per-request check: the authenticated sender must
+match the core-bound requester and still satisfy the channel's approver policy.
+An operator scope or command authorization cannot override that check. See
+[Teams requester-only approvals](/channels/msteams/cards-and-actions#requester-only-approvals).
+
 ### Native approval delivery
 
 Some channels can also act as native approval clients: Discord, Slack, Telegram, Matrix, and QQ bot.
@@ -507,6 +512,11 @@ native approval clients use their resolved approver lists for approval authoriza
 a Telegram forum-topic approval prompt can be visible to everyone in the topic, but only numeric
 Telegram user IDs resolved from `channels.telegram.execApprovals.approvers` or
 `commands.ownerAllowFrom` can approve or deny it.
+
+With Teams `approvals.requesterOnly` enabled, explicit approver membership is
+required, but only the authenticated requester can resolve their own request.
+This restriction also applies to `/approve`, CLI, Control UI, and RPC resolution
+and remains on stamped requests after the option is disabled.
 
 ## Related
 

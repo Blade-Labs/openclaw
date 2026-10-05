@@ -13,6 +13,7 @@ import {
   type ExecApprovalRequestPayload,
 } from "../../infra/exec-approvals.js";
 import { createDeferredCore } from "../../shared/deferred.js";
+import { withRequesterApprovalChannel } from "../approval-requester.test-support.js";
 import { createTestApprovalManager } from "../exec-approval-manager.test-support.js";
 import { createSyntheticPluginRuntimeClient } from "../server-plugin-runtime-client.js";
 import { createGatewayRequestContext } from "../server-request-context.js";
@@ -31,6 +32,59 @@ const binding = {
 };
 
 describe("attached command approval custody", () => {
+  it("returns a typed terminal denial for a strict account without admitted source", async (test) => {
+    await withRequesterApprovalChannel(async () => {
+      const run = createOperationalRunInstanceRef("synthetic-environment-run");
+      const authority = claimAgentRunDelegatedAuthority(run);
+      test.onTestFinished(() => {
+        releaseAgentRunDelegatedAuthority(authority);
+      });
+      const manager = createTestApprovalManager(test, {
+        validateAgentRuntimeDelegatedAuthority: validateAgentRunDelegatedAuthority,
+      });
+      const broadcast = vi.fn();
+      const forward = vi.fn(async () => true);
+      const context = createGatewayRequestContext(
+        makeContextParams({ execApprovalManager: manager, forwardExecApprovalRequest: forward }),
+      );
+      context.broadcast = broadcast;
+      broadcast.mockImplementation((_event, request: ExecApprovalRequest) => {
+        void manager.resolve(request.id, "allow-once");
+      });
+      const client = createSyntheticPluginRuntimeClient({
+        pluginRuntimeOwnerId: "synthetic-plugin",
+        scopes: ["operator.write"],
+      });
+      client.internal!.agentRuntimeIdentity = {
+        kind: "agentRuntime",
+        agentId: binding.agentId,
+        sessionKey: binding.sessionKey,
+        operationalRunInstance: run,
+        delegatedAuthority: { ...authority, kind: "local" },
+        turnSourceChannel: "test",
+        turnSourceAccountId: "default",
+      };
+      const options = { client, context } as unknown as GatewayRequestHandlerOptions;
+      await expect(
+        approveSessionEnvironmentCommand({
+          options,
+          binding,
+          argv: ["node"],
+          background: false,
+          assertCurrent: () => {},
+        }),
+      ).rejects.toMatchObject({
+        details: {
+          code: "APPROVAL_REQUESTER_UNAVAILABLE",
+          terminalReason: "requester-unavailable",
+        },
+      });
+      expect(broadcast).not.toHaveBeenCalled();
+      expect(forward).not.toHaveBeenCalled();
+      expect(await manager.listPendingRecords()).toEqual([]);
+    });
+  });
+
   it.for([
     { route: "forward", outcome: "allow-once" },
     { route: "ios", outcome: "allow-once" },
@@ -166,7 +220,7 @@ describe("attached command approval custody", () => {
           });
           const completion =
             outcome === "allow-once" || outcome === "cron"
-              ? expect(operation).resolves.toBeUndefined()
+              ? expect(operation).resolves.toMatchObject({ assertCurrent: expect.any(Function) })
               : expect(operation).rejects.toThrow(
                   outcome === "expire" ? "not approved" : "run authority ended",
                 );
@@ -177,6 +231,10 @@ describe("attached command approval custody", () => {
             }),
           ]);
           expect(event.request).toMatchObject({
+            authorization: {
+              requesterBinding: { state: "unavailable" },
+              policy: { requireResolverMatch: false },
+            },
             runId: run.runId,
             sessionKey: binding.sessionKey,
             turnSourceChannel: "telegram",
@@ -253,7 +311,7 @@ describe("attached command approval custody", () => {
         assertCurrent: () => {},
       });
       if (decision === "allow-once") {
-        await expect(operation).resolves.toBeUndefined();
+        await expect(operation).resolves.toMatchObject({ assertCurrent: expect.any(Function) });
         const id = broadcast.mock.calls[0]![1].id;
         expect(await manager.consumeAllowOnce(id)).toBe(false);
       } else {

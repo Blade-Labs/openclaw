@@ -50,6 +50,20 @@ type ChannelApprovalNativeDeliveryCapabilities = {
  * Adapter implemented by channel plugins that support native approval delivery.
  */
 export type ChannelApprovalNativeAdapter = {
+  /** Verified personal destination; strict requests never use roster or origin fallbacks. */
+  resolveRequesterTarget?: (params: {
+    cfg: OpenClawConfig;
+    accountId?: string | null;
+    approvalKind: ChannelApprovalKind;
+    request: ChannelApprovalNativeRequest;
+  }) => ChannelApprovalNativeTarget | null | Promise<ChannelApprovalNativeTarget | null>;
+  /** Optional safe notice target for a blocked request with one authenticated personal chat. */
+  resolveRequesterNoticeTarget?: (params: {
+    cfg: OpenClawConfig;
+    accountId?: string | null;
+    approvalKind: ChannelApprovalKind;
+    request: ChannelApprovalNativeRequest;
+  }) => ChannelApprovalNativeTarget | null | Promise<ChannelApprovalNativeTarget | null>;
   describeDeliveryCapabilities: (params: {
     cfg: OpenClawConfig;
     accountId?: string | null;

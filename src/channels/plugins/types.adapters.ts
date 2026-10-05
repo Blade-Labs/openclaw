@@ -10,6 +10,10 @@ import type { DmScope } from "../../config/types.base.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { GroupToolPolicyConfig } from "../../config/types.tools.js";
 import type { ChannelApprovalNativeRuntimeAdapter } from "../../infra/approval-handler-runtime-types.js";
+import type {
+  ApprovalRequestAuthorization,
+  ApprovalRequestPolicy,
+} from "../../infra/approval-requester-binding.js";
 import type { ChannelApprovalKind } from "../../infra/approval-types.js";
 import type { ExecApprovalRequest, ExecApprovalResolved } from "../../infra/exec-approvals-core.js";
 import type {
@@ -622,7 +626,13 @@ export type ChannelApprovalAdapter = {
 };
 
 export type ChannelApprovalCapability = ChannelApprovalAdapter & {
+  resolveRequestPolicy?: (params: {
+    cfg: OpenClawConfig;
+    accountId: string;
+    approvalKind: ChannelApprovalKind;
+  }) => ApprovalRequestPolicy | undefined;
   authorizeActorAction?: (params: {
+    authorization?: ApprovalRequestAuthorization;
     cfg: OpenClawConfig;
     accountId?: string | null;
     senderId?: string | null;

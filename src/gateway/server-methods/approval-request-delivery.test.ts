@@ -2,10 +2,18 @@ import { setImmediate as nextTurn } from "node:timers/promises";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AsyncWorkScope } from "../../shared/async-work-scope.js";
 import { createDeferredCore } from "../../shared/deferred.js";
+import { requesterAuthorization } from "../approval-requester.test-support.js";
 import { createTestApprovalManager } from "../exec-approval-manager.test-support.js";
+import type { ExecApprovalRecord } from "../exec-approval-manager.types.js";
 import { runApprovalRequestDeliveries } from "./approval-request-delivery.js";
 
-const handleApprovalWebPushRequestedMock = vi.fn(() => false);
+const handleApprovalWebPushRequestedMock =
+  vi.fn<
+    (
+      record: ExecApprovalRecord<unknown>,
+      opts?: { shouldSuppress?: () => boolean },
+    ) => boolean | Promise<boolean>
+  >();
 
 const approvalDeliveryCallers = [
   {
@@ -63,6 +71,33 @@ describe("runApprovalRequestDeliveries", () => {
     handleApprovalWebPushRequestedMock.mockReturnValue(false);
   });
 
+  it.for([true, false])(
+    "suppresses forwarding and both push transports before strict approval fan-out (frozen=%s)",
+    (frozen, testContext) => {
+      const manager = createTestApprovalManager(testContext);
+      const record = manager.create(
+        { command: "echo synthetic" },
+        60_000,
+        "synthetic-exclusive-approval",
+      );
+      record.authorization = requesterAuthorization(frozen);
+      record.requiresRequesterMatch = () => true;
+      const forward = vi.fn(async () => true);
+      const iosPush = vi.fn(async () => true);
+      expect(
+        runApprovalRequestDeliveries({
+          context: deliveryContext(),
+          record,
+          forward: [forward, "forward failed"],
+          iosPush: [iosPush, "push failed"],
+        }),
+      ).toBe(false);
+      expect(forward).not.toHaveBeenCalled();
+      expect(iosPush).not.toHaveBeenCalled();
+      expect(handleApprovalWebPushRequestedMock).not.toHaveBeenCalled();
+    },
+  );
+
   it("returns false synchronously when no external routes exist", (testContext) => {
     const manager = createTestApprovalManager(testContext);
     const record = manager.create({ command: "echo ok" }, 60_000, "approval-no-delivery");
@@ -78,7 +113,50 @@ describe("runApprovalRequestDeliveries", () => {
     const delivery = runApprovalRequestDeliveries({ context: deliveryContext(), record });
 
     await expect(delivery).resolves.toBe(true);
-    expect(handleApprovalWebPushRequestedMock).toHaveBeenCalledWith(record);
+    expect(handleApprovalWebPushRequestedMock).toHaveBeenCalledWith(record, {
+      shouldSuppress: expect.any(Function),
+    });
+  });
+
+  it("latches a live restriction across both push continuations", async (testContext) => {
+    const manager = createTestApprovalManager(testContext);
+    const record = manager.create({ command: "echo synthetic" }, 60_000, "synthetic-latched-push");
+    record.authorization = requesterAuthorization(false);
+    let strict = false;
+    record.requiresRequesterMatch = () => strict;
+    const release = createDeferredCore();
+    const observed = createDeferredCore();
+    const networkSend = vi.fn();
+    handleApprovalWebPushRequestedMock.mockImplementationOnce(async (_record, opts) => {
+      await release.promise;
+      const suppressed = opts?.shouldSuppress?.() ?? false;
+      strict = false;
+      observed.resolve();
+      if (!suppressed || !(opts?.shouldSuppress?.() ?? false)) {
+        networkSend();
+        return true;
+      }
+      return false;
+    });
+    const delivered = runApprovalRequestDeliveries({
+      context: deliveryContext(),
+      record,
+      iosPush: [
+        async (_isTargetVisible, shouldSuppress) => {
+          await observed.promise;
+          if (!shouldSuppress?.()) {
+            networkSend();
+            return true;
+          }
+          return false;
+        },
+        "push failed",
+      ],
+    });
+    strict = true;
+    release.resolve();
+    await expect(delivered).resolves.toBe(false);
+    expect(networkSend).not.toHaveBeenCalled();
   });
 
   it.for(

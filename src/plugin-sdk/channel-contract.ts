@@ -42,3 +42,4 @@ export type {
   ChannelStatusAdapter,
 } from "../channels/plugins/types.adapters.js";
 export type { ChannelRuntimeSurface } from "../channels/plugins/channel-runtime-surface.types.js";
+export type { ApprovalRequestPolicy } from "../infra/approval-requester-binding.js";

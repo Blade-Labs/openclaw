@@ -38,6 +38,7 @@ export type OperatorApprovalWorkerOperations = {
     input: {
       id: string;
       decision: OperatorApprovalDecision;
+      requireResolverMatch?: boolean;
       resolver: OperatorApprovalResolver;
       expectedKind?: OperatorApprovalKind;
       runtimeEpoch?: string;
@@ -56,6 +57,7 @@ export type OperatorApprovalWorkerOperations = {
       status?: "denied" | "expired" | "cancelled";
       requireDue?: boolean;
       reason: OperatorApprovalTerminalReason;
+      requireResolverMatch?: boolean;
       resolver: OperatorApprovalResolver;
       expectedKind?: OperatorApprovalKind;
       runtimeEpoch?: string;
@@ -71,6 +73,7 @@ export type OperatorApprovalWorkerOperations = {
     input: {
       id: string;
       consumerId: string;
+      requireResolverMatch?: boolean;
       expectedKind?: OperatorApprovalKind;
       runtimeEpoch?: string;
       redemptionWindowMs?: number;

@@ -2,6 +2,7 @@
 import { generateKeyPairSync } from "node:crypto";
 import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
 import {
   deriveDeviceIdFromPublicKey,
   publicKeyRawBase64UrlFromPem,
@@ -214,6 +215,35 @@ describe("push-apns.relay", () => {
   });
 
   describe("sendApnsRelayPush", () => {
+    it("rechecks the synchronous approval guard after awaited relay preparation", async () => {
+      const started = createDeferred();
+      const preparation = createDeferred<boolean>();
+      const isCurrent = vi
+        .fn()
+        .mockResolvedValueOnce(true)
+        .mockImplementationOnce(() => {
+          started.resolve();
+          return preparation.promise;
+        });
+      const fetchMock = vi.fn().mockResolvedValue(new Response("", { status: 202 }));
+      vi.stubGlobal("fetch", fetchMock);
+      let suppressed = false;
+      const sending = sendApnsRelayPush({
+        ...createRelayPushParams(),
+        isCurrent,
+        assertCurrent: () => {
+          if (suppressed) {
+            throw new Error("synthetic requester-only suppression");
+          }
+        },
+      });
+      await started.promise;
+      suppressed = true;
+      preparation.resolve(true);
+      await expect(sending).rejects.toThrow("synthetic requester-only suppression");
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
     it("revalidates ownership before relay fetch and combines the lifecycle signal", async () => {
       const controller = new AbortController();
       const isCurrent = vi.fn().mockResolvedValue(true);

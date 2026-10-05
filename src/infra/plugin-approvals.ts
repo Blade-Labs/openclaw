@@ -1,5 +1,9 @@
 // Defines plugin approval request/resolution payloads and actions.
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
+import type {
+  ApprovalRequestAuthorization,
+  ApprovalResolvingActor,
+} from "./approval-requester-binding.js";
 import { summarizeApprovalScope, type ApprovalScope } from "./approval-scope.js";
 import type { ExecApprovalDecision } from "./exec-approvals-core.js";
 
@@ -32,6 +36,7 @@ type PluginApprovalPlacementGrantBinding = {
 
 /** Request payload supplied by plugin approval callers. */
 export type PluginApprovalRequestPayload = {
+  authorization?: ApprovalRequestAuthorization;
   pluginId?: string | null;
   title: string;
   description: string;
@@ -74,6 +79,7 @@ export type PluginApprovalRequest = {
 
 /** Resolved plugin approval decision plus optional request snapshot. */
 export type PluginApprovalResolved = {
+  resolvedByActor?: ApprovalResolvingActor | null;
   id: string;
   decision: ExecApprovalDecision;
   resolvedBy?: string | null;

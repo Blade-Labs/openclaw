@@ -135,3 +135,23 @@ export function prepareExecApprovalSettlement(params: {
     resolutionSource: params.localResolutionSource,
   };
 }
+
+/** Observational error handlers cannot change fail-closed approval settlement. */
+export function reportExecApprovalError(
+  error: unknown,
+  context: { approvalId: string; operation: "expire" },
+  approvalKind: import("./operator-approval-store.js").OperatorApprovalKind,
+  onError: ExecApprovalManagerOptions<unknown>["onError"],
+): void {
+  if (!onError) {
+    return;
+  }
+  try {
+    onError(error instanceof Error ? error : new Error(String(error)), {
+      ...context,
+      approvalKind,
+    });
+  } catch {
+    // Error reporting must not turn a fail-closed timeout into an uncaught timer exception.
+  }
+}

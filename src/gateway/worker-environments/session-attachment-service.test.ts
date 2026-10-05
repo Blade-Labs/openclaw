@@ -4,15 +4,26 @@ import {
   GATEWAY_CLIENT_CAPS,
   GATEWAY_CLIENT_IDS,
 } from "../../../packages/gateway-protocol/src/client-info.js";
+import {
+  createOperationalRunInstanceRef,
+  getAdmittedRunDelegatedAuthority,
+  prepareAgentRunAdmission,
+} from "../../agents/admitted-run-context.js";
+import * as execDefaults from "../../agents/exec-defaults.js";
 import { withGatewayToolCallerIdentity } from "../../agents/tools/gateway-caller-context.js";
 import {
   ensureSessionEntrySync,
   replaceSessionEntrySync,
 } from "../../config/sessions/session-accessor.js";
+import { validateAgentRunDelegatedAuthority } from "../../infra/agent-run-registry.js";
+import { createHostChannelTurnSource } from "../../infra/host-turn-source.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { closeOpenClawAgentDatabases } from "../../state/openclaw-agent-db.js";
+import { withRequesterApprovalChannel } from "../approval-requester.test-support.js";
+import { createTestApprovalFixture } from "../exec-approval-manager.test-support.js";
 import { createGatewayPortalService } from "../portals/portal-service.js";
 import { createDirectChatContext } from "../server-chat.agent-events.test-helpers.js";
+import { environmentsSessionExecHandlers } from "../server-methods/environments.session-exec.js";
 import {
   environmentsSessionHandlers,
   resolveSessionEnvironmentCaller,
@@ -87,6 +98,213 @@ describe("conversation-owned temporary environments", () => {
       },
     );
   });
+
+  it.for([false, true].flatMap((strict) => [false, true].map((revoke) => ({ strict, revoke }))))(
+    "retains resolver eligibility through attachment maintenance (strict=$strict, revoke=$revoke)",
+    async ({ strict, revoke }, testContext) => {
+      let eligible = true;
+      await withRequesterApprovalChannel(
+        async () => {
+          const policy = vi.spyOn(execDefaults, "resolveExecDefaults").mockReturnValue({
+            host: "gateway",
+            effectiveHost: "gateway",
+            mode: "ask",
+            security: "allowlist",
+            ask: "always",
+            canRequestNode: true,
+          });
+          testContext.onTestFinished(() => policy.mockRestore());
+          const runSessionEnvironmentCommand = vi.fn<
+            NonNullable<support.WorkerEnvironmentServiceOptions["runSessionEnvironmentCommand"]>
+          >(async (_binding, command) => {
+            command.assertCurrent?.();
+            return {
+              workspaceDir: "/workspace",
+              stdout: "Synthetic command completed",
+              stderr: "",
+              code: 0,
+              signal: null,
+              killed: false,
+              termination: "exit",
+            };
+          });
+          const service = support.createService(support.createProvider(), {
+            runSessionEnvironmentCommand,
+          });
+          const created = await service.createSessionAttachment(request, authorize);
+          const attachment = service.getSessionAttachment(identity.sessionId);
+          expect(attachment).toBeDefined();
+          const operationalRunInstance = createOperationalRunInstanceRef("synthetic-attached-exec");
+          const admission = prepareAgentRunAdmission({
+            cfg: support.testState.config,
+            sessionKey: identity.sessionKey,
+            facts: {
+              runId: operationalRunInstance.runId,
+              agentId: identity.agentId,
+              ingress: { kind: "system", boundary: "synthetic-test", state: "present" },
+            },
+            operationalRunInstance,
+            turnSource: createHostChannelTurnSource({
+              actor: {
+                channel: "test",
+                accountId: "default",
+                senderId: "synthetic-requester",
+                actorKind: "human",
+              },
+              message: {
+                messageId: "synthetic-environment-message",
+                conversationId: "synthetic-environment-chat",
+                conversationKind: "direct",
+                eventKind: "message",
+              },
+            }),
+          });
+          const fixture = createTestApprovalFixture(testContext, {
+            validateAgentRuntimeDelegatedAuthority: validateAgentRunDelegatedAuthority,
+          });
+          const maintenanceEntered = createDeferredCore();
+          const maintenanceRelease = createDeferredCore();
+          const touch = support.testState.store.touchSessionAttachment.bind(
+            support.testState.store,
+          );
+          const touchSpy = vi
+            .spyOn(support.testState.store, "touchSessionAttachment")
+            .mockImplementationOnce(async (...args) => {
+              maintenanceEntered.resolve();
+              await maintenanceRelease.promise;
+              return await touch(...args);
+            });
+          try {
+            const admitted = await admission.admit("plugin-harness");
+            const authority = getAdmittedRunDelegatedAuthority(admitted);
+            if (!authority) {
+              throw new Error("Missing synthetic admission authority");
+            }
+            await fixture.run(async () => {
+              const delivered = createDeferredCore<string>();
+              const context = createDirectChatContext({
+                getRuntimeConfig: () => support.testState.config,
+                workerEnvironmentService: service,
+                execApprovalManager: fixture.manager,
+                hasExecApprovalClients: () => true,
+                approvalEvents: {
+                  publishRequested: (_kind, event) => {
+                    delivered.resolve((event as { id: string }).id);
+                    return 1;
+                  },
+                  publishResolved: vi.fn(),
+                  deliverRequester: async (_kind, event) => {
+                    delivered.resolve((event as { id: string }).id);
+                    return true;
+                  },
+                },
+              });
+              const respond = vi.fn();
+              await withGatewayToolCallerIdentity(
+                {
+                  ...identity,
+                  operationalRunInstance,
+                  approvalAuthority: authority,
+                  receiptAuthority: () => validateAgentRunDelegatedAuthority(authority),
+                  assertToolAllowed: () => {},
+                  gatewayContextResolver: () => context,
+                  turnSourceChannel: "test",
+                  turnSourceAccountId: "default",
+                },
+                async () => {
+                  const pending = fixture.track(
+                    Promise.resolve(
+                      environmentsSessionExecHandlers["environments.session.exec"]!({
+                        req: {
+                          type: "req",
+                          id: "synthetic-exec",
+                          method: "environments.session.exec",
+                        },
+                        params: {
+                          argv: ["synthetic-command"],
+                          environmentId: created.attachment.environmentId,
+                        },
+                        context,
+                        client: createSyntheticPluginRuntimeClient({
+                          pluginRuntimeOwnerId: "synthetic-plugin",
+                        }),
+                        isWebchatConnect: () => false,
+                        respond,
+                      }),
+                    ),
+                  );
+                  const id = await Promise.race([
+                    delivered.promise,
+                    pending.then(() => {
+                      throw new Error("Environment execution ended before approval delivery");
+                    }),
+                  ]);
+                  expect(
+                    await fixture.manager.resolveDetailed(
+                      id,
+                      "allow-once",
+                      {
+                        kind: "channel",
+                        id: "test:default",
+                        actor: {
+                          kind: "channel",
+                          channel: "test",
+                          accountId: "default",
+                          senderId: "synthetic-requester",
+                          actorKind: "human",
+                        },
+                      },
+                      null,
+                      "operator",
+                      {
+                        assertCurrent: () => {
+                          if (!eligible) {
+                            throw new Error("Synthetic resolver revoked");
+                          }
+                        },
+                      },
+                    ),
+                  ).toMatchObject({ outcome: "resolved" });
+                  await Promise.race([
+                    maintenanceEntered.promise,
+                    pending.then(() => {
+                      throw new Error("Environment execution ended before attachment maintenance");
+                    }),
+                  ]);
+                  expect((await fixture.manager.getSnapshot(id))?.consumedDecision).toBe(
+                    "allow-once",
+                  );
+                  expect(runSessionEnvironmentCommand).not.toHaveBeenCalled();
+                  eligible = !revoke;
+                  maintenanceRelease.resolve();
+                  await pending;
+                  expect(respond.mock.calls.at(-1)?.[0]).toBe(!revoke);
+                  if (revoke) {
+                    expect(respond.mock.calls.at(-1)?.[2]).toMatchObject({
+                      message: "Approval execution authority is no longer active",
+                    });
+                  } else {
+                    expect(respond.mock.calls.at(-1)?.[1]).toMatchObject({
+                      environmentId: created.attachment.environmentId,
+                      stdout: "Synthetic command completed",
+                    });
+                  }
+                  expect(runSessionEnvironmentCommand).toHaveBeenCalledTimes(revoke ? 0 : 1);
+                  expect(service.getSessionAttachment(identity.sessionId)).toEqual(attachment);
+                },
+              ).finally(() => maintenanceRelease.resolve());
+            });
+          } finally {
+            maintenanceRelease.resolve();
+            touchSpy.mockRestore();
+            admission.close();
+            policy.mockRestore();
+          }
+        },
+        { strict: () => strict, eligible: () => eligible },
+      );
+    },
+  );
 
   it("opens a portal through ambient plugin authority and closes an unused carrier when that authority ends", async () => {
     const service = support.createService(support.createProvider());

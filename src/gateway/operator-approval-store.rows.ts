@@ -2,8 +2,18 @@
 import { safeParseJson } from "@openclaw/normalization-core/json-coercion";
 import { normalizeNullableString } from "@openclaw/normalization-core/string-coerce";
 import { validateApprovalPresentation } from "../../packages/gateway-protocol/src/approval-result-validators.js";
+import { lazyCompile } from "../../packages/gateway-protocol/src/protocol-validator.js";
 import { isWellFormedApprovalId } from "../../packages/gateway-protocol/src/schema/approval-id.js";
+import {
+  ApprovalRequestAuthorizationSchema,
+  ApprovalResolvingActorSchema,
+} from "../../packages/gateway-protocol/src/schema/approval-provenance.js";
 import type { ApprovalPresentation } from "../../packages/gateway-protocol/src/schema/approvals.js";
+import {
+  classifyApprovalRequester,
+  type ApprovalRequestAuthorization,
+  type ApprovalResolvingActor,
+} from "../infra/approval-requester-binding.js";
 import {
   buildApprovalResolutionRef,
   isApprovalResolutionRef,
@@ -26,6 +36,8 @@ import type {
   OperatorApprovalStatus,
   OperatorApprovalTerminalReason,
 } from "./operator-approval-store.types.js";
+const validateAuthorization = lazyCompile(ApprovalRequestAuthorizationSchema);
+const validateActor = lazyCompile(ApprovalResolvingActorSchema);
 export const OPERATOR_APPROVAL_TERMINAL_RETENTION_MS = 30 * 24 * 60 * 60_000;
 export const OPERATOR_APPROVAL_RECEIPT_SUMMARY_MAX_ROWS = 128;
 export const OPERATOR_APPROVAL_RECEIPT_MAX_PAYLOAD_BYTES = 64 * 1024;
@@ -229,6 +241,26 @@ function hasValidLifecycleTuple(params: {
 }
 
 export function decodeOperatorApprovalRow(row: OperatorApprovalRow): OperatorApprovalRecord | null {
+  let authorization: ApprovalRequestAuthorization | undefined;
+  if (row.authorization_json != null) {
+    const parsed = safeParseJson(row.authorization_json);
+    if (
+      !validateAuthorization(parsed) ||
+      JSON.stringify(parsed.requesterBinding) !==
+        JSON.stringify(classifyApprovalRequester(parsed.source))
+    ) {
+      return null;
+    }
+    authorization = parsed;
+  }
+  let resolvedByActor: ApprovalResolvingActor | undefined;
+  if (row.resolver_actor_json != null) {
+    const parsed = safeParseJson(row.resolver_actor_json);
+    if (!validateActor(parsed)) {
+      return null;
+    }
+    resolvedByActor = parsed;
+  }
   const presentation = parseApprovalPresentation(row.presentation_json);
   const reviewerDeviceIds = parseStringArray(row.reviewer_device_ids_json);
   const audienceSessionKeys = parseStringArray(row.audience_session_keys_json);
@@ -322,7 +354,14 @@ export function decodeOperatorApprovalRow(row: OperatorApprovalRow): OperatorApp
     expiresAtMs: row.expires_at_ms,
     updatedAtMs: row.updated_at_ms,
     decision,
-    terminalReason,
+    terminalReason:
+      terminalReason === "no-route" &&
+      resolvedByActor?.kind === "system" &&
+      resolvedByActor.reason === "requester-unavailable"
+        ? "requester-unavailable"
+        : terminalReason,
+    ...(authorization ? { authorization } : {}),
+    ...(resolvedByActor ? { resolvedByActor } : {}),
     resolvedAtMs: row.resolved_at_ms,
     resolver:
       resolverKind === null
@@ -469,6 +508,8 @@ export function inputMatchesExistingRow(
     row.status === "pending" &&
     row.kind === input.kind &&
     row.presentation_json === serialized.presentationJson &&
+    (row.authorization_json ?? null) ===
+      (input.authorization ? JSON.stringify(input.authorization) : null) &&
     row.requested_by_device_id === normalizeNullableString(input.requester?.deviceId) &&
     row.requested_by_client_id === normalizeNullableString(input.requester?.clientId) &&
     row.requested_by_device_token_auth === (input.requester?.deviceTokenAuth === true ? 1 : 0) &&

@@ -2,6 +2,10 @@ import type { Static } from "typebox";
 // Gateway Protocol schema module defines durable cross-surface approval shapes.
 import { Type } from "typebox";
 import { APPROVAL_ID_WELL_FORMED_UNICODE_PATTERN } from "./approval-id.js";
+import {
+  ApprovalRequestAuthorizationSchema,
+  ApprovalResolvingActorSchema,
+} from "./approval-provenance.js";
 import { closedObject } from "./closed-object.js";
 import { NonEmptyString } from "./primitives.js";
 import { withSince } from "./since.js";
@@ -40,6 +44,7 @@ export const ApprovalTerminalReasonSchema = Type.Union([
   Type.Literal("timeout"),
   Type.Literal("malformed-verdict"),
   Type.Literal("no-route"),
+  Type.Literal("requester-unavailable"),
   Type.Literal("run-aborted"),
   Type.Literal("gateway-restart"),
   Type.Literal("storage-corrupt"),
@@ -53,6 +58,7 @@ export const ApprovalDeniedReasonSchema = Type.Union([
   Type.Literal("user"),
   Type.Literal("malformed-verdict"),
   Type.Literal("no-route"),
+  Type.Literal("requester-unavailable"),
   Type.Literal("storage-corrupt"),
 ]);
 
@@ -198,6 +204,8 @@ export const ApprovalPresentationSchema = Type.Union([
 ]);
 
 const ApprovalRecordCommonFields = {
+  authorization: Type.Optional(ApprovalRequestAuthorizationSchema),
+  resolvedByActor: Type.Optional(Type.Union([ApprovalResolvingActorSchema, Type.Null()])),
   id: ApprovalIdSchema,
   urlPath: NonEmptyString,
   createdAtMs: Type.Integer({ minimum: 0 }),

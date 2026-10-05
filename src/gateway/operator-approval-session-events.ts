@@ -3,8 +3,10 @@ import type {
   PendingApprovalSnapshot,
   SessionApprovalEvent,
 } from "../../packages/gateway-protocol/src/index.js";
+import { getRuntimeConfig } from "../config/config.js";
 import { emitAgentEvent } from "../infra/agent-events.js";
 import type { OpenClawStateDatabaseOptions } from "../state/openclaw-state-db.js";
+import { requiresApprovalRequesterMatch } from "./approval-request-policy.js";
 import { resolveApprovalSourceStreamKey } from "./approval-session-audience.js";
 import { normalizeControlUiBasePath } from "./control-ui-shared.js";
 import type {
@@ -93,11 +95,20 @@ export function createOperatorApprovalSessionEventRuntime(params: {
     return recipients;
   };
 
+  const isRequesterOnly = (record: OperatorApprovalRecord): boolean =>
+    record.terminalReason === "requester-unavailable" ||
+    params.getLiveManager?.(record.kind)?.getLiveSnapshot(record.id)?.requiresRequesterMatch?.() ===
+      true ||
+    requiresApprovalRequesterMatch(record.authorization, getRuntimeConfig(), record.kind);
+
   const publish = (event: OperatorApprovalLifecycleEvent): void => {
     publicationRevision += 1;
+    const manager = params.getLiveManager?.(event.record.kind);
+    if (isRequesterOnly(event.record)) {
+      return;
+    }
     const source = event.record.source;
     const pending = event.phase === "pending" && event.record.status === "pending";
-    const manager = params.getLiveManager?.(event.record.kind);
     const live = pending ? manager?.getLiveSnapshot(event.record.id) : undefined;
     const request = asOptionalObjectRecord(live?.request);
     const livePending = Boolean(
@@ -219,6 +230,9 @@ export function createOperatorApprovalSessionEventRuntime(params: {
       };
       const truncated = records.length > MAX_SESSION_APPROVAL_REPLAY;
       for (const record of records) {
+        if (isRequesterOnly(record)) {
+          continue;
+        }
         if (approvals.length === MAX_SESSION_APPROVAL_REPLAY) {
           return {
             replay: { sessionKey, updatedAtMs: snapshotAtMs, approvals, truncated: true },

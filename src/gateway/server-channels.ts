@@ -9,6 +9,10 @@ import {
   buildChannelAccountSnapshotFromInspection,
   buildChannelAccountSnapshotFromRuntime,
 } from "../channels/account-summary.js";
+import {
+  admitChannelApprovalActor,
+  readAdmittedChannelApprovalActor,
+} from "../channels/message-access/approval-actor.js";
 import { resolveChannelDefaultAccountId } from "../channels/plugins/helpers.js";
 import {
   getLoadedChannelPluginEntryById,
@@ -28,7 +32,10 @@ import {
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { withGatewayNativeApprovalRuntime } from "../infra/approval-gateway-runtime-context.js";
 import type { GatewayNativeApprovalMethod } from "../infra/approval-gateway-runtime-methods.js";
-import type { GatewayNativeApprovalRuntime } from "../infra/approval-gateway-runtime.types.js";
+import type {
+  ChannelApprovalResolutionRuntimeV2,
+  GatewayNativeApprovalRuntime,
+} from "../infra/approval-gateway-runtime.types.js";
 import { startChannelApprovalHandlerBootstrap } from "../infra/approval-handler-bootstrap.js";
 import { type BackoffPolicy, sleepWithAbort } from "../infra/backoff.js";
 import {
@@ -922,12 +929,46 @@ export function createChannelManager(opts: ChannelManagerOptions): ChannelManage
             }
             const gatewayApprovalRuntime = opts.getNativeApprovalRuntime?.();
             if (channelRuntimeForTask && gatewayApprovalRuntime) {
-              const approvalRuntime: Pick<GatewayNativeApprovalRuntime, "request"> = {
+              const assertApprovalRuntimeCurrent = () => {
+                if (abort.signal.aborted || manuallyStopped.has(rKey) || opts.isClosing?.()) {
+                  throw new Error("channel approval runtime is closed");
+                }
+              };
+              const approvalRuntime: Pick<GatewayNativeApprovalRuntime, "request"> &
+                ChannelApprovalResolutionRuntimeV2 = {
+                version: 2,
+                admitInteractionActor: (event) =>
+                  admitChannelApprovalActor(
+                    {
+                      kind: "channel",
+                      channel: channelId,
+                      accountId: id,
+                      senderId: event.senderId,
+                      actorKind: event.actorKind,
+                      interactionId: event.interactionId,
+                    },
+                    assertApprovalRuntimeCurrent,
+                  ),
+                resolve: async (request, actor) => {
+                  assertApprovalRuntimeCurrent();
+                  const admitted = readAdmittedChannelApprovalActor(actor);
+                  if (
+                    !admitted ||
+                    admitted.actor.channel !== channelId ||
+                    admitted.actor.accountId !== id
+                  ) {
+                    throw new Error("approval actor does not belong to this account");
+                  }
+                  return await gatewayApprovalRuntime.request("approval.resolve", request, {
+                    approvalActor: actor,
+                  });
+                },
                 request: async <T>(
                   method: GatewayNativeApprovalMethod,
                   requestParams: Record<string, unknown>,
                   requestOptions?: { clientDisplayName?: string },
                 ): Promise<T> => {
+                  assertApprovalRuntimeCurrent();
                   if (method !== "approval.resolve") {
                     throw new Error(`channel approval runtime cannot dispatch ${method}`);
                   }

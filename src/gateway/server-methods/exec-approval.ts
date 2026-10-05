@@ -33,6 +33,7 @@ import {
 } from "../../infra/system-run-approval-binding.js";
 import { resolveSystemRunApprovalRequestContext } from "../../infra/system-run-approval-context.js";
 import { normalizeAgentId } from "../../routing/session-key.js";
+import { bindApprovalRequestAuthorization } from "../approval-request-authorization.js";
 import type { ExecApprovalManager } from "../exec-approval-manager.js";
 import { InvalidApprovalIdError } from "../exec-approval-registration.js";
 import {
@@ -414,6 +415,12 @@ export function createExecApprovalHandlers(
         }
         throw error;
       }
+      bindApprovalRequestAuthorization({
+        record,
+        cfg: context.getRuntimeConfig(),
+        approvalKind: "exec",
+        identity: trustedAgentRuntime,
+      });
       bindApprovalRequesterMetadata({ record, client });
       if (trustedAgentRuntime) {
         record.agentRuntimeDelegatedAuthority = trustedAgentRuntime.delegatedAuthority;
@@ -461,6 +468,9 @@ export function createExecApprovalHandlers(
       await handleApprovalWaitDecision({
         manager,
         inputId: (params as { id?: string }).id,
+        context,
+        consumeAllowOnce: (params as { consumeAllowOnce?: unknown }).consumeAllowOnce,
+        validateConsumed: (params as { validateConsumed?: unknown }).validateConsumed,
         client,
         ...(client?.authenticatedUserProfile ? { getCfg: context.getRuntimeConfig } : {}),
         respond,

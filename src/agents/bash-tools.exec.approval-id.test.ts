@@ -123,6 +123,7 @@ vi.mock("../infra/exec-approval-surface.js", () => ({
 vi.mock("../infra/shell-env.js", () => ({
   getShellPathFromLoginShell: vi.fn(() => null),
   resolveShellEnvFallbackTimeoutMs: vi.fn(() => 0),
+  shouldEnableShellEnvFallback: vi.fn(() => false),
 }));
 
 vi.mock("../process/supervisor/index.js", async () => {

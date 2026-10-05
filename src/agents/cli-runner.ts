@@ -23,6 +23,7 @@ import {
 } from "../plugins/hook-agent-context.js";
 import { resolveBlockMessage } from "../plugins/hook-decision-types.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
+import { captureAdmittedRunSource } from "./admitted-run-context.js";
 import {
   loadAuthProfileStoreForRuntime,
   markAuthProfileFailure,
@@ -305,6 +306,8 @@ async function runPreparedCliAgentOwned(
     sessionId: params.sessionId,
     workspaceDir: params.workspaceDir,
     trigger: params.trigger,
+    inputProvenance: params.inputProvenance,
+    source: captureAdmittedRunSource(context.params.admittedRunContext).source,
     ...(params.config ? { config: params.config } : {}),
     ...contextWindowFields(),
     ...buildAgentHookContextChannelFields(params),

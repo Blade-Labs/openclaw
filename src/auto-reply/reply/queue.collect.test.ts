@@ -13,6 +13,13 @@ import {
   loadTranscriptEvents,
   replaceSessionEntry,
 } from "../../config/sessions/session-accessor.js";
+import { classifyApprovalRequester } from "../../infra/approval-requester-binding.js";
+import {
+  createHostChannelTurnSource,
+  createHostNonUserTurnSource,
+  projectHostTurnSource,
+  MAX_TURN_SOURCE_INPUTS,
+} from "../../infra/host-turn-source.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import { createTestUserTurnTranscriptTarget } from "../../sessions/user-turn-transcript.test-support.js";
 import type { FollowupRun, QueueSettings } from "./queue.js";
@@ -99,6 +106,83 @@ function enqueueRoutedRuns(
 }
 
 describe("followup queue collect routing", () => {
+  it.each([
+    ["same", "bound"],
+    ["different", "mixed"],
+    ["cross-session", "mixed"],
+    ["bot", "unavailable"],
+    ["missing", "unavailable"],
+  ] as const)("preserves all collect sources (%s)", async (secondKind, state) => {
+    const key = `test-collect-source-${secondKind}`;
+    const { calls, done, runFollowup } = createDrainRecorder();
+    const actor = {
+      channel: "test",
+      accountId: "default",
+      senderId: "synthetic-sender-a",
+      actorKind: "human",
+    } as const;
+    const message = {
+      messageId: "synthetic-message-a",
+      conversationId: "synthetic-dm",
+      conversationKind: "direct",
+      eventKind: "message",
+    } as const;
+    const first = createRun({ prompt: "first source" });
+    first.turnSource = createHostChannelTurnSource({ actor, message });
+    const second = createRun({ prompt: "second source" });
+    second.turnSource =
+      secondKind === "cross-session"
+        ? createHostNonUserTurnSource("cross-session")
+        : secondKind === "missing"
+          ? undefined
+          : createHostChannelTurnSource({
+              actor: {
+                ...actor,
+                senderId: secondKind === "different" ? "synthetic-sender-b" : actor.senderId,
+                actorKind: secondKind === "bot" ? "bot" : "human",
+              },
+              message: { ...message, messageId: "synthetic-message-b" },
+            });
+    try {
+      enqueueFollowupRun(key, first, createQueueSettings());
+      enqueueFollowupRun(key, second, createQueueSettings());
+      await drainRecordedQueue(key, runFollowup, done);
+      const source = projectHostTurnSource(
+        calls[0]?.turnSource,
+        "synthetic-run",
+        "synthetic-session",
+      );
+      expect(classifyApprovalRequester(source).state).toBe(state);
+      expect(source.inputs).toHaveLength(secondKind === "missing" ? 1 : 2);
+      expect(calls[0]?.prompt).toContain("first source");
+      expect(calls[0]?.prompt).toContain("second source");
+    } finally {
+      clearFollowupQueue(key);
+    }
+  });
+
+  it("splits collect work before the source bound would discard an input", async () => {
+    const key = "test-collect-source-bound";
+    const { calls, done, runFollowup } = createDrainRecorder(2);
+    const settings = createQueueSettings({ cap: MAX_TURN_SOURCE_INPUTS + 1 });
+    try {
+      for (let index = 0; index <= MAX_TURN_SOURCE_INPUTS; index += 1) {
+        const run = createRun({ prompt: `synthetic input ${index}` });
+        run.turnSource = createHostNonUserTurnSource("system");
+        enqueueFollowupRun(key, run, settings);
+      }
+      await drainRecordedQueue(key, runFollowup, done);
+      expect(
+        calls.map(
+          (run) =>
+            projectHostTurnSource(run.turnSource, "synthetic-run", "synthetic-session").inputs
+              .length,
+        ),
+      ).toEqual([MAX_TURN_SOURCE_INPUTS, 1]);
+    } finally {
+      clearFollowupQueue(key);
+    }
+  });
   it("carries queued local cron-authority unavailability through a followup drain", async () => {
     const key = `test-followup-cron-authority-${Date.now()}`;
     const { calls, done, runFollowup } = createDrainRecorder();

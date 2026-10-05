@@ -14,6 +14,7 @@ import type { PrepareAssistantTranscriptMessage } from "../config/sessions/trans
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { TtsAutoMode } from "../config/types.tts.js";
 import type { DiagnosticTraceContext } from "../infra/diagnostic-trace-context.js";
+import type { TurnSourceProvenance } from "../infra/turn-source-provenance.js";
 import type { InputProvenance } from "../sessions/input-provenance.js";
 import type {
   PluginHookBeforeModelResolveEvent,
@@ -303,6 +304,7 @@ export type PluginHookToolAuthority = {
 };
 
 export type PluginHookAgentContext = {
+  readonly source?: TurnSourceProvenance;
   runId?: string;
   jobId?: string;
   trace?: DiagnosticTraceContext;
@@ -713,6 +715,7 @@ export type PluginHookToolRequesterContext = {
 };
 
 export type PluginHookToolContext = {
+  readonly source?: TurnSourceProvenance;
   agentId?: string;
   sessionKey?: string;
   sessionId?: string;

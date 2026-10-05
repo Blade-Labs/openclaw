@@ -6,6 +6,7 @@ import type { ChatType } from "../../channels/chat-type.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import type { GroupToolPolicyConfig } from "../../config/types.tools.js";
 import type { GatewayUiCommandTarget } from "../../gateway/ui-command-target.types.js";
+import type { HostTurnSource } from "../../infra/host-turn-source.js";
 import type { ImageContent } from "../../llm/types.js";
 import type { MediaFact } from "../../media/media-facts.js";
 import type { PromptImageOrderEntry } from "../../media/prompt-image-order.js";
@@ -57,6 +58,8 @@ export type ReplyBackendQueueMessageOptions = {
 };
 
 export type ReplyMessageInjectionOptions = ReplyBackendQueueMessageOptions & {
+  /** Private source capability consumed by the host before backend dispatch. */
+  turnSource?: HostTurnSource;
   /** User-authorized controls retain sender authority but are not answers to pending questions. */
   allowPendingUserInputAnswer?: false;
   /** Consumed by reply ownership and never forwarded to the active backend. */
@@ -199,6 +202,7 @@ type ReplyMessageInjectionRejectionReason =
   | "not_running"
   | "stale_run"
   | "injection_unavailable"
+  | "source_requires_followup"
   | ReplyBackendQueueMessageMismatch
   | "runtime_rejected";
 

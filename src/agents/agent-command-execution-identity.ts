@@ -5,6 +5,7 @@ import type { InternalSessionEntry } from "../config/sessions.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { drainAgentRunTerminalWrites } from "../infra/agent-run-terminal-writes.js";
 import { formatErrorMessage } from "../infra/errors.js";
+import { createHostNonUserTurnSource, type HostTurnSource } from "../infra/host-turn-source.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import {
   createOperationalRunInstanceRef,
@@ -52,6 +53,8 @@ function prepareAgentCommandRunAdmission(
     ingress: AgentCommandAdmissionIngress;
     operationalRunInstance: OperationalRunInstanceRef;
     runId: string;
+    sessionKey?: string;
+    turnSource?: HostTurnSource;
     onAdmitted?: Parameters<typeof prepareAgentRunAdmission>[0]["onAdmitted"];
     assertSourceCurrent?: () => void;
     operatorAuthority?: AgentCommandOpts["operatorAuthority"];
@@ -66,6 +69,8 @@ function prepareAgentCommandRunAdmission(
   return prepareAgentRunAdmission({
     cfg: params.cfg,
     operationalRunInstance: params.operationalRunInstance,
+    turnSource: spawnFacts ? createHostNonUserTurnSource("subagent") : params.turnSource,
+    sessionKey: params.sessionKey,
     facts: executionIdentitySpawnAdmission({
       operation: "attach",
       value: {
@@ -167,6 +172,13 @@ export function prepareAgentCommandExecutionIdentity(params: {
     ingress: params.ingress,
     operationalRunInstance,
     runId: prepared.runId,
+    sessionKey: prepared.sessionKey,
+    turnSource:
+      opts.inputProvenance?.kind === "inter_session"
+        ? createHostNonUserTurnSource("cross-session", opts.inputProvenance.runId)
+        : opts.inputProvenance?.kind === "internal_system"
+          ? createHostNonUserTurnSource("system", opts.inputProvenance.runId)
+          : undefined,
     assertSourceCurrent: opts.assertSourceCurrent,
     operatorAuthority: opts.operatorAuthority,
     onAdmitted: async (admittedRunContext) => {

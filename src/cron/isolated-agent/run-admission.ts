@@ -13,6 +13,7 @@ import {
   mintMessageActionTurnCapability,
   revokeMessageActionTurnCapability,
 } from "../../gateway/message-action-turn-capability.js";
+import { createHostNonUserTurnSource } from "../../infra/host-turn-source.js";
 import {
   bindGatewayContextResolver,
   getPluginRuntimeGatewayRequestScope,
@@ -60,6 +61,8 @@ export function prepareCronPromptRunAdmission(params: {
   const basePreparedRunAdmission = prepareAgentRunAdmission({
     operationalRunInstance,
     admissionSource: params.admissionSource,
+    turnSource: createHostNonUserTurnSource("cron"),
+    sessionKey: params.sessionKey,
     cfg: params.cfg,
     facts: {
       runId,

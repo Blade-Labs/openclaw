@@ -4,17 +4,32 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GATEWAY_CLIENT_IDS } from "../../../packages/gateway-protocol/src/client-info.js";
+import { admitChannelApprovalActor } from "../../channels/message-access/approval-actor.js";
+import { classifyApprovalRequester } from "../../infra/approval-requester-binding.js";
+import { reportBlockedRequesterNotice } from "../../infra/approval-requester-notice.js";
+import type { TurnSourceProvenance } from "../../infra/turn-source-provenance.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import {
   closeOpenClawStateDatabaseByPathAsync,
   closeOpenClawStateDatabaseForTest,
 } from "../../state/openclaw-state-db.js";
+import type { AgentRuntimeIdentity } from "../agent-runtime-identity-token.js";
+import { ApprovalRequesterPolicyError } from "../approval-requester-policy.js";
+import {
+  requesterAuthorization,
+  withRequesterApprovalChannel,
+} from "../approval-requester.test-support.js";
 import { ExecApprovalManager } from "../exec-approval-manager.js";
-import { createTestApprovalManager } from "../exec-approval-manager.test-support.js";
+import {
+  createTestApprovalFixture,
+  createTestApprovalManager,
+} from "../exec-approval-manager.test-support.js";
+import * as operatorApprovalStore from "../operator-approval-store.js";
 import {
   bindApprovalReviewerDeviceIds,
+  registerPendingApprovalRecord,
   handleApprovalResolve,
   handleApprovalWaitDecision,
   handlePendingApprovalRequest,
@@ -68,7 +83,693 @@ function createApprovalClientLookup(clients: GatewayClient[]): ApprovalClientLoo
     );
 }
 
+function remoteApprovalIdentity(): AgentRuntimeIdentity {
+  const operationalRunInstance = {
+    instanceId: "synthetic-worker-instance",
+    runId: "synthetic-worker-run",
+  };
+  return {
+    kind: "agentRuntime",
+    agentId: "main",
+    sessionKey: "agent:main:synthetic-worker",
+    operationalRunInstance,
+    delegatedAuthority: {
+      kind: "worker",
+      claimId: "synthetic-delegated-claim",
+      lifecycleGeneration: "synthetic-lifecycle",
+      operationalRunInstance,
+      turnClaim: {
+        claimId: "synthetic-worker-claim",
+        runId: operationalRunInstance.runId,
+        sessionId: "synthetic-worker-session",
+        placementGeneration: 1,
+        owner: { kind: "worker", environmentId: "synthetic-environment", ownerEpoch: 1 },
+      },
+    },
+  };
+}
+
+describe("remote approval one-use execution", () => {
+  it.for([false, true])(
+    "returns the latched requester policy with a verdict available=%s",
+    async (available, testContext) => {
+      const manager = createTestApprovalManager(testContext);
+      const record = manager.create({ command: "echo synthetic" }, 60_000);
+      record.authorization = requesterAuthorization(false);
+      let strict = false;
+      record.requiresRequesterMatch = () => strict;
+      await manager.register(record, 60_000);
+      if (available) {
+        await manager.resolveDetailed(record.id, "allow-once", {
+          kind: "channel",
+          id: "test:default",
+          actor: {
+            kind: "channel",
+            channel: "test",
+            accountId: "default",
+            senderId: "synthetic-requester",
+            actorKind: "human",
+          },
+        });
+        expect(record).toMatchObject({
+          status: "allowed",
+          decision: "allow-once",
+          terminalReason: "user",
+        });
+      } else {
+        await manager.expire(record.id);
+      }
+      strict = true;
+      const respond = vi.fn();
+      await handleApprovalWaitDecision({ manager, inputId: record.id, respond });
+      expect(respond).toHaveBeenCalledWith(
+        true,
+        expect.objectContaining({
+          decision: available ? "allow-once" : "deny",
+          authorization: expect.objectContaining({
+            policy: {
+              requireResolverMatch: true,
+              delivery: "requester",
+              allowedDecisions: ["allow-once", "deny"],
+            },
+          }),
+        }),
+        undefined,
+      );
+      expect(record.authorization.policy.requireResolverMatch).toBe(false);
+      expect(record.consumedDecision).toBeUndefined();
+    },
+  );
+
+  it.for([false, true])(
+    "consumes only once and revalidates the same remote owner (strict=%s)",
+    async (strict, testContext) => {
+      await withRequesterApprovalChannel(
+        async () => {
+          const identity = remoteApprovalIdentity();
+          const manager = createTestApprovalManager(testContext, {
+            validateAgentRuntimeDelegatedAuthority: () => true,
+          });
+          const record = manager.create({ command: "echo synthetic" }, 60_000);
+          record.authorization = requesterAuthorization(strict);
+          record.agentRuntimeDelegatedAuthority = identity.delegatedAuthority;
+          await manager.register(record, 60_000);
+          await manager.resolveDetailed(record.id, "allow-once", {
+            kind: "channel",
+            id: "test:default",
+            actor: {
+              kind: "channel",
+              channel: "test",
+              accountId: "default",
+              senderId: "synthetic-requester",
+              actorKind: "human",
+            },
+          });
+          const client = createApprovalClient({
+            connId: "synthetic-worker-reconnected",
+            clientId: "synthetic-runtime",
+          });
+          client.internal = { agentRuntimeIdentity: structuredClone(identity) };
+          const respond = vi.fn();
+          let active = true;
+          const context = { validateAgentRuntimeApprovalAuthority: () => active };
+          const wait = (flags: { consumeAllowOnce?: boolean; validateConsumed?: boolean }) =>
+            handleApprovalWaitDecision({
+              manager,
+              inputId: record.id,
+              client,
+              context,
+              respond,
+              ...flags,
+            });
+          await wait({ consumeAllowOnce: true });
+          expect(respond).toHaveBeenLastCalledWith(
+            true,
+            expect.objectContaining({ id: record.id, decision: "allow-once", consumed: true }),
+            undefined,
+          );
+          expect(record.consumedDecision).toBe("allow-once");
+          await wait({ consumeAllowOnce: true });
+          expect(respond).toHaveBeenLastCalledWith(false, undefined, expect.any(Object));
+          await wait({ validateConsumed: true });
+          expect(respond).toHaveBeenLastCalledWith(
+            true,
+            expect.objectContaining({ consumed: true }),
+            undefined,
+          );
+          active = false;
+          await wait({ validateConsumed: true });
+          expect(respond).toHaveBeenLastCalledWith(false, undefined, expect.any(Object));
+        },
+        { strict: () => strict },
+      );
+    },
+  );
+
+  it.for(["operator", "claim", "lifecycle", "instance", "worker-turn"] as const)(
+    "rejects remote redemption by a different %s owner",
+    async (mismatch, testContext) => {
+      const identity = remoteApprovalIdentity();
+      const manager = createTestApprovalManager(testContext, {
+        validateAgentRuntimeDelegatedAuthority: () => true,
+      });
+      const record = manager.create({ command: "echo synthetic" }, 60_000);
+      record.agentRuntimeDelegatedAuthority = identity.delegatedAuthority;
+      await manager.register(record, 60_000);
+      await manager.resolve(record.id, "allow-once");
+      const client = createApprovalClient({
+        connId: "synthetic-other-owner",
+        clientId: "synthetic-runtime",
+        scopes: ["operator.admin"],
+      });
+      const other = structuredClone(identity);
+      if (mismatch === "claim") {
+        other.delegatedAuthority = {
+          ...other.delegatedAuthority,
+          claimId: "synthetic-other-claim",
+        };
+      } else if (mismatch === "lifecycle") {
+        other.delegatedAuthority = {
+          ...other.delegatedAuthority,
+          lifecycleGeneration: "synthetic-other-lifecycle",
+        };
+      } else if (mismatch === "instance") {
+        other.delegatedAuthority = {
+          ...other.delegatedAuthority,
+          operationalRunInstance: {
+            ...other.operationalRunInstance,
+            instanceId: "synthetic-other-instance",
+          },
+        };
+      } else if (mismatch === "worker-turn" && other.delegatedAuthority.kind === "worker") {
+        other.delegatedAuthority.turnClaim.placementGeneration = 2;
+      }
+      if (mismatch !== "operator") {
+        client.internal = { agentRuntimeIdentity: other };
+      }
+      const respond = vi.fn();
+      await handleApprovalWaitDecision({
+        manager,
+        inputId: record.id,
+        client,
+        context: { validateAgentRuntimeApprovalAuthority: () => true },
+        consumeAllowOnce: true,
+        respond,
+      });
+      expect(respond).toHaveBeenCalledWith(false, undefined, expect.any(Object));
+      expect(record.consumedDecision).toBeUndefined();
+    },
+  );
+
+  it("rechecks the remote requester at the deferred store redemption boundary", async (testContext) => {
+    const identity = remoteApprovalIdentity();
+    const { manager, databaseOptions } = createTestApprovalFixture(testContext, {
+      validateAgentRuntimeDelegatedAuthority: () => true,
+    });
+    const record = manager.create({ command: "echo synthetic" }, 60_000);
+    record.agentRuntimeDelegatedAuthority = identity.delegatedAuthority;
+    await manager.register(record, 60_000);
+    await manager.resolve(record.id, "allow-once");
+    const client = createApprovalClient({
+      connId: "synthetic-worker-owner",
+      clientId: "synthetic-runtime",
+    });
+    client.internal = { agentRuntimeIdentity: identity };
+    const entered = createDeferredCore();
+    const release = createDeferredCore();
+    const consume = operatorApprovalStore.consumeOperatorApprovalAllowOnce;
+    const spy = vi
+      .spyOn(operatorApprovalStore, "consumeOperatorApprovalAllowOnce")
+      .mockImplementationOnce(async (options) => {
+        entered.resolve();
+        await release.promise;
+        return consume(options);
+      });
+    let active = true;
+    const respond = vi.fn();
+    const waiting = handleApprovalWaitDecision({
+      manager,
+      inputId: record.id,
+      client,
+      context: { validateAgentRuntimeApprovalAuthority: () => active },
+      consumeAllowOnce: true,
+      respond,
+    });
+    try {
+      await Promise.race([entered.promise, waiting]);
+      expect(spy).toHaveBeenCalledOnce();
+      active = false;
+      release.resolve();
+      await waiting;
+      expect(respond).toHaveBeenCalledWith(false, undefined, expect.any(Object));
+      expect(
+        await operatorApprovalStore.getOperatorApprovalDetailed({ id: record.id, databaseOptions }),
+      ).toMatchObject({ outcome: "found", record: { consumedAtMs: null } });
+    } finally {
+      release.resolve();
+      await waiting;
+      spy.mockRestore();
+    }
+  });
+});
+
+describe("strict legacy approval resolution", () => {
+  beforeEach(() => {
+    prepareApprovalChannelCustodyMock.mockReset().mockReturnValue({
+      resolverId: "test:default",
+      authorizes: () => true,
+    });
+  });
+  it.for([false, true])(
+    "preserves admitted custody and live eligibility with requester matching=%s",
+    async (strict, testContext) => {
+      let eligible = true;
+      await withRequesterApprovalChannel(
+        async () => {
+          const manager = createTestApprovalManager(testContext);
+          const record = manager.create(
+            { command: "echo synthetic" },
+            60_000,
+            "synthetic-legacy-requester",
+          );
+          record.authorization = requesterAuthorization(strict);
+          await manager.register(record, 60_000);
+          const foreign = manager.create(
+            { command: "echo synthetic", turnSourceAccountId: "other" },
+            60_000,
+            "synthetic-legacy-foreign",
+          );
+          foreign.authorization = requesterAuthorization(strict);
+          await manager.register(foreign, 60_000);
+          prepareApprovalChannelCustodyMock.mockReturnValue({
+            resolverId: "test:default",
+            authorizes: (candidate: { request: { turnSourceAccountId?: string } }) =>
+              candidate.request.turnSourceAccountId !== "other",
+          });
+          const actor = admitChannelApprovalActor(
+            {
+              kind: "channel",
+              channel: "test",
+              accountId: "default",
+              senderId: "synthetic-requester",
+              actorKind: "human",
+              messageId: "synthetic-command",
+            },
+            () => {},
+          );
+          const client = createApprovalClient({
+            connId: "synthetic-account-runtime",
+            clientId: "synthetic-runtime",
+            approvalRuntime: true,
+          });
+          client.internal = { ...client.internal, approvalActor: actor };
+          const respond = vi.fn();
+          const publishResolved = vi.fn();
+          const context = {
+            getRuntimeConfig: () => ({}),
+            approvalEvents: { publishResolved },
+            broadcast: vi.fn(),
+            broadcastToConnIds: vi.fn(),
+          } as unknown as GatewayRequestContext;
+          const resolve = () =>
+            handleApprovalResolve({
+              manager,
+              approvalKind: "exec",
+              inputId: record.id,
+              decision: "allow-once",
+              respond,
+              client,
+              context,
+            });
+          await handleApprovalResolve({
+            manager,
+            approvalKind: "exec",
+            inputId: foreign.id,
+            decision: "allow-once",
+            respond,
+            client,
+            context,
+          });
+          expect(respond).toHaveBeenLastCalledWith(false, undefined, expect.any(Object));
+          expect((await manager.getSnapshot(foreign.id))?.decision).toBeUndefined();
+          await resolve();
+          expect(respond).toHaveBeenLastCalledWith(true, { ok: true }, undefined);
+          expect(publishResolved).toHaveBeenCalledWith(
+            "exec",
+            expect.objectContaining({
+              resolvedByActor: {
+                kind: "channel",
+                channel: "test",
+                accountId: "default",
+                senderId: "synthetic-requester",
+                actorKind: "human",
+                messageId: "synthetic-command",
+              },
+            }),
+          );
+          eligible = false;
+          await resolve();
+          expect(respond).toHaveBeenLastCalledWith(
+            false,
+            undefined,
+            expect.objectContaining({
+              details: { code: "APPROVAL_REQUESTER_UNAVAILABLE", reason: "ineligible" },
+            }),
+          );
+          expect(record.resolvedByActor).toMatchObject({ senderId: "synthetic-requester" });
+        },
+        { strict: () => strict, eligible: () => eligible },
+      );
+    },
+  );
+});
+
 describe("handlePendingApprovalRequest", () => {
+  it("blocks strict delivery when source authority closes during the verified send", async (testContext) => {
+    const manager = createTestApprovalManager(testContext);
+    const record = manager.create(
+      { command: "echo synthetic" },
+      60_000,
+      "synthetic-delivery-closure",
+    );
+    record.authorization = requesterAuthorization();
+    let current = true;
+    record.assertRequesterCurrent = () => {
+      if (!current) {
+        throw new ApprovalRequesterPolicyError("stale");
+      }
+    };
+    await manager.register(record, 60_000);
+    const respond = vi.fn();
+    const context = {
+      getRuntimeConfig: () => ({}),
+      logGateway: { error: vi.fn() },
+      approvalEvents: {
+        deliverRequester: vi.fn(async () => {
+          current = false;
+          return true;
+        }),
+        reportBlockedRequest: vi.fn(async () => "no-unique-chat" as const),
+      },
+    } as unknown as GatewayRequestContext;
+    await handlePendingApprovalRequest({
+      manager,
+      record,
+      respond,
+      context,
+      requestEventName: "exec.approval.requested",
+      requestEvent: {
+        id: record.id,
+        request: record.request,
+        createdAtMs: record.createdAtMs,
+        expiresAtMs: record.expiresAtMs,
+      },
+      twoPhase: true,
+      deliverRequest: vi.fn(() => true),
+    });
+    expect(respond).toHaveBeenCalledWith(
+      false,
+      undefined,
+      expect.objectContaining({
+        details: expect.objectContaining({ code: "APPROVAL_REQUESTER_UNAVAILABLE" }),
+      }),
+    );
+    expect(await manager.getSnapshot(record.id)).toMatchObject({
+      decision: "deny",
+      terminalReason: "requester-unavailable",
+    });
+  });
+
+  it.for([false, true])(
+    "records stale strict registration as a typed terminal denial (noticeFails=%s)",
+    async (noticeFails, testContext) => {
+      const entered = createDeferredCore();
+      const release = createDeferredCore();
+      let current = true;
+      const manager = createTestApprovalManager(testContext, {
+        resolveAudienceSessionKeys: async (source) => {
+          entered.resolve();
+          await release.promise;
+          return [source];
+        },
+      });
+      const record = manager.create(
+        { command: "echo synthetic", sessionKey: "agent:main:synthetic" },
+        60_000,
+        "synthetic-stale-request",
+      );
+      record.authorization = requesterAuthorization();
+      record.assertRequesterCurrent = () => {
+        if (!current) {
+          throw new ApprovalRequesterPolicyError("stale");
+        }
+      };
+      const respond = vi.fn();
+      const context = {
+        approvalEvents: {
+          reportBlockedRequest: vi.fn(async () => {
+            if (noticeFails) {
+              throw new Error("synthetic notice failure");
+            }
+            return "no-unique-chat" as const;
+          }),
+        },
+        logGateway: { error: vi.fn() },
+      } as unknown as GatewayRequestContext;
+      const pending = registerPendingApprovalRecord({
+        manager,
+        record,
+        respond,
+        context,
+        timeoutMs: 60_000,
+      });
+      await entered.promise;
+      current = false;
+      release.resolve();
+      expect(await pending).toBeUndefined();
+      expect(respond).toHaveBeenCalledWith(
+        false,
+        undefined,
+        expect.objectContaining({
+          details: expect.objectContaining({
+            code: "APPROVAL_REQUESTER_UNAVAILABLE",
+            reason: "stale",
+          }),
+        }),
+      );
+      expect(await manager.getSnapshot(record.id)).toMatchObject({
+        decision: "deny",
+        terminalReason: "requester-unavailable",
+      });
+    },
+  );
+
+  it.for(
+    (["mixed", "non-user", "unavailable"] as const).flatMap((state) =>
+      [false, true].map((noticeFails) => ({ state, noticeFails })),
+    ),
+  )(
+    "records strict $state requests as typed terminal denials (noticeFails=$noticeFails)",
+    async ({ state, noticeFails }, testContext) => {
+      const manager = createTestApprovalManager(testContext);
+      const base = requesterAuthorization();
+      const source: TurnSourceProvenance =
+        state === "unavailable"
+          ? { ...base.source, completeness: "unavailable", inputs: [] }
+          : state === "non-user"
+            ? { ...base.source, inputs: [{ inputId: "synthetic-cron-input", origin: "cron" }] }
+            : {
+                ...base.source,
+                inputs: [
+                  ...base.source.inputs,
+                  { inputId: "synthetic-cron-input", origin: "cron" },
+                ],
+              };
+      const record = manager.create({ command: "echo synthetic" }, 60_000, `synthetic-${state}`);
+      record.authorization = {
+        ...base,
+        source,
+        requesterBinding: classifyApprovalRequester(source),
+      };
+      const respond = vi.fn();
+      const reportBlockedRequest = vi.fn(async () => {
+        if (noticeFails) {
+          throw new Error("synthetic notice failure");
+        }
+        return "no-unique-chat" as const;
+      });
+      const context = {
+        logGateway: { error: vi.fn() },
+        approvalEvents: { reportBlockedRequest },
+      } as unknown as GatewayRequestContext;
+      expect(
+        await registerPendingApprovalRecord({
+          manager,
+          record,
+          timeoutMs: 60_000,
+          respond,
+          context,
+        }),
+      ).toBeUndefined();
+      expect(respond).toHaveBeenCalledWith(
+        false,
+        undefined,
+        expect.objectContaining({
+          details: expect.objectContaining({
+            code: "APPROVAL_REQUESTER_UNAVAILABLE",
+            reason: state,
+          }),
+        }),
+      );
+      expect(await manager.getSnapshot(record.id)).toMatchObject({
+        decision: "deny",
+        terminalReason: "requester-unavailable",
+        authorization: { requesterBinding: { state } },
+      });
+      expect(reportBlockedRequest).toHaveBeenCalledOnce();
+      expect(manager.consumeAskFallback(record.id)).toBe(false);
+      if (noticeFails) {
+        expect(context.logGateway.error).toHaveBeenCalledWith(
+          expect.stringContaining("notice outcome=failed"),
+        );
+      }
+    },
+  );
+
+  it.for([
+    { delivered: true, noticeFails: false },
+    { delivered: false, noticeFails: false },
+    { delivered: false, noticeFails: true },
+  ])(
+    "routes strict approval exclusively to its requester (delivered=$delivered, noticeFails=$noticeFails)",
+    async ({ delivered, noticeFails }, testContext) => {
+      const manager = createTestApprovalManager(testContext);
+      const record = manager.create(
+        { command: "echo synthetic" },
+        60_000,
+        "synthetic-exclusive-request",
+      );
+      record.authorization = requesterAuthorization();
+      await manager.register(record, 60_000);
+      const selected = createDeferredCore();
+      const deliverRequester = vi.fn(async () => {
+        selected.resolve();
+        return delivered;
+      });
+      const publishRequested = vi.fn(() => 4);
+      const broadcast = vi.fn();
+      const broadcastToConnIds = vi.fn();
+      const deliverRequest = vi.fn(() => true);
+      const noticeSend = vi.fn().mockResolvedValue({});
+      if (noticeFails) {
+        noticeSend.mockRejectedValueOnce(new Error("synthetic notice failure"));
+      }
+      const reportBlockedRequest = vi.fn(() =>
+        reportBlockedRequesterNotice({
+          kind: "exec",
+          request: {
+            id: record.id,
+            request: { ...record.request, authorization: record.authorization },
+            createdAtMs: record.createdAtMs,
+            expiresAtMs: record.expiresAtMs,
+          },
+          runtimes: [
+            {
+              channel: "test",
+              accountId: "default",
+              handledKinds: new Set(["exec"]),
+              resolveRequesterNoticeTarget: async () => ({ to: "synthetic-personal-chat" }),
+              requestGateway: noticeSend,
+            },
+          ],
+          isCurrent: () => true,
+        }),
+      );
+      const afterDecision = vi.fn();
+      const respond = vi.fn();
+      const context = {
+        broadcast,
+        broadcastToConnIds,
+        hasExecApprovalClients: () => true,
+        approvalEvents: {
+          deliverRequester,
+          publishRequested,
+          publishResolved: vi.fn(),
+          reportBlockedRequest,
+        },
+        logGateway: { error: vi.fn() },
+      } as unknown as GatewayRequestContext;
+      const pending = handlePendingApprovalRequest({
+        manager,
+        record,
+        context,
+        respond,
+        requestEventName: "exec.approval.requested",
+        requestEvent: {
+          id: record.id,
+          request: record.request,
+          createdAtMs: record.createdAtMs,
+          expiresAtMs: record.expiresAtMs,
+        },
+        twoPhase: true,
+        deliverRequest,
+        afterDecision,
+        keepPendingWithoutRoute: true,
+      });
+      await selected.promise;
+      if (delivered) {
+        await manager.resolveDetailed(record.id, "deny", {
+          kind: "channel",
+          id: "synthetic-label",
+          actor: {
+            kind: "channel",
+            channel: "test",
+            accountId: "default",
+            senderId: "synthetic-requester",
+            actorKind: "human",
+          },
+        });
+      }
+      await pending;
+      expect(broadcast).not.toHaveBeenCalled();
+      expect(broadcastToConnIds).not.toHaveBeenCalled();
+      expect(publishRequested).not.toHaveBeenCalled();
+      expect(deliverRequest).not.toHaveBeenCalled();
+      expect(hasApprovalTurnSourceRouteMock).not.toHaveBeenCalled();
+      expect(afterDecision).toHaveBeenCalledWith(
+        "deny",
+        expect.objectContaining({ id: record.id }),
+      );
+      if (delivered) {
+        expect(reportBlockedRequest).not.toHaveBeenCalled();
+        expect(noticeSend).not.toHaveBeenCalled();
+      } else {
+        expect(reportBlockedRequest).toHaveBeenCalledOnce();
+        expect(noticeSend).toHaveBeenCalledOnce();
+        expect(noticeSend).toHaveBeenCalledWith(
+          "send",
+          expect.objectContaining({
+            to: "synthetic-personal-chat",
+            idempotencyKey: `approval-route-notice:blocked:${record.id}`,
+            message: expect.stringContaining("No action was approved"),
+          }),
+        );
+        expect(noticeSend.mock.calls[0]?.[1].message).not.toContain("/approve");
+        expect(await manager.getSnapshot(record.id)).toMatchObject({
+          decision: "deny",
+          terminalReason: "requester-unavailable",
+        });
+        expect(respond).toHaveBeenCalledWith(
+          false,
+          undefined,
+          expect.objectContaining({
+            details: expect.objectContaining({ code: "APPROVAL_REQUESTER_UNAVAILABLE" }),
+          }),
+        );
+      }
+    },
+  );
+
   afterEach(() => {
     hasApprovalTurnSourceRouteMock.mockClear();
     prepareApprovalChannelCustodyMock.mockReset();

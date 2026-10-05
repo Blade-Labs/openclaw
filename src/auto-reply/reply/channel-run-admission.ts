@@ -12,6 +12,7 @@ import {
   type ChannelAdmissionEvidence,
 } from "../../channels/message-access/admission-evidence.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import type { HostTurnSource } from "../../infra/host-turn-source.js";
 
 /** Adapt one opaque channel carrier to the canonical admitted-run facts and decision FIFO. */
 export function consumeChannelRunAdmission(evidence: ChannelAdmissionEvidence | undefined): {
@@ -56,6 +57,8 @@ export function consumeChannelRunAdmission(evidence: ChannelAdmissionEvidence | 
 
 /** Defer evidence consumption until the selected runtime actually admits the run. */
 export function prepareChannelRunAdmission(params: {
+  turnSource?: HostTurnSource;
+  sessionKey?: string;
   cfg: OpenClawConfig;
   runId: string;
   agentId: string;
@@ -98,6 +101,8 @@ export function prepareChannelRunAdmission(params: {
           assertSourceCurrent: params.assertSourceCurrent,
           operationalRunInstance,
           operatorAuthority: params.operatorAuthority,
+          turnSource: params.turnSource,
+          sessionKey: params.sessionKey,
           facts: {
             runId: params.runId,
             agentId: params.agentId,

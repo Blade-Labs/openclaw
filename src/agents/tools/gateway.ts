@@ -650,6 +650,11 @@ export async function callGatewayTool<T = Record<string, unknown>>(
   const gateway = resolveGatewayOptions(opts);
   const resolveGatewayContext = getGatewayToolCallerIdentity()?.gatewayContextResolver;
   const callParams = attachNodeInvokeTurnSource(method, params);
+  const approvalWaitParams = asNullableRecord(callParams);
+  const consumesApproval =
+    (method === "exec.approval.waitDecision" || method === "plugin.approval.waitDecision") &&
+    (approvalWaitParams?.consumeAllowOnce === true ||
+      approvalWaitParams?.validateConsumed === true);
   const scopes = Array.isArray(extra?.scopes)
     ? extra.scopes
     : resolveLeastPrivilegeOperatorScopesForMethod(method, callParams);
@@ -657,7 +662,7 @@ export async function callGatewayTool<T = Record<string, unknown>>(
     method,
     opts,
     target: inProcess ? "local" : gateway.target,
-    required: extra?.requireAgentRuntimeIdentity,
+    required: consumesApproval || extra?.requireAgentRuntimeIdentity,
     signal: extra?.signal,
     inProcess,
   });

@@ -1,4 +1,7 @@
 import { stableStringify } from "@openclaw/normalization-core";
+import { formatErrorMessage } from "../../infra/errors.js";
+import { projectHostTurnSource } from "../../infra/host-turn-source.js";
+import type { TurnSourceProvenance } from "../../infra/turn-source-provenance.js";
 import {
   getAgentToolResultMiddlewareMatcherScope,
   listAgentToolResultMiddlewares,
@@ -13,6 +16,7 @@ import {
   hasBeforeToolCallPolicy,
   runBeforeToolCallHook,
 } from "../agent-tools.before-tool-call.js";
+import { consumeSourceForToolCall } from "../agent-tools.before-tool-call.state.js";
 import { resolveToolLoopDetectionConfig } from "../tool-loop-detection-config.js";
 import { payloadTextResult } from "../tools/common.js";
 import { runAgentHarnessAfterToolCallHook } from "./hook-helpers.js";
@@ -27,7 +31,6 @@ import {
   setNativeHookRelayPreToolUseApproval,
 } from "./native-hook-relay-permissions.js";
 import type {
-  ActiveNativeHookRelayRegistration,
   NativeHookRelayEvent,
   NativeHookRelayExecutionAdmission,
   NativeHookRelayInvocation,
@@ -43,9 +46,9 @@ function getGlobalToolHookMatcherScope(hookName: "before_tool_call" | "after_too
 }
 
 type NativeHookRelayPolicy = Pick<
-  ActiveNativeHookRelayRegistration,
-  "preToolUseLoopDetection" | "sessionKey" | "config" | "agentId"
-> & { executionAdmissionToolNames?: readonly string[] };
+  NativeHookRelayRegistration,
+  "sessionKey" | "config" | "agentId"
+> & { preToolUseLoopDetection?: boolean; executionAdmissionToolNames?: readonly string[] };
 
 /** Snapshot the same canonical native tool family for planning and receipt admission. */
 export function snapshotNativeHookRelayExecutionAdmission(
@@ -78,6 +81,7 @@ export function nativeHookRelayEventHasLocalWork(
     return (
       Boolean(registration.executionAdmissionToolNames?.length) ||
       hasBeforeToolCallPolicy() ||
+      hasGlobalHooks("after_tool_call") ||
       nativePreToolUseMayRunLoopDetection(registration)
     );
   }
@@ -102,6 +106,7 @@ export function nativeHookRelayEventToolMatcher(
     const policyRegistry = getGlobalHookRunnerRegistry();
     const scope = mergePluginToolMatcherScopes([
       getGlobalToolHookMatcherScope("before_tool_call"),
+      getGlobalToolHookMatcherScope("after_tool_call"),
       getTrustedToolPolicyMatcherScope(policyRegistry),
       registration.executionAdmissionToolNames?.length
         ? { matchAll: false, toolNames: registration.executionAdmissionToolNames }
@@ -124,10 +129,31 @@ export async function processNativeHookRelayInvocation(params: {
   invocation: NativeHookRelayInvocation;
   adapter: NativeHookRelayProviderAdapter;
   executionAdmission?: NativeHookRelayExecutionAdmission;
+  toolSources?: Map<string, TurnSourceProvenance>;
   assertExecutionAdmissionCurrent: () => void;
 }): Promise<NativeHookRelayProcessResponse> {
   if (params.invocation.event === "pre_tool_use") {
-    return runNativeHookRelayPreToolUse(params);
+    const toolCallId = params.invocation.toolUseId;
+    const releaseSource = () => {
+      if (toolCallId) {
+        params.toolSources?.delete(toolCallId);
+        consumeSourceForToolCall(toolCallId, params.registration.runId);
+      }
+    };
+    params.registration.signal?.addEventListener("abort", releaseSource, { once: true });
+    try {
+      return await runNativeHookRelayPreToolUse(params);
+    } catch (error) {
+      releaseSource();
+      throw error;
+    } finally {
+      // Generic before hooks retain source for embedded completion. Native
+      // completion belongs to this relay, including calls with no post event.
+      if (toolCallId) {
+        consumeSourceForToolCall(toolCallId, params.registration.runId);
+      }
+      params.registration.signal?.removeEventListener("abort", releaseSource);
+    }
   }
   if (params.invocation.event === "post_tool_use") {
     return runNativeHookRelayPostToolUse(params);
@@ -143,12 +169,37 @@ async function runNativeHookRelayPreToolUse(params: {
   invocation: NativeHookRelayInvocation;
   adapter: NativeHookRelayProviderAdapter;
   executionAdmission?: NativeHookRelayExecutionAdmission;
+  toolSources?: Map<string, TurnSourceProvenance>;
   assertExecutionAdmissionCurrent: () => void;
 }): Promise<NativeHookRelayProcessResponse> {
   const toolName = normalizeNativeHookToolName(params.invocation.toolName);
   const toolInput = params.adapter.readToolInput(params.invocation.rawPayload);
   const originalToolInputFingerprint = stableStringify(toolInput);
   const approvalMode = readNativeHookRelayApprovalMode(params.invocation.rawPayload);
+  const source =
+    params.registration.approvalHost?.readSource?.() ??
+    projectHostTurnSource(
+      undefined,
+      params.registration.runId,
+      params.registration.sessionKey ?? null,
+    );
+  if (params.invocation.toolUseId) {
+    params.toolSources?.set(params.invocation.toolUseId, source);
+  }
+  const retainSourceForCompletion = () => {
+    const matcher = nativeHookRelayEventToolMatcher(params.registration, "post_tool_use");
+    if (
+      params.invocation.toolUseId &&
+      params.registration.allowedEvents.includes("post_tool_use") &&
+      (!matcher || matcher.includes(toolName))
+    ) {
+      const retained =
+        consumeSourceForToolCall(params.invocation.toolUseId, params.registration.runId) ?? source;
+      params.toolSources?.set(params.invocation.toolUseId, retained);
+    } else if (params.invocation.toolUseId) {
+      params.toolSources?.delete(params.invocation.toolUseId);
+    }
+  };
   const policyRequest = {
     toolName,
     params: toolInput,
@@ -165,6 +216,7 @@ async function runNativeHookRelayPreToolUse(params: {
         ...policyRequest,
         ...(approvalMode === "report" ? { approvalMode: "defer" } : {}),
         ctx: {
+          source,
           ...(params.registration.agentId ? { agentId: params.registration.agentId } : {}),
           sessionId: params.registration.sessionId,
           ...(params.registration.sessionKey ? { sessionKey: params.registration.sessionKey } : {}),
@@ -189,6 +241,9 @@ async function runNativeHookRelayPreToolUse(params: {
     throw error;
   }
   if (outcome.blocked) {
+    if (params.invocation.toolUseId) {
+      params.toolSources?.delete(params.invocation.toolUseId);
+    }
     return params.adapter.renderPreToolUseBlockResponse(
       outcome.reason,
       outcome.kind === "failure" && outcome.disposition !== "blocked"
@@ -201,6 +256,9 @@ async function runNativeHookRelayPreToolUse(params: {
     nativeHookRelayParamsWereRewritten(originalToolInputFingerprint, outcome.params)
   ) {
     // Native execution must not retain custody of rewritten inputs it will not use.
+    if (params.invocation.toolUseId) {
+      params.toolSources?.delete(params.invocation.toolUseId);
+    }
     return params.adapter.renderPreToolUseBlockResponse(
       "OpenClaw tool policy rewrote Codex app-server approval params; refusing original request.",
     );
@@ -229,12 +287,35 @@ async function runNativeHookRelayPreToolUse(params: {
       })
     ) {
       cancelDeferredPluginToolApproval(outcome.deferredApproval);
+      if (params.invocation.toolUseId) {
+        params.toolSources?.delete(params.invocation.toolUseId);
+      }
       return params.adapter.renderPreToolUseBlockResponse(
         "Plugin approval required but Codex tool id unavailable.",
       );
     }
+    retainSourceForCompletion();
     return params.adapter.renderNoopResponse(params.invocation.event);
   }
+  try {
+    for (const execution of outcome.approvalExecutions ?? []) {
+      await execution.redeem();
+      await execution.revalidate();
+    }
+    params.registration.signal?.throwIfAborted();
+    params.registration.assertActive?.();
+    for (const execution of outcome.approvalExecutions ?? []) {
+      execution.assertCurrent();
+    }
+  } catch (error) {
+    if (params.invocation.toolUseId) {
+      params.toolSources?.delete(params.invocation.toolUseId);
+    }
+    return params.adapter.renderPreToolUseBlockResponse(
+      `Plugin approval is no longer executable: ${formatErrorMessage(error)}`,
+    );
+  }
+  retainSourceForCompletion();
   return params.adapter.renderNoopResponse(params.invocation.event);
 }
 
@@ -242,12 +323,22 @@ async function runNativeHookRelayPostToolUse(params: {
   registration: NativeHookRelayRegistration;
   invocation: NativeHookRelayInvocation;
   adapter: NativeHookRelayProviderAdapter;
+  toolSources?: Map<string, TurnSourceProvenance>;
 }): Promise<NativeHookRelayProcessResponse> {
   const toolName = normalizeNativeHookToolName(params.invocation.toolName);
   const toolCallId =
     params.invocation.toolUseId ?? `${params.invocation.event}:${params.invocation.receivedAt}`;
   const startArgs = params.adapter.readToolInput(params.invocation.rawPayload);
   const rawResult = params.adapter.readToolResponse(params.invocation.rawPayload);
+  const source =
+    params.toolSources?.get(toolCallId) ??
+    params.registration.approvalHost?.readSource?.() ??
+    projectHostTurnSource(
+      undefined,
+      params.registration.runId,
+      params.registration.sessionKey ?? null,
+    );
+  params.toolSources?.delete(toolCallId);
   // Native results are observe-only for middleware: codex-rs PostToolUse hooks
   // cannot replace tool_response (PostToolUseOutcome has no result field), so a
   // transformed result reaches only after_tool_call observers, never the model.
@@ -277,6 +368,7 @@ async function runNativeHookRelayPostToolUse(params: {
     ...(params.registration.sessionKey ? { sessionKey: params.registration.sessionKey } : {}),
     ...(params.registration.channelId ? { channelId: params.registration.channelId } : {}),
     startArgs,
+    source,
     result,
   });
   return params.adapter.renderNoopResponse(params.invocation.event);

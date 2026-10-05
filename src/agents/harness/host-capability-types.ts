@@ -2,12 +2,16 @@ import type {
   ApprovalDecision,
   ApprovalTerminalReason,
 } from "../../../packages/gateway-protocol/src/schema/approvals.js";
+import type { ApprovalWaitDecisionResult } from "../../infra/approval-requester-binding.js";
+import type { TurnSourceProvenance } from "../../infra/turn-source-provenance.js";
+import type { ApprovalExecution } from "../approval-execution.js";
 import type { AnyAgentTool } from "../tools/common.js";
 
 type AgentHarnessHostApprovalResult = Readonly<{
   decision: ApprovalDecision | null | undefined;
   terminalReason: ApprovalTerminalReason | null | undefined;
-}>;
+}> &
+  Partial<ApprovalWaitDecisionResult> & { approvalExecutions?: ApprovalExecution[] };
 
 type AgentHarnessPreparedEnvironment = Readonly<{
   credentialScrubEnv: Readonly<Record<string, string>>;
@@ -28,6 +32,9 @@ export type AgentHarnessHostCapabilities = Readonly<{
   version: 1;
   /** Fails closed unless this exact admitted run capability remains active. */
   assertActive: () => void;
+  /** Public immutable projection obtained from this exact admitted host owner. */
+  readSource?: () => TurnSourceProvenance;
+  requiresRequesterMatch?: () => boolean;
   /** Retains the original source for already-admitted work beyond foreground completion. */
   retainSourceAuthority?: () =>
     | Readonly<{
@@ -122,7 +129,13 @@ export type AgentHarnessHostCapabilities = Readonly<{
     allowedDecisions?: ApprovalDecision[];
     timeoutMs: number;
     transportTimeoutMs?: number;
-  }) => Promise<{ id?: string; decision?: ApprovalDecision | null } | undefined>;
+  }) => Promise<
+    | ({ id?: string; decision?: ApprovalDecision | null } & Pick<
+        ApprovalWaitDecisionResult,
+        "authorization" | "resolvedByActor"
+      >)
+    | undefined
+  >;
   waitForApproval: (request: {
     approvalId: string;
     timeoutMs: number;

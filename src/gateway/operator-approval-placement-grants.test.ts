@@ -6,8 +6,13 @@ import { createOperationalRunInstanceRef } from "../agents/admitted-run-context.
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../infra/kysely-sync.js";
 import { resolveCanonicalPluginApprovalRequestAllowedDecisions } from "../infra/plugin-approval-canonical-decisions.js";
 import type { PluginApprovalRequestPayload } from "../infra/plugin-approvals.js";
-import { resetPluginRuntimeStateForTest } from "../plugins/runtime.js";
+import {
+  getActivePluginRegistry,
+  setActivePluginRegistry,
+  resetPluginRuntimeStateForTest,
+} from "../plugins/runtime.js";
 import { withPluginRuntimeGatewayRequestScope } from "../plugins/runtime/gateway-request-scope.js";
+import { createDeferredCore } from "../shared/deferred.js";
 import { tableExists } from "../state/openclaw-state-db-schema-helpers.js";
 import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
 import {
@@ -15,6 +20,7 @@ import {
   openOpenClawStateDatabase,
   type OpenClawStateDatabaseOptions,
 } from "../state/openclaw-state-db.js";
+import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
 import { createTestApprovalFixture } from "./exec-approval-manager.test-support.js";
 import { applyPluginNodeInvokePolicy } from "./node-invoke-plugin-policy.js";
 import {
@@ -424,6 +430,9 @@ describe("placement standing grants", () => {
     });
     await fixture.run(async () => {
       seedActivePlacement(databaseOptions);
+      let pauseBeforeDispatch = false;
+      const grantReturned = createDeferredCore();
+      const releaseDispatch = createDeferredCore();
       const policy = createDemoPolicy(async (context) => {
         const placementApproval = await context.approvals?.request({
           title: "Run on placement",
@@ -435,6 +444,10 @@ describe("placement standing grants", () => {
           placementApproval?.decision !== "allow-always"
         ) {
           return { ok: false, code: "DENIED", message: "approval denied" };
+        }
+        if (pauseBeforeDispatch) {
+          grantReturned.resolve();
+          await releaseDispatch.promise;
         }
         return await context.invokeNode();
       });
@@ -509,13 +522,13 @@ describe("placement standing grants", () => {
       expect(await manager.resolve(identityOnlyApproval.id, "deny")).toBe(true);
       await expect(identityOnlyLaunch).resolves.toMatchObject({ ok: false, code: "DENIED" });
 
-      const launch = () =>
+      const launch = (caller = client) =>
         withPluginRuntimeGatewayRequestScope(
           { isWebchatConnect: () => false, nodePlacementGrantAuthority },
           () =>
             applyPluginNodeInvokePolicy({
               context,
-              client,
+              client: caller,
               nodeSession,
               command: DEMO_COMMAND,
               params: DEMO_PARAMS,
@@ -553,6 +566,63 @@ describe("placement standing grants", () => {
       expect(await manager.listPendingRecords()).toEqual([]);
       expect(invoke).toHaveBeenCalledTimes(2);
 
+      let requesterOnly = false;
+      const channelRegistry = createTestRegistry([
+        {
+          pluginId: "test",
+          source: "test",
+          plugin: {
+            ...createChannelTestPluginBase({ id: "test" }),
+            approvalCapability: {
+              resolveRequestPolicy: () =>
+                requesterOnly
+                  ? {
+                      requireResolverMatch: true,
+                      delivery: "requester",
+                      allowedDecisions: ["allow-once", "deny"],
+                    }
+                  : { requireResolverMatch: false, delivery: "default" },
+            },
+          },
+        },
+      ]);
+      setActivePluginRegistry({
+        ...getActivePluginRegistry()!,
+        channels: channelRegistry.channels,
+      });
+      pauseBeforeDispatch = true;
+      const cachedLaunch = fixture.track(
+        launch({
+          ...client,
+          internal: {
+            agentRuntimeIdentity: {
+              kind: "agentRuntime",
+              agentId: "main",
+              sessionKey: SESSION_KEY,
+              operationalRunInstance,
+              delegatedAuthority: {
+                kind: "local",
+                operationalRunInstance,
+                lifecycleGeneration: "synthetic-generation",
+                claimId: "synthetic-claim",
+              },
+              turnSourceChannel: "test",
+              turnSourceAccountId: "default",
+            },
+          },
+        }),
+      );
+      await grantReturned.promise;
+      requesterOnly = true;
+      releaseDispatch.resolve();
+      await expect(cachedLaunch).resolves.toMatchObject({
+        ok: false,
+        code: "AUTHORIZATION_CLOSED",
+      });
+      expect(await manager.listPendingRecords()).toEqual([]);
+      requesterOnly = false;
+      pauseBeforeDispatch = false;
+
       const database = openOpenClawStateDatabase(databaseOptions);
       const stateDb = getNodeSqliteKysely<PlacementTestDatabase>(database.db);
       executeSqliteQuerySync(
@@ -581,7 +651,7 @@ describe("placement standing grants", () => {
       expect(movedApproval.request.placementGrant).toMatchObject({ placementGeneration: 5 });
       expect(await manager.resolve(movedApproval.id, "deny")).toBe(true);
       await expect(movedLaunch).resolves.toMatchObject({ ok: false, code: "DENIED" });
-      expect(invoke).toHaveBeenCalledTimes(2);
+      expect(invoke).toHaveBeenCalledTimes(3);
     });
   });
 });

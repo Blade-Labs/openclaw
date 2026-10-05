@@ -5,6 +5,7 @@ import {
   closeOpenClawStateDatabaseAsync,
   openOpenClawStateDatabase,
 } from "../state/openclaw-state-db.js";
+import { requesterAuthorization } from "./approval-requester.test-support.js";
 import * as store from "./operator-approval-store.js";
 import * as native from "./operator-approval-store.kernel.js";
 import * as nativeTransitions from "./operator-approval-store.transitions.js";
@@ -150,4 +151,113 @@ it("revalidates live authority after dispatch and rolls back refused decisions",
   expect(
     await store.getOperatorApprovalDetailed({ id: "guarded", nowMs: 2000, databaseOptions }),
   ).toMatchObject({ outcome: "found", record: { status: "pending", decision: null } });
+});
+
+it("persists strict authorization and only commits the authenticated requester actor", async () => {
+  const databaseOptions = options();
+  const input = {
+    ...approval("synthetic-requester-only"),
+    authorization: requesterAuthorization(),
+  };
+  const inserted = await store.insertOperatorApproval({ approval: input, databaseOptions });
+  expect(inserted).toMatchObject({
+    outcome: "inserted",
+    record: { authorization: input.authorization },
+  });
+  const requester = {
+    kind: "channel" as const,
+    channel: "test",
+    accountId: "default",
+    senderId: "synthetic-requester",
+    actorKind: "human" as const,
+    interactionId: "synthetic-interaction",
+  };
+  const rejectedActors = [
+    undefined,
+    { kind: "operator" as const, connectionId: "synthetic-admin" },
+    { ...requester, senderId: "synthetic-other" },
+    { ...requester, accountId: "synthetic-other-account" },
+    { ...requester, actorKind: "bot" as const },
+  ];
+  for (const actor of rejectedActors) {
+    for (const decision of ["allow-once", "deny"] as const) {
+      await expect(
+        store.resolveOperatorApproval({
+          id: input.id,
+          decision,
+          resolver: { kind: "channel", id: "synthetic-label", actor },
+          nowMs: 2000,
+          databaseOptions,
+        }),
+      ).rejects.toMatchObject({ code: "APPROVAL_REQUESTER_UNAVAILABLE" });
+    }
+    await expect(
+      store.forceDenyOperatorApproval({
+        id: input.id,
+        reason: "malformed-verdict",
+        resolver: { kind: "channel", id: "synthetic-label", actor },
+        nowMs: 2000,
+        databaseOptions,
+      }),
+    ).rejects.toMatchObject({ code: "APPROVAL_REQUESTER_UNAVAILABLE" });
+  }
+  await expect(
+    store.resolveOperatorApproval({
+      id: input.id,
+      decision: "allow-always",
+      resolver: { kind: "channel", id: "synthetic-label", actor: requester },
+      nowMs: 2000,
+      databaseOptions,
+    }),
+  ).rejects.toMatchObject({ code: "APPROVAL_REQUESTER_UNAVAILABLE" });
+  const resolved = await store.resolveOperatorApproval({
+    id: input.id,
+    decision: "allow-once",
+    resolver: { kind: "channel", id: "synthetic-label", actor: requester },
+    nowMs: 3000,
+    databaseOptions,
+  });
+  expect(resolved).toMatchObject({
+    outcome: "resolved",
+    record: { resolvedByActor: requester, authorization: input.authorization },
+  });
+  await expect(
+    store.getOperatorApprovalDetailed({ id: input.id, nowMs: 4000, databaseOptions }),
+  ).resolves.toMatchObject({
+    outcome: "found",
+    record: { decision: "allow-once", resolvedByActor: requester },
+  });
+  await expect(
+    store.consumeOperatorApprovalAllowOnce({
+      id: input.id,
+      consumerId: "synthetic-consumer",
+      nowMs: 4000,
+      databaseOptions,
+    }),
+  ).resolves.toMatchObject({ outcome: "consumed", record: { resolvedByActor: requester } });
+});
+
+it("preserves the typed requester-unavailable denial through the worker", async () => {
+  const databaseOptions = options();
+  const input = {
+    ...approval("synthetic-requester-blocked"),
+    authorization: requesterAuthorization(),
+  };
+  await store.insertOperatorApproval({ approval: input, databaseOptions });
+  await expect(
+    store.forceDenyOperatorApproval({
+      id: input.id,
+      reason: "requester-unavailable",
+      resolver: { kind: "system", id: null },
+      nowMs: 2000,
+      databaseOptions,
+    }),
+  ).resolves.toMatchObject({
+    outcome: "denied",
+    record: {
+      decision: "deny",
+      terminalReason: "requester-unavailable",
+      resolvedByActor: { kind: "system", reason: "requester-unavailable" },
+    },
+  });
 });

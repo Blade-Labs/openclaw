@@ -88,6 +88,7 @@ type ExecApprovalUnavailableReason =
 
 /** Context returned after a default approval request is registered. */
 type RegisteredExecApprovalRequestContext = {
+  authorization?: ExecApprovalRegistration["authorization"];
   approvalId: string;
   approvalSlug: string;
   warningText: string;
@@ -315,6 +316,7 @@ async function createAndRegisterDefaultExecApprovalRequest(
     approvalSlug,
     warningText,
     expiresAtMs: registration.expiresAtMs ?? defaultExpiresAtMs,
+    authorization: registration.authorization,
     preResolvedDecision:
       registration.finalDecision === undefined
         ? defaultPreResolvedDecision
@@ -479,6 +481,10 @@ export async function resolveExecApprovalWaitOutcome<TTimeoutContext = undefined
   params: Omit<ExecApprovalDecisionParams<TTimeoutContext>, "decision"> & {
     approvalId: string;
     preResolvedDecision: string | null | undefined;
+    authorization?: ExecApprovalRegistration["authorization"];
+    onAuthorization?: (
+      authorization: NonNullable<ExecApprovalRegistration["authorization"]>,
+    ) => void;
     signal?: AbortSignal;
   },
 ): Promise<
@@ -495,6 +501,8 @@ export async function resolveExecApprovalWaitOutcome<TTimeoutContext = undefined
     decision = await resolveRegisteredExecApprovalDecision({
       approvalId: params.approvalId,
       preResolvedDecision: params.preResolvedDecision,
+      authorization: params.authorization,
+      onAuthorization: params.onAuthorization,
     });
   } catch (error) {
     return { kind: isExecApprovalRunAbortedError(error) ? "run-aborted" : "request-failed" };
@@ -589,6 +597,8 @@ export async function sendExecApprovalFollowupResult(
 
 /** Renders an approval-pending or approval-unavailable exec tool result. */
 export function buildExecApprovalPendingToolResult(params: {
+  approvalRequesterOnly?: true;
+  authorization?: ExecApprovalRegistration["authorization"];
   host: "gateway" | "node";
   command: string;
   cwd: string | undefined;
@@ -636,6 +646,8 @@ export function buildExecApprovalPendingToolResult(params: {
     details:
       params.unavailableReason !== null
         ? ({
+            ...(params.approvalRequesterOnly ? { approvalRequesterOnly: true } : {}),
+            ...(params.authorization ? { approvalAuthorization: params.authorization } : {}),
             status: "approval-unavailable",
             reason: params.unavailableReason,
             channel: params.initiatingSurface.channel,
@@ -649,6 +661,8 @@ export function buildExecApprovalPendingToolResult(params: {
             warningText: params.warningText,
           } satisfies ExecToolDetails)
         : ({
+            ...(params.approvalRequesterOnly ? { approvalRequesterOnly: true } : {}),
+            ...(params.authorization ? { approvalAuthorization: params.authorization } : {}),
             status: "approval-pending",
             approvalId: params.approvalId,
             approvalSlug: params.approvalSlug,

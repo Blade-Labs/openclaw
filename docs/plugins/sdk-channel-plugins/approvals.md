@@ -53,6 +53,64 @@ custom approval payloads instead of the shared renderer.
   `isImplicitSameChatApprovalAuthorization(...)` before resolving so implicit
   fallback still goes through the channel's normal actor authorization.
 
+### Requester policy and authenticated resolution
+
+`approvalCapability.resolveRequestPolicy({ cfg, accountId, approvalKind })`
+declares account-scoped policy for `exec`, `plugin`, and `system-agent` approvals.
+Default policy is `{ requireResolverMatch: false, delivery: "default" }`.
+Requester-only policy uses `requireResolverMatch: true`, `delivery: "requester"`,
+and `allowedDecisions: ["allow-once", "deny"]`.
+
+Core stamps immutable `authorization` from the exact live admitted run. It
+contains `version: 1`, source provenance, `requesterBinding`, and the latched
+policy. A binding is `bound` only for complete user inputs with one authenticated
+human actor tuple and native message identity. Other bindings are `mixed`,
+`non-user`, or `unavailable`. Session routing and plugin-supplied approval metadata
+cannot create a bound requester. The same requester check covers native actions,
+`/approve`, and Gateway resolution. Operators and RPC clients cannot override a
+strict request, and disabling the current option cannot weaken a stamped policy.
+
+For native interactions, obtain `ChannelApprovalResolutionRuntimeV2` from the
+account's `channelRuntime.runtimeContexts` under capability `"approval.gateway"`.
+After authenticating the provider event, call `admitInteractionActor` with its
+sender ID, actor kind, and interaction ID, then call `resolve(request, actor)`.
+The capability is bound to that channel account and fails after its owner closes.
+Do not manufacture an `AdmittedChannelActor` from a plain object or claim human
+authority through reviewer fields. `resolveApprovalOverGateway` also accepts a
+host-admitted `admittedActor`; a display name or raw channel/account/sender tuple
+alone does not establish requester authority.
+
+Keep provider token, activity, conversation, expiry, decision, and live approver
+checks in the channel. A rejected requester check must release a native control
+claim without permanently consuming the token. Concurrent valid answers use the
+canonical recorded winner returned by resolution.
+
+For strict delivery, implement `resolveRequesterTarget` on the native adapter and
+return only the bound actor's verified destination. Core suppresses default
+forwarding, push, and subscriber fan-out before delivery. Implement
+`resolveRequesterNoticeTarget` for the existing core blocked-request notice path:
+verify the unique personal chat identified by admitted source facts and never
+substitute an approver or fallback recipient. Core records `sent`,
+`no-unique-chat`, or `failed` and uses the approval ID for notice idempotency.
+
+### Approval results and resolver identity
+
+Canonical resolution returns `{ applied, approval }`. `applied` reports whether
+this call won; `approval` contains the terminal recorded winner even when another
+surface answered first. Approval snapshots, resolved events, and wait results
+carry optional `resolvedByActor` alongside existing `resolvedBy` display text.
+Core records the actor atomically with the verdict from an authenticated channel,
+operator, runtime, or system resolution path. A channel actor records its
+`channel`, `accountId`, `senderId`, `actorKind`, and optional message/interaction
+ID. Client-supplied actor fields, reviewer labels, and `resolvedBy` strings are
+not authenticated identity.
+
+`resolvedByActor` can be absent or `null` on legacy records. Treat that as unknown
+identity; it cannot satisfy requester matching. For strict requests, consumption
+also checks the recorded actor against the binding. An allow decision alone is
+insufficient when the requester check fails or the request was denied with
+`terminalReason: "requester-unavailable"`.
+
 ### Payload lifecycle and setup guidance
 
 - Use `outbound.shouldSuppressLocalPayloadPrompt` or

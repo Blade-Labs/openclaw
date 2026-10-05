@@ -17,12 +17,20 @@ import {
   upsertCronJobRow,
 } from "../cron/store/row-codec.js";
 import type { CronStoredJob } from "../cron/types.js";
+import {
+  requesterAuthorization,
+  withRequesterApprovalChannel,
+} from "../gateway/approval-requester.test-support.js";
+import { createTestApprovalManager } from "../gateway/exec-approval-manager.test-support.js";
 import { buildCronExecOperationBinding } from "../gateway/operator-approval-standing-grants.js";
 import {
   insertOperatorApproval,
   resolveOperatorApproval,
 } from "../gateway/operator-approval-store.js";
+import { createGatewayRequestContext } from "../gateway/server-request-context.js";
+import { makeContextParams } from "../gateway/server-request-context.test-support.js";
 import { onAgentEvent } from "../infra/agent-events.js";
+import type { ApprovalRequestAuthorization } from "../infra/approval-requester-binding.js";
 import { registerCronRunExecSource } from "../infra/cron-run-exec-source.js";
 import {
   onInternalDiagnosticEvent,
@@ -70,6 +78,7 @@ import type {
   ExecApprovalFollowupFactory,
   ExecApprovalFollowupOutcome,
 } from "./bash-tools.exec-types.js";
+import { withGatewayToolCallerIdentity } from "./tools/gateway-caller-context.js";
 
 type SendExecApprovalFollowupResult =
   typeof import("./bash-tools.exec-host-shared.js").sendExecApprovalFollowupResult;
@@ -91,6 +100,7 @@ type MockAllowlistResult = {
   authorizationPlan?: ExecAuthorizationPlan;
 };
 type MockRegisteredExecApprovalRequest = {
+  authorization?: ApprovalRequestAuthorization;
   approvalId: string;
   approvalSlug: string;
   warningText: string;
@@ -640,6 +650,72 @@ describe("processGatewayAllowlist", () => {
     });
   }
 
+  async function prepareRequesterApproval(
+    testContext: Parameters<typeof createTestApprovalManager>[0],
+    strict = true,
+    decision: ExecApprovalDecision = "allow-once",
+  ) {
+    const manager = createTestApprovalManager(testContext);
+    const record = manager.create({ command: "pwd" }, 60_000, "req-1");
+    record.authorization = requesterAuthorization(strict);
+    await manager.register(record, 60_000);
+    let current = true;
+    await manager.resolveDetailed(
+      record.id,
+      decision,
+      {
+        kind: "channel",
+        id: "test:default",
+        actor: {
+          kind: "channel",
+          channel: "test",
+          accountId: "default",
+          senderId: "synthetic-requester",
+          actorKind: "human",
+        },
+      },
+      null,
+      "operator",
+      {
+        assertCurrent: () => {
+          if (!current) {
+            throw new Error("Synthetic approver revoked");
+          }
+        },
+      },
+    );
+    createAndRegisterDefaultExecApprovalRequestMock.mockResolvedValue({
+      approvalId: record.id,
+      approvalSlug: "slug-1",
+      warningText: "",
+      expiresAtMs: record.expiresAtMs,
+      preResolvedDecision: decision,
+      initiatingSurface: "origin",
+      sentApproverDms: false,
+      unavailableReason: null,
+      authorization: record.authorization,
+    });
+    const context = createGatewayRequestContext(
+      makeContextParams({ execApprovalManager: manager }),
+    );
+    return {
+      manager,
+      record,
+      revoke: () => {
+        current = false;
+      },
+      run: <T>(run: () => Promise<T>) =>
+        withGatewayToolCallerIdentity(
+          {
+            agentId: "main",
+            sessionKey: "agent:main:main",
+            gatewayContextResolver: () => context,
+          },
+          run,
+        ),
+    };
+  }
+
   function mockApprovedDetachedExec(params: {
     outcome: ExecApprovalFollowupOutcome;
     sessionId?: string;
@@ -771,6 +847,104 @@ describe("processGatewayAllowlist", () => {
       sessionKey: "agent:main:main",
     });
   }
+
+  it.for(
+    [false, true].flatMap((strict) =>
+      (["full", "allowlist"] as const).map((askFallback) => ({ strict, askFallback })),
+    ),
+  )(
+    "preserves manager-backed timeout fallback (strict=$strict, askFallback=$askFallback)",
+    async ({ strict, askFallback }, testContext) => {
+      await withRequesterApprovalChannel(
+        async () => {
+          const manager = createTestApprovalManager(testContext);
+          const record = manager.create(
+            { command: "node --version" },
+            60_000,
+            "synthetic-timeout-fallback",
+          );
+          record.authorization = requesterAuthorization(strict);
+          await manager.register(record, 60_000);
+          expect(await manager.expire(record.id)).toBe(true);
+          const { command, authorizationPlan, segments, enforcedCommand } =
+            await planAllowlistedNodeVersion();
+          const policyPath =
+            resolvePolicyTargetCandidatePath(segments[0]?.resolution ?? null) ?? "node";
+          requiresExecApprovalMock.mockReturnValue(true);
+          evaluateShellAllowlistWithAuthorizationMock.mockReturnValue({
+            allowlistMatches: [{ pattern: policyPath }],
+            analysisOk: true,
+            allowlistSatisfied: true,
+            segments,
+            segmentAllowlistEntries: [{ pattern: policyPath }],
+            segmentSatisfiedBy: ["allowlist"],
+            authorizationPlan,
+          });
+          buildEnforcedShellCommandMock.mockReturnValue({ ok: true, command: enforcedCommand });
+          resolveExecHostApprovalContextMock.mockReturnValue({
+            approvals: { allowlist: [], file: { version: 1, agents: {} } },
+            hostSecurity: "full",
+            hostAsk: "always",
+            askFallback,
+          });
+          createAndRegisterDefaultExecApprovalRequestMock.mockResolvedValue({
+            approvalId: record.id,
+            approvalSlug: "synthetic-slug",
+            warningText: "",
+            expiresAtMs: record.expiresAtMs,
+            preResolvedDecision: null,
+            initiatingSurface: "origin",
+            sentApproverDms: false,
+            unavailableReason: null,
+            authorization: record.authorization,
+          });
+          resolveApprovalDecisionOrUndefinedMock.mockResolvedValue(null);
+          createExecApprovalDecisionStateMock.mockReturnValue({
+            baseDecision: { timedOut: true },
+            approvedByAsk: askFallback === "full",
+            deniedReason: null,
+          });
+          const context = createGatewayRequestContext(
+            makeContextParams({ execApprovalManager: manager }),
+          );
+          const result = await withGatewayToolCallerIdentity(
+            {
+              agentId: "main",
+              sessionKey: "synthetic-session",
+              gatewayContextResolver: () => context,
+            },
+            async () => {
+              const executionResult = await runGatewayAllowlist({
+                command,
+                security: "full",
+                ask: "always",
+              });
+              if (!strict) {
+                expect(executionResult.deniedResult).toBeUndefined();
+                await expect(
+                  executionResult.revalidateBeforeExecution?.(),
+                ).resolves.toBeUndefined();
+                expect(() => executionResult.assertCurrent?.()).not.toThrow();
+              }
+              return executionResult;
+            },
+          );
+          if (strict) {
+            expect(result.deniedResult?.details.status).toBe("failed");
+            expect(commitExecAuthorizationMock).not.toHaveBeenCalled();
+          } else {
+            expect(commitExecAuthorizationMock).toHaveBeenCalledWith(
+              expect.objectContaining({
+                authorization: expect.objectContaining({ source: "ask-fallback" }),
+              }),
+            );
+          }
+          expect(record.consumedDecision).toBeUndefined();
+        },
+        { strict: () => strict },
+      );
+    },
+  );
 
   it("denies shell-expansion plan misses immediately when asking is off and fallback denies", async () => {
     const command = "grep -il needle -r /tmp --include=*.md";
@@ -3113,41 +3287,184 @@ EOF`,
     expect(sendExecApprovalFollowupResultMock).not.toHaveBeenCalled();
   });
 
-  it.each([
-    { decision: "allow-once", deniedReason: null },
-    { decision: "deny", deniedReason: "user-denied" },
-  ] as const)("emits inline approval park and clear events for $decision", async (testCase) => {
-    resolveApprovalDecisionOrUndefinedMock.mockResolvedValue(testCase.decision);
+  it("rejects a requester approval revoked while execution authorization commits", async (testContext) => {
+    const approval = await prepareRequesterApproval(testContext);
+    resolveApprovalDecisionOrUndefinedMock.mockResolvedValue("allow-once");
     createExecApprovalDecisionStateMock.mockReturnValue({
       baseDecision: { timedOut: false },
-      approvedByAsk: testCase.decision === "allow-once",
-      deniedReason: testCase.deniedReason,
+      approvedByAsk: true,
+      deniedReason: null,
     });
-    const events: Array<Record<string, unknown>> = [];
-    const unsubscribe = onAgentEvent((event) => {
-      if (event.runId === "run-inline" && event.stream === "lifecycle") {
-        events.push(event.data);
-      }
+    const entered = createDeferredCore();
+    const release = createDeferredCore();
+    commitExecAuthorizationMock.mockImplementation(async () => {
+      entered.resolve();
+      await release.promise;
+      return () => {};
     });
-
-    try {
-      await runGatewayAllowlist({
-        command: "pwd",
-        turnSourceChannel: "webchat",
-        runId: "run-inline",
-        toolCallId: "tool-inline",
-        sessionKey: "agent:main:main",
-        sessionId: "session-inline",
-      });
-    } finally {
-      unsubscribe();
-    }
-
-    expect(events).toEqual([
-      { phase: "waiting-approval", approvalId: "req-1", toolCallId: "tool-inline" },
-      { phase: "approval-resolved", approvalId: "req-1", toolCallId: "tool-inline" },
+    const pending = approval.run(() => runGatewayAllowlist({ command: "pwd" }));
+    await Promise.race([
+      entered.promise,
+      pending.then(() => {
+        throw new Error("Gateway approval returned before execution authorization committed");
+      }),
     ]);
+    approval.revoke();
+    release.resolve();
+    const result = await pending;
+    expect(result.deniedResult).toBeUndefined();
+    await expect(result.revalidateBeforeExecution?.()).rejects.toThrow();
+    expect(() => result.assertCurrent?.()).toThrow();
+    expect((await approval.manager.getSnapshot(approval.record.id))?.consumedAtMs).toBeNull();
+    expect(runExecProcessMock).not.toHaveBeenCalled();
   });
+
+  it("redeems strict foreground approval once at the final process boundary", async (testContext) => {
+    const approval = await prepareRequesterApproval(testContext);
+    resolveApprovalDecisionOrUndefinedMock.mockResolvedValue("allow-once");
+    createExecApprovalDecisionStateMock.mockReturnValue({
+      baseDecision: { timedOut: false },
+      approvedByAsk: true,
+      deniedReason: null,
+    });
+    commitExecAuthorizationMock.mockResolvedValue(() => {});
+    const result = await approval.run(() => runGatewayAllowlist({ command: "pwd" }));
+    expect(result.deniedResult).toBeUndefined();
+    expect((await approval.manager.getSnapshot(approval.record.id))?.consumedAtMs).toBeNull();
+    await expect(result.revalidateBeforeExecution?.()).resolves.toBeUndefined();
+    expect(() => result.assertCurrent?.()).not.toThrow();
+    expect((await approval.manager.getSnapshot(approval.record.id))?.consumedDecision).toBe(
+      "allow-once",
+    );
+    await expect(result.revalidateBeforeExecution?.()).resolves.toBeUndefined();
+    const replay = await approval.run(() => runGatewayAllowlist({ command: "pwd" }));
+    expect(replay.deniedResult).toBeUndefined();
+    await expect(replay.revalidateBeforeExecution?.()).rejects.toThrow();
+    approval.revoke();
+    expect(() => result.assertCurrent?.()).toThrow();
+    expect(runExecProcessMock).not.toHaveBeenCalled();
+  });
+
+  it("retains a requester restriction enabled at the final foreground dispatch", async (testContext) => {
+    let strict = false;
+    await withRequesterApprovalChannel(
+      async () => {
+        const approval = await prepareRequesterApproval(testContext, false);
+        resolveApprovalDecisionOrUndefinedMock.mockResolvedValue("allow-once");
+        createExecApprovalDecisionStateMock.mockReturnValue({
+          baseDecision: { timedOut: false },
+          approvedByAsk: true,
+          deniedReason: null,
+        });
+        commitExecAuthorizationMock.mockResolvedValue(() => {});
+        const result = await approval.run(() => runGatewayAllowlist({ command: "pwd" }));
+        expect(result.deniedResult).toBeUndefined();
+        expect(result.approvalRequesterOnly).toBeUndefined();
+        strict = true;
+        await expect(result.revalidateBeforeExecution?.()).resolves.toBeUndefined();
+        expect((await approval.manager.getSnapshot(approval.record.id))?.consumedDecision).toBe(
+          "allow-once",
+        );
+        strict = false;
+        expect(result.approvalRequesterOnly).toBe(true);
+        expect(result.approvalAuthorization?.policy.requireResolverMatch).toBe(false);
+        expect(() => result.assertCurrent?.()).not.toThrow();
+      },
+      { strict: () => strict },
+    );
+  });
+
+  it.for([
+    { strict: false, decision: "allow-once", deniedReason: null },
+    { strict: false, decision: "deny", deniedReason: "user-denied" },
+    { strict: true, decision: "allow-once", deniedReason: null },
+    { strict: true, decision: "deny", deniedReason: "user-denied" },
+  ] as const)(
+    "publishes inline approval lifecycle for $decision only when requester matching=$strict is off",
+    async (testCase, testContext) => {
+      const approval = await prepareRequesterApproval(
+        testContext,
+        testCase.strict,
+        testCase.decision,
+      );
+      resolveApprovalDecisionOrUndefinedMock.mockResolvedValue(testCase.decision);
+      createExecApprovalDecisionStateMock.mockReturnValue({
+        baseDecision: { timedOut: false },
+        approvedByAsk: testCase.decision === "allow-once",
+        deniedReason: testCase.deniedReason,
+      });
+      const events: Array<Record<string, unknown>> = [];
+      const unsubscribe = onAgentEvent((event) => {
+        if (event.runId === "run-inline" && event.stream === "lifecycle") {
+          events.push(event.data);
+        }
+      });
+
+      try {
+        await approval.run(() =>
+          runGatewayAllowlist({
+            command: "pwd",
+            turnSourceChannel: "webchat",
+            runId: "run-inline",
+            toolCallId: "tool-inline",
+            sessionKey: "agent:main:main",
+            sessionId: "session-inline",
+          }),
+        );
+      } finally {
+        unsubscribe();
+      }
+
+      expect(events).toEqual(
+        testCase.strict
+          ? []
+          : [
+              { phase: "waiting-approval", approvalId: "req-1", toolCallId: "tool-inline" },
+              { phase: "approval-resolved", approvalId: "req-1", toolCallId: "tool-inline" },
+            ],
+      );
+    },
+  );
+
+  it.each([false, true])(
+    "carries detached pending authorization with requester matching=%s",
+    async (strict) => {
+      const authorization = requesterAuthorization(strict);
+      const pending = createDeferredCore<ExecApprovalDecision>();
+      const finished = createDeferredCore();
+      createAndRegisterDefaultExecApprovalRequestMock.mockResolvedValue({
+        approvalId: "req-1",
+        approvalSlug: "slug-1",
+        warningText: "",
+        expiresAtMs: Date.now() + 60_000,
+        preResolvedDecision: null,
+        initiatingSurface: "origin",
+        sentApproverDms: false,
+        unavailableReason: null,
+        authorization,
+      });
+      buildExecApprovalFollowupTargetMock.mockImplementation((value) => value);
+      resolveApprovalDecisionOrUndefinedMock.mockReturnValue(pending.promise);
+      createExecApprovalDecisionStateMock.mockReturnValue({
+        baseDecision: { timedOut: false },
+        approvedByAsk: false,
+        deniedReason: "user-denied",
+      });
+      sendExecApprovalFollowupResultMock.mockImplementation(async () => {
+        finished.resolve();
+      });
+      const result = await runGatewayAllowlist({ command: "pwd", approvalFollowupMode: "agent" });
+      expect(result.pendingResult?.details.status).toBe("approval-pending");
+      expect(buildExecApprovalPendingToolResultMock).toHaveBeenCalledWith(
+        expect.objectContaining({ authorization }),
+      );
+      const pendingArgs = buildExecApprovalPendingToolResultMock.mock.calls[0]?.[0];
+      expect(pendingArgs.approvalRequesterOnly).toBe(strict ? true : undefined);
+      pending.resolve("deny");
+      await finished.promise;
+      expect(runExecProcessMock).not.toHaveBeenCalled();
+    },
+  );
 
   it.each([
     ["telegram"],

@@ -1562,7 +1562,8 @@ describe("native hook relay registry", () => {
       },
     });
 
-    expect(relay.shouldRelayEvent("pre_tool_use")).toBe(false);
+    expect(relay.shouldRelayEvent("pre_tool_use")).toBe(true);
+    expect(relay.toolMatcherForEvent("pre_tool_use")).toEqual(["apply_patch"]);
     expect(relay.shouldRelayEvent("post_tool_use")).toBe(true);
     expect(relay.toolMatcherForEvent("post_tool_use")).toEqual(["apply_patch"]);
     expect(relay.shouldRelayEvent("before_agent_finalize")).toBe(false);

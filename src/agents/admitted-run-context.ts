@@ -8,6 +8,8 @@ import {
   type ExecutionIdentityAdmissionToken,
 } from "../audit/execution-identity-admission.js";
 import { executionIdentitySpawnAdmission } from "../audit/execution-identity-spawn-admission.js";
+import { requiresTurnSourceRequesterMatch } from "../channels/plugins/approvals.js";
+import { getRuntimeConfig } from "../config/config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   claimAgentRunDelegatedAuthority,
@@ -16,6 +18,19 @@ import {
   validateAgentRunDelegatedAuthority,
   type AgentRunDelegatedAuthority,
 } from "../infra/agent-run-registry.js";
+import {
+  classifyApprovalRequester,
+  type ApprovalRequesterBinding,
+} from "../infra/approval-requester-binding.js";
+import {
+  canCombineHostTurnSources,
+  combineHostTurnSources,
+  createHostNonUserTurnSource,
+  latchHostTurnSourcePolicy,
+  projectHostTurnSource,
+  type HostTurnSource,
+} from "../infra/host-turn-source.js";
+import type { TurnInputOrigin, TurnSourceProvenance } from "../infra/turn-source-provenance.js";
 import type { GatewayAccessGrantRef } from "../plugins/gateway-access-policy.types.js";
 import { prepareGatewayContextBindingOwner } from "../plugins/runtime/gateway-context-binding-owner.js";
 
@@ -109,6 +124,10 @@ type DelegatedAuthorityLease = {
   foregroundClosed: boolean;
   assertSourceCurrent?: () => void;
   operatorAuthority?: AdmittedRunOperatorAuthority;
+  turnSource?: HostTurnSource;
+  sourceRevision: number;
+  sessionKey: string | null;
+  config: OpenClawConfig;
 };
 
 const delegatedAuthorityLeases = new WeakMap<AdmittedRunContext, DelegatedAuthorityLease>();
@@ -122,6 +141,7 @@ function bindAdmittedRunDelegatedAuthority(
   context: AdmittedRunContext,
   assertSourceCurrent?: () => void,
   operatorAuthority?: AdmittedRunOperatorAuthority,
+  source?: { turnSource?: HostTurnSource; sessionKey?: string; cfg: OpenClawConfig },
 ): void {
   const authority = claimAgentRunDelegatedAuthority(
     context.operationalRunInstance,
@@ -130,7 +150,19 @@ function bindAdmittedRunDelegatedAuthority(
   const previousRecovery = activeNativeHookRecoveryLeases.get(context.operationalRunInstance.runId);
   activeNativeHookRecoveryLeases.delete(context.operationalRunInstance.runId);
   previousRecovery?.releaseOperatorAuthority?.();
-  const lease = { authority, foregroundClosed: false, assertSourceCurrent, operatorAuthority };
+  const lease: DelegatedAuthorityLease = {
+    authority,
+    foregroundClosed: false,
+    assertSourceCurrent,
+    operatorAuthority,
+    turnSource: latchHostTurnSourcePolicy(
+      source?.turnSource,
+      requiresTurnSourceRequesterMatch(source?.cfg ?? {}, source?.turnSource),
+    ),
+    sourceRevision: 0,
+    sessionKey: source?.sessionKey ?? null,
+    config: source?.cfg ?? {},
+  };
   delegatedAuthorityLeases.set(context, lease);
   if (!admittedContextsByAuthority.has(authority)) {
     admittedContextsByAuthority.set(authority, context);
@@ -183,6 +215,90 @@ export function getAdmittedRunSource(
   return context && getAdmittedRunDelegatedAuthority(context) === authority
     ? context.admissionSource
     : undefined;
+}
+
+export type AdmittedSourceSnapshot = Readonly<{
+  source: TurnSourceProvenance;
+  requesterBinding: ApprovalRequesterBinding;
+  requireResolverMatch: boolean;
+  assertCurrent: () => void;
+}>;
+
+/** Missing admission exposes unavailable facts; only a live exact owner grants currentness. */
+export function captureAdmittedRunSource(
+  context: AdmittedRunContext | undefined,
+): AdmittedSourceSnapshot {
+  const lease = context ? delegatedAuthorityLeases.get(context) : undefined;
+  const revision = lease?.sourceRevision ?? 0;
+  const source = projectHostTurnSource(
+    lease?.turnSource,
+    context?.operationalRunInstance.runId ?? null,
+    lease?.sessionKey ?? null,
+    revision,
+  );
+  const strict = lease
+    ? requiresTurnSourceRequesterMatch(lease.config, lease.turnSource) ||
+      requiresTurnSourceRequesterMatch(getRuntimeConfig(), lease.turnSource)
+    : false;
+  if (lease && strict) {
+    lease.turnSource = latchHostTurnSourcePolicy(lease.turnSource, true);
+  }
+  return Object.freeze({
+    source,
+    requesterBinding: classifyApprovalRequester(source),
+    requireResolverMatch: strict,
+    assertCurrent: () => {
+      if (
+        !context ||
+        !lease ||
+        getAdmittedRunDelegatedAuthority(context) !== lease.authority ||
+        lease.sourceRevision !== revision
+      ) {
+        throw new Error("admitted turn source is no longer current");
+      }
+    },
+  });
+}
+
+/** A run ID alone cannot retrieve provenance belonging to another operational instance. */
+export function lookupAdmittedRunSource(
+  authority: AgentRunDelegatedAuthority,
+  instance: OperationalRunInstanceRef,
+): AdmittedSourceSnapshot | undefined {
+  const context = admittedContextsByAuthority.get(authority);
+  return context &&
+    context.operationalRunInstance === instance &&
+    getAdmittedRunDelegatedAuthority(context) === authority
+    ? captureAdmittedRunSource(context)
+    : undefined;
+}
+
+export function canAppendAdmittedRunSource(
+  context: AdmittedRunContext,
+  incoming?: HostTurnSource,
+): boolean {
+  const lease = delegatedAuthorityLeases.get(context);
+  return Boolean(
+    lease &&
+    getAdmittedRunDelegatedAuthority(context) &&
+    !captureAdmittedRunSource(context).requireResolverMatch &&
+    !requiresTurnSourceRequesterMatch(lease.config, incoming) &&
+    !requiresTurnSourceRequesterMatch(getRuntimeConfig(), incoming) &&
+    canCombineHostTurnSources([lease.turnSource, incoming]),
+  );
+}
+
+/** Record already accepted input; admission checks belong before backend exposure. */
+export function appendAdmittedRunSource(
+  context: AdmittedRunContext,
+  incoming?: HostTurnSource,
+): void {
+  const lease = delegatedAuthorityLeases.get(context);
+  if (!lease) {
+    throw new Error("admitted turn source is unavailable");
+  }
+  lease.turnSource = combineHostTurnSources([lease.turnSource, incoming], "unavailable");
+  lease.sourceRevision += 1;
 }
 
 /** Captures an exact admitted-run assertion for work that may cross an await boundary. */
@@ -314,12 +430,14 @@ export function prepareSystemAgentRunAdmission(
   boundary: string,
   assertSourceCurrent?: () => void,
   operatorAuthority?: AdmittedRunOperatorAuthority,
+  origin: Exclude<TurnInputOrigin, "user"> = "system",
 ): PreparedAgentRunAdmission {
   return prepareAgentRunAdmission({
     cfg,
     operationalRunInstance: createOperationalRunInstanceRef(runId),
     assertSourceCurrent,
     operatorAuthority,
+    turnSource: createHostNonUserTurnSource(origin),
     facts: {
       runId,
       agentId,
@@ -341,8 +459,19 @@ export function prepareAgentRunAdmission(params: {
   onAdmitted?: (context: AdmittedRunContext) => void | Promise<void>;
   assertSourceCurrent?: () => void;
   operatorAuthority?: AdmittedRunOperatorAuthority;
+  turnSource?: HostTurnSource;
+  sessionKey?: string;
 }): PreparedAgentRunAdmission {
   const operationalRunInstance = params.operationalRunInstance;
+  const turnSource =
+    params.turnSource ??
+    createHostNonUserTurnSource(
+      params.facts.ingress.kind === "schedule"
+        ? "cron"
+        : params.facts.ingress.kind === "system"
+          ? "system"
+          : "unknown",
+    );
   if (operationalRunInstance.runId !== params.facts.runId) {
     throw new Error("operational run instance disagrees with prepared admission");
   }
@@ -420,7 +549,10 @@ export function prepareAgentRunAdmission(params: {
           runtimeInstanceId: admittedRuntimeInstanceId,
           ...(params.recovery ? { recovery: params.recovery } : {}),
         });
-        bindAdmittedRunDelegatedAuthority(context, assertSourceCurrent, operatorAuthority);
+        bindAdmittedRunDelegatedAuthority(context, assertSourceCurrent, operatorAuthority, {
+          ...params,
+          turnSource,
+        });
         admittedContext = context;
         try {
           await params.onAdmitted?.(context);

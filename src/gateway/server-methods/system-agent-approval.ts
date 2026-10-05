@@ -1,6 +1,13 @@
 // Owns delegated system-agent authorization and exact-proposal completion.
 import { randomUUID } from "node:crypto";
-import { getGatewayToolCallerIdentity } from "../../agents/tools/gateway-caller-context.js";
+import {
+  prepareApprovalExecution,
+  type ApprovalExecution,
+} from "../../agents/approval-execution.js";
+import {
+  getGatewayToolCallerIdentity,
+  withoutGatewayToolCallerIdentity,
+} from "../../agents/tools/gateway-caller-context.js";
 import {
   getActiveAgentRunDelegatedAuthority,
   validateAgentRunDelegatedAuthority,
@@ -17,12 +24,14 @@ import { runWithGatewayIndependentRootWorkContinuation } from "../../process/gat
 import { createDeferredCore } from "../../shared/deferred.js";
 import { describeSystemAgentPersistentOperation } from "../../system-agent/operations.js";
 import type { AgentRuntimeDelegatedAuthority } from "../agent-runtime-identity-token.js";
+import { bindApprovalRequestAuthorization } from "../approval-request-authorization.js";
 import { ApprovalObserverClosedError } from "../exec-approval-lifecycle.js";
 import { sameWorkerSessionTurnClaim } from "../worker-environments/placement-record.js";
 import {
   broadcastApprovalResolvedEvent,
   buildRequestedApprovalEvent,
   handlePendingApprovalRequest,
+  registerPendingApprovalRecord,
 } from "./approval-shared.js";
 import type { GatewaySystemAgentSession } from "./shared-types.js";
 import { persistSystemAgentEngineHistory } from "./system-agent-chat-turn.js";
@@ -197,6 +206,7 @@ export async function prepareDelegatedSystemAgentApproval(params: {
       const applyDecision = async (
         decision: ExecApprovalDecision | null,
         terminalStatus?: "expired" | "cancelled",
+        execution?: ApprovalExecution,
       ) => {
         if (decision && decision !== "deny") {
           assertLiveApprovalAuthority();
@@ -204,7 +214,10 @@ export async function prepareDelegatedSystemAgentApproval(params: {
         return await params.session.engine.resolveOperatorApproval(
           decision,
           proposal.hash,
-          assertLiveApprovalAuthority,
+          () => {
+            assertLiveApprovalAuthority();
+            execution?.assertCurrent();
+          },
           terminalStatus,
         );
       };
@@ -273,6 +286,22 @@ export async function prepareDelegatedSystemAgentApproval(params: {
         SYSTEM_AGENT_APPROVAL_TIMEOUT_MS,
         `system-agent:${randomUUID()}`,
       );
+      bindApprovalRequestAuthorization({
+        record,
+        cfg: params.context.getRuntimeConfig(),
+        approvalKind: "system-agent",
+        identity: callerIdentity?.operationalRunInstance
+          ? {
+              kind: "agentRuntime",
+              agentId: callerIdentity.agentId,
+              sessionKey: callerIdentity.sessionKey,
+              operationalRunInstance: callerIdentity.operationalRunInstance,
+              delegatedAuthority: runtimeApprovalAuthority,
+              turnSourceChannel: callerIdentity.turnSourceChannel,
+              turnSourceAccountId: callerIdentity.turnSourceAccountId,
+            }
+          : undefined,
+      });
       const completion =
         createDeferredCore<NonNullable<Awaited<ReturnType<typeof applyDecision>>>>();
       const pendingApproval = {
@@ -300,7 +329,31 @@ export async function prepareDelegatedSystemAgentApproval(params: {
       if (callerIdentity?.approvalSignals?.length) {
         record.approvalSignals = callerIdentity.approvalSignals;
       }
-      await manager.register(record, SYSTEM_AGENT_APPROVAL_TIMEOUT_MS);
+      let registrationError: Error | undefined;
+      const registered = await registerPendingApprovalRecord({
+        manager,
+        record,
+        timeoutMs: SYSTEM_AGENT_APPROVAL_TIMEOUT_MS,
+        context: params.context,
+        throwStorageErrors: true,
+        respond: (_ok, _result, error) => {
+          registrationError = Object.assign(
+            new Error(error?.message ?? "OpenClaw approval unavailable"),
+            error?.details ?? {},
+          );
+        },
+      });
+      if (!registered) {
+        params.session.pendingApproval = undefined;
+        const historyStart = params.session.engine.historyLength();
+        try {
+          const reply = await applyDecision("deny");
+          completion.resolve(reply ?? failedReply);
+        } finally {
+          persistSystemAgentEngineHistory(params.session.engine, historyStart);
+        }
+        throw registrationError ?? new Error("OpenClaw approval unavailable");
+      }
       const requestEvent = buildRequestedApprovalEvent(record, "system-agent");
       const publishApplicationResult = (
         decision: ExecApprovalDecision,
@@ -310,6 +363,7 @@ export async function prepareDelegatedSystemAgentApproval(params: {
           id: record.id,
           decision,
           resolvedBy: record.resolvedBy ?? null,
+          resolvedByActor: record.resolvedByActor,
           ts: Date.now(),
           request,
           applicationStatus,
@@ -320,6 +374,12 @@ export async function prepareDelegatedSystemAgentApproval(params: {
           record,
           event: resolvedEvent,
         });
+        if (
+          record.requiresRequesterMatch?.() &&
+          !record.authorization?.policy.requireResolverMatch
+        ) {
+          return;
+        }
         params.context.approvalEvents?.publishResolved("system-agent", resolvedEvent);
       };
       void handlePendingApprovalRequest({
@@ -335,6 +395,18 @@ export async function prepareDelegatedSystemAgentApproval(params: {
         keepPendingWithoutRoute: true,
         requireDeliveryRoute: false,
         afterDecision: async (decision) => {
+          const execution =
+            decision === "allow-once"
+              ? withoutGatewayToolCallerIdentity(() =>
+                  prepareApprovalExecution({
+                    id: record.id,
+                    kind: "system-agent",
+                    authorization: record.authorization,
+                    manager,
+                    consumeAllowOnce: true,
+                  }),
+                )
+              : undefined;
           try {
             const { reply, correction } = await runWithGatewayIndependentRootWorkContinuation(
               () =>
@@ -352,13 +424,25 @@ export async function prepareDelegatedSystemAgentApproval(params: {
                       : !isAuthorityActive() || record.status === "cancelled"
                         ? "cancelled"
                         : undefined;
-                  params.session.pendingApproval = undefined;
                   try {
                     // Retire failures before releasing this task; a later run may propose the same hash.
                     const appliedReply =
-                      (await withProposalFailureCleanup(() =>
-                        applyDecision(terminalStatus ? null : decision, terminalStatus),
-                      )) ?? cancelledReply;
+                      (await withProposalFailureCleanup(async () => {
+                        if (!terminalStatus && execution) {
+                          await execution.redeem();
+                          await execution.revalidate();
+                          assertLiveApprovalAuthority();
+                          execution.assertCurrent();
+                        }
+                        return applyDecision(
+                          terminalStatus ? null : decision,
+                          terminalStatus,
+                          execution,
+                        );
+                      })) ?? cancelledReply;
+                    if (params.session.pendingApproval === pendingApproval) {
+                      params.session.pendingApproval = undefined;
+                    }
                     return {
                       reply: appliedReply,
                       correction: await resolveCorrection(appliedReply),
@@ -369,6 +453,9 @@ export async function prepareDelegatedSystemAgentApproval(params: {
                     params.session.engine.noteAssistantMessage(failedReply.text);
                     return { reply: failedReply, correction: undefined };
                   } finally {
+                    if (params.session.pendingApproval === pendingApproval) {
+                      params.session.pendingApproval = undefined;
+                    }
                     persistSystemAgentEngineHistory(params.session.engine, historyStart);
                   }
                 }),

@@ -3,269 +3,36 @@ import { clampPositiveTimerTimeoutMs } from "@openclaw/normalization-core/number
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { toErrorObject } from "../../infra/errors.js";
 import { resolveExecutablePath } from "../../infra/executable-path.js";
-import { mergePathPrepend } from "../../infra/path-prepend.js";
 import {
   resolveWindowsExecutablePath,
   resolveWindowsSpawnProgramCandidate,
 } from "../../plugin-sdk/windows-spawn.js";
 import type {
   CliBackendExecute,
-  CliBackendToolPermissionRequest,
-  CliBackendToolPermissionResult,
   CliBackendUserInputRequest,
   CliBackendUserInputResult,
 } from "../../plugins/cli-backend.types.js";
 import type { RunExit, TerminationReason } from "../../process/supervisor/types.js";
-import {
-  recordAdjustedParamsForToolCall,
-  runBeforeToolCallHook,
-} from "../agent-tools.before-tool-call.js";
 import type { CliTerminalInterruption } from "../cli-output-contracts.js";
-import { resolveExecDefaults } from "../exec-defaults.js";
 import { FailoverError, isSignalTimeoutReason } from "../failover-error.js";
 import { withAgentQuestionAnswerAuthority } from "../harness/host-private-capabilities.js";
 import { runStructuredInput } from "../harness/structured-input-execution.js";
 import { compileStructuredInputQuestions } from "../harness/structured-input.js";
-import { resolveExecToolConfig } from "../lazy-exec-tool.js";
 import { resolveReplyExpectation } from "../reply-completion.js";
 import { recordAgentCleanupFailure } from "../run-cleanup-timeout.js";
-import { resolveToolLoopDetectionConfig } from "../tool-loop-detection-config.js";
 import {
   restartCliLiveSession,
   createCliLiveSessionCapability,
-  getCliLiveSessionApprovalGrants,
 } from "./cli-live-session-registry.js";
-import {
-  requestCliNativeToolApproval,
-  resolveCliNativeToolApprovalPlan,
-} from "./cli-native-tool-approval.js";
 import { createCliAbortError } from "./execute-node-claude.js";
+import { createPluginToolPermissionHandler } from "./execute-plugin-tool-permission.js";
 import { createCliPluginWatchdog, type CliWatchdogClock } from "./execute-plugin-watchdog.js";
 import { createCliRunCurrentAssertion } from "./execution-target.js";
 import { createCliFailoverError as failover } from "./exit-error.js";
 import * as noOutputPolicy from "./no-output-timeout-policy.js";
-import { normalizeCliToolName } from "./tool-policy.js";
 import type { PreparedCliRunContext } from "./types.js";
 
 const PLUGIN_ITERATOR_CLOSE_TIMEOUT_MS = 5_000;
-
-function denyTool(message: string): CliBackendToolPermissionResult {
-  return { behavior: "deny", message };
-}
-
-function createPluginToolPermissionHandler(params: {
-  context: PreparedCliRunContext;
-  abortSignal: AbortSignal;
-  onPendingApproval: (delta: 1 | -1) => void;
-  env: NodeJS.ProcessEnv;
-}): (request: CliBackendToolPermissionRequest) => Promise<CliBackendToolPermissionResult> {
-  const run = params.context.params;
-  const permission = resolveExecDefaults({
-    cfg: run.config,
-    sessionEntry: run.sessionEntry,
-    execOverrides: run.execOverrides,
-    agentId: run.agentId,
-    sessionKey: run.runtimePolicySessionKey ?? run.sessionKey,
-  });
-  const grants = new Set<string>();
-
-  return async (request) => {
-    const signal = request.abortSignal
-      ? AbortSignal.any([params.abortSignal, request.abortSignal])
-      : params.abortSignal;
-    const assertActive = createCliRunCurrentAssertion(run, signal);
-    try {
-      assertActive();
-    } catch {
-      return denyTool("OpenClaw denied native tool use: the admitted run is no longer active.");
-    }
-
-    const toolName = request.toolName.trim();
-    if (!toolName) {
-      return denyTool("OpenClaw denied an unnamed native tool.");
-    }
-    if (run.cliToolAvailability && !run.cliToolAvailability.native.includes(toolName)) {
-      return denyTool(`OpenClaw denied native tool ${toolName}: it is unavailable to this run.`);
-    }
-
-    // Provider schemas are not policy schemas: match canonical names and file operands.
-    const canonicalToolName = normalizeCliToolName(toolName);
-    const nativeFileTool =
-      ["read", "write", "edit"].includes(canonicalToolName) &&
-      Object.hasOwn(request.toolInput, "file_path");
-    let policyInput = request.toolInput;
-    if (nativeFileTool) {
-      const nativePath = request.toolInput.file_path;
-      if (typeof nativePath !== "string") {
-        return denyTool("OpenClaw denied native file tool use: invalid file path.");
-      }
-      if (Object.hasOwn(request.toolInput, "path") && request.toolInput.path !== nativePath) {
-        return denyTool("OpenClaw denied native file tool use: conflicting file paths.");
-      }
-      policyInput = { ...request.toolInput, path: nativePath };
-      if (canonicalToolName === "edit") {
-        const { old_string: oldText, new_string: newText, edits } = request.toolInput;
-        if (typeof oldText !== "string" || typeof newText !== "string") {
-          return denyTool("OpenClaw denied native edit tool use: invalid replacement.");
-        }
-        if (
-          edits !== undefined &&
-          (!Array.isArray(edits) ||
-            edits.length !== 1 ||
-            !isRecord(edits[0]) ||
-            edits[0].oldText !== oldText ||
-            edits[0].newText !== newText)
-        ) {
-          return denyTool("OpenClaw denied native edit tool use: conflicting replacements.");
-        }
-        policyInput.edits = [{ oldText, newText }];
-      }
-    }
-
-    const requester = {
-      ...((run.messageChannel ?? run.messageProvider)
-        ? { channel: run.messageChannel ?? run.messageProvider }
-        : {}),
-      ...(run.agentAccountId ? { accountId: run.agentAccountId } : {}),
-      ...(run.senderId ? { senderId: run.senderId } : {}),
-      ...(run.senderIsOwner !== undefined ? { senderIsOwner: run.senderIsOwner } : {}),
-    };
-    const hookResult = await runBeforeToolCallHook({
-      toolName: canonicalToolName,
-      params: policyInput,
-      ...(request.toolCallId ? { toolCallId: request.toolCallId } : {}),
-      signal,
-      ctx: {
-        ...(run.agentId ? { agentId: run.agentId } : {}),
-        ...(run.config ? { config: run.config } : {}),
-        cwd: params.context.cwd ?? params.context.workspaceDir,
-        workspaceDir: params.context.workspaceDir,
-        ...(run.sessionKey ? { sessionKey: run.sessionKey } : {}),
-        sessionId: run.sessionId,
-        runId: run.runId,
-        ...(run.trigger ? { trigger: run.trigger } : {}),
-        ...(run.approvalReviewerDeviceId
-          ? { approvalReviewerDeviceId: run.approvalReviewerDeviceId }
-          : {}),
-        ...(run.currentChannelId ? { channelId: run.currentChannelId } : {}),
-        ...(Object.keys(requester).length > 0 ? { requester } : {}),
-        turnSourceChannel: run.messageChannel ?? run.messageProvider,
-        turnSourceTo: run.chatId ?? run.currentChannelId,
-        turnSourceAccountId: run.agentAccountId,
-        turnSourceThreadId: run.currentThreadTs,
-        loopDetection: resolveToolLoopDetectionConfig({
-          cfg: run.config,
-          agentId: run.agentId,
-        }),
-      },
-    });
-    try {
-      assertActive();
-    } catch {
-      return denyTool("OpenClaw denied native tool use: the admitted run closed during policy.");
-    }
-    if (hookResult.blocked) {
-      return denyTool(hookResult.reason);
-    }
-    if (!isRecord(hookResult.params)) {
-      return denyTool("OpenClaw denied native tool use: before_tool_call returned invalid input.");
-    }
-    let toolInput = hookResult.params;
-    // SDK permission replies must return the native schema, never policy-only aliases.
-    if (nativeFileTool) {
-      if (typeof toolInput.path !== "string") {
-        return denyTool("OpenClaw denied native file tool use: invalid rewritten file path.");
-      }
-      if (toolInput === policyInput) {
-        toolInput = request.toolInput;
-      } else {
-        toolInput = { ...toolInput, file_path: toolInput.path };
-        if (!Object.hasOwn(request.toolInput, "path")) {
-          delete toolInput.path;
-        }
-        if (canonicalToolName === "edit") {
-          const edits = toolInput.edits;
-          if (
-            !Array.isArray(edits) ||
-            edits.length !== 1 ||
-            !isRecord(edits[0]) ||
-            typeof edits[0].oldText !== "string" ||
-            typeof edits[0].newText !== "string"
-          ) {
-            return denyTool("OpenClaw denied an unrepresentable native edit rewrite.");
-          }
-          toolInput.old_string = edits[0].oldText;
-          toolInput.new_string = edits[0].newText;
-          if (!Object.hasOwn(request.toolInput, "edits")) {
-            delete toolInput.edits;
-          }
-        }
-      }
-    }
-
-    const plan = resolveCliNativeToolApprovalPlan(permission);
-    if (plan === "deny") {
-      return denyTool(
-        `OpenClaw exec policy denied native tool use (security=${permission.security}, ask=${permission.ask}).`,
-      );
-    }
-    const currentGrants = getCliLiveSessionApprovalGrants(params.context) ?? grants;
-    if (plan === "allow" || (permission.ask !== "always" && currentGrants.has(toolName))) {
-      assertActive();
-      recordAdjustedParamsForToolCall(request.toolCallId, toolInput, run.runId);
-      return { behavior: "allow", updatedInput: toolInput };
-    }
-
-    params.onPendingApproval(1);
-    let outcome: Awaited<ReturnType<typeof requestCliNativeToolApproval>>;
-    try {
-      outcome = await requestCliNativeToolApproval({
-        toolName,
-        toolInput,
-        pluginId: params.context.backendResolved.id,
-        sessionKey: run.sessionKey,
-        agentId: run.agentId,
-        toolCallId: request.toolCallId,
-        cwd: request.cwd,
-        fallbackCwd: params.context.cwd ?? params.context.workspaceDir,
-        bindingEnv: params.env,
-        env: {
-          ...params.env,
-          PATH: mergePathPrepend(
-            params.env.PATH,
-            resolveExecToolConfig({ cfg: run.config, agentId: run.agentId }).pathPrepend ?? [],
-          ),
-        },
-        assertActive,
-        abortSignal: signal,
-        ask: permission.ask,
-      });
-    } finally {
-      params.onPendingApproval(-1);
-    }
-    // Approval itself may outlive, replace, or close the exact admitted turn.
-    // The host rechecks authority immediately before returning any capability.
-    try {
-      assertActive();
-    } catch {
-      return denyTool("OpenClaw denied native tool use: the admitted run closed during approval.");
-    }
-    if (outcome.kind !== "allow") {
-      return denyTool(
-        outcome.message ??
-          (outcome.reason === "user"
-            ? `OpenClaw user denied native tool use (${toolName}).`
-            : `OpenClaw approval was not granted for native tool use (${toolName}).`),
-      );
-    }
-    if (outcome.grantAlways) {
-      currentGrants.add(toolName);
-    }
-    const updatedInput = outcome.updatedInput ?? toolInput;
-    recordAdjustedParamsForToolCall(request.toolCallId, updatedInput, run.runId);
-    return { behavior: "allow", updatedInput };
-  };
-}
 
 function cancelUserInput(message: string): CliBackendUserInputResult {
   return { status: "cancelled", message };
@@ -517,6 +284,12 @@ export async function executePluginOwnedProcess(params: {
     },
     params.watchdogClock,
   );
+  const requestToolPermission = createPluginToolPermissionHandler({
+    context: params.context,
+    abortSignal: signal,
+    onPendingApproval: updatePendingApproval,
+    env: params.env,
+  });
   const stopAskUserDeadlineListener = params.onActiveLoopbackAskUserDeadlineChange?.(() =>
     watchdog.reset(),
   );
@@ -589,12 +362,7 @@ export async function executePluginOwnedProcess(params: {
       ...(run.executionMode ? { executionMode: run.executionMode } : {}),
       ...(run.cliToolAvailability ? { toolAvailability: run.cliToolAvailability } : {}),
       ...(liveSession ? { liveSession } : {}),
-      requestToolPermission: createPluginToolPermissionHandler({
-        context: params.context,
-        abortSignal: signal,
-        onPendingApproval: updatePendingApproval,
-        env: params.env,
-      }),
+      requestToolPermission,
       requestUserInput: createPluginUserInputHandler({
         context: params.context,
         abortSignal: signal,
@@ -679,6 +447,7 @@ export async function executePluginOwnedProcess(params: {
     if (!controller.signal.aborted) {
       controller.abort(new Error("CLI plugin runtime turn is no longer active."));
     }
+    requestToolPermission.dispose();
     if (replyBackendHandle) {
       run.replyOperation?.detachBackend(replyBackendHandle);
     }

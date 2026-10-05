@@ -24,6 +24,10 @@ import type { PluginApprovalRequestPayload } from "../../infra/plugin-approvals.
 import type { SystemAgentApprovalRequestPayload } from "../../infra/system-agent-approvals.js";
 import type { OpenClawStateDatabaseOptions } from "../../state/openclaw-state-db.js";
 import { prepareApprovalChannelCustody } from "../approval-channel-custody.js";
+import {
+  prepareApprovalResolvingActor,
+  readApprovalChannelReviewer,
+} from "../approval-resolving-actor.js";
 import { normalizeControlUiBasePath } from "../control-ui-shared.js";
 import type { ExecApprovalManager, ExecApprovalRecord } from "../exec-approval-manager.js";
 import {
@@ -412,9 +416,60 @@ export function createApprovalHandlers(
         respondApprovalNotFound(respond);
         return;
       }
-      const id = readExactApprovalId(rawParams);
+      let id = readExactApprovalId(rawParams);
       let record: OperatorApprovalRecord | null;
+      let reviewer: ApprovalResolveParams["reviewer"];
       try {
+        reviewer = readApprovalChannelReviewer(client, resolveParams?.reviewer);
+        if (id && resolveParams && client?.internal?.approvalActor) {
+          const manager =
+            resolveParams.kind === "exec"
+              ? params.execApprovalManager
+              : resolveParams.kind === "plugin"
+                ? params.pluginApprovalManager
+                : params.systemAgentApprovalManager;
+          if (manager && !manager.getLiveSnapshot(id)) {
+            const match = manager.lookupLocalApprovalId(id, {
+              includeResolved: true,
+              filter: (
+                candidate: ExecApprovalRecord<
+                  | ExecApprovalRequestPayload
+                  | PluginApprovalRequestPayload
+                  | SystemAgentApprovalRequestPayload
+                >,
+              ) => {
+                try {
+                  prepareApprovalResolvingActor({
+                    client,
+                    context,
+                    approvalKind: resolveParams.kind,
+                    authorization: candidate.authorization,
+                    decision: resolveParams.decision,
+                  });
+                  return Boolean(
+                    reviewer &&
+                    prepareApprovalChannelCustody({
+                      cfg: context.getRuntimeConfig(),
+                      approvalKind: resolveParams.kind,
+                      reviewer,
+                    })?.authorizes(candidate) &&
+                    canAccessApprovalSession({
+                      cfg: context.getRuntimeConfig(),
+                      client,
+                      sessionKey: candidate.request.sessionKey,
+                      agentId: candidate.request.agentId,
+                    }),
+                  );
+                } catch {
+                  return false;
+                }
+              },
+            });
+            if (match.kind === "prefix" || match.kind === "exact") {
+              id = match.id;
+            }
+          }
+        }
         record = id
           ? await loadVisibleApproval({
               id,
@@ -436,20 +491,33 @@ export function createApprovalHandlers(
         respondApprovalNotFound(respond);
         return;
       }
-      const custody = resolveParams?.reviewer
-        ? prepareApprovalChannelCustody({
-            cfg: context.getRuntimeConfig(),
-            approvalKind: record.kind,
-            reviewer: resolveParams.reviewer,
-          })
-        : null;
       const liveRecord =
         record.kind === "exec"
           ? params.execApprovalManager.getLiveSnapshot(record.id)
           : record.kind === "plugin"
             ? params.pluginApprovalManager.getLiveSnapshot(record.id)
             : params.systemAgentApprovalManager?.getLiveSnapshot(record.id);
-      if (resolveParams?.reviewer && (!custody || !liveRecord || !custody.authorizes(liveRecord))) {
+      let preparedActor: ReturnType<typeof prepareApprovalResolvingActor>;
+      try {
+        preparedActor = prepareApprovalResolvingActor({
+          client,
+          context,
+          approvalKind: record.kind,
+          authorization: record.authorization,
+          decision: resolveParams?.decision ?? "deny",
+        });
+      } catch (error) {
+        respondApprovalStorageUnavailable({ context, respond, operation: "resolve", error });
+        return;
+      }
+      const custody = reviewer
+        ? prepareApprovalChannelCustody({
+            cfg: context.getRuntimeConfig(),
+            approvalKind: record.kind,
+            reviewer,
+          })
+        : null;
+      if (reviewer && (!custody || !liveRecord || !custody.authorizes(liveRecord))) {
         respondApprovalNotFound(respond);
         return;
       }
@@ -468,8 +536,8 @@ export function createApprovalHandlers(
         return;
       }
       const resolver = custody
-        ? ({ kind: "channel", id: custody.resolverId } as const)
-        : resolveApprovalResolver(client);
+        ? ({ kind: "channel", id: custody.resolverId, actor: preparedActor.actor } as const)
+        : { ...resolveApprovalResolver(client), actor: preparedActor.actor };
       const localResolvedBy = resolveLegacyApprovalLabel(client);
       const requestedDecision = resolveParams?.decision ?? null;
       const decisionAllowed =
@@ -481,12 +549,13 @@ export function createApprovalHandlers(
       const kindMatches = resolveParams?.kind === record.presentation.kind;
       const forceMalformedDeny = !validParams || !kindMatches || !decisionAllowed;
       const assertCurrent = () => {
+        preparedActor.assertCurrent();
         const currentCfg = context.getRuntimeConfig();
-        const currentCustody = resolveParams?.reviewer
+        const currentCustody = reviewer
           ? prepareApprovalChannelCustody({
               cfg: currentCfg,
               approvalKind: record.kind,
-              reviewer: resolveParams.reviewer,
+              reviewer,
             })
           : null;
         if (
@@ -502,7 +571,7 @@ export function createApprovalHandlers(
             sessionKey: record.source.sessionKey,
             agentId: record.source.agentId,
           }) ||
-          (resolveParams?.reviewer && (!liveRecord || !currentCustody?.authorizes(liveRecord)))
+          (reviewer && (!liveRecord || !currentCustody?.authorizes(liveRecord)))
         ) {
           throw new Error("approval resolver authority is no longer active");
         }

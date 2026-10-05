@@ -1,11 +1,16 @@
 // Tests approval command behavior for pending tool and execution requests.
 import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { buildChannelInboundEventContext } from "../../channels/inbound-event/context.js";
+import { createHostChannelInboundEventContextBuilder } from "../../channels/inbound-event/host-context-builder.js";
+import { readAdmittedChannelApprovalActor } from "../../channels/message-access/approval-actor.js";
+import { createHostChannelIngressRuntime } from "../../channels/message-access/runtime.js";
 import type {
   ChannelApprovalCapability,
   ChannelPlugin,
 } from "../../channels/plugins/types.public.js";
 import type { OpenClawConfig } from "../../config/config.js";
+import { withRequesterApprovalChannel } from "../../gateway/approval-requester.test-support.js";
 import type { ChannelApprovalKind } from "../../infra/approval-types.js";
 import { markImplicitSameChatApprovalAuthorization } from "../../plugin-sdk/approval-auth-runtime.js";
 import { setActivePluginRegistry } from "../../plugins/runtime.js";
@@ -156,6 +161,113 @@ describe("handleApproveCommand", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     setApprovePluginRegistry();
+  });
+
+  it.each(
+    [
+      "exec:synthetic-command",
+      "plugin:synthetic-command",
+      "system-agent:synthetic-command",
+    ].flatMap((id) => [
+      { id, senderId: "synthetic-requester", rejected: false },
+      { id, senderId: "synthetic-other", rejected: true },
+    ]),
+  )(
+    "routes strict $id with admitted $senderId and preserves central requester rejection",
+    async ({ id, senderId, rejected }) => {
+      await withRequesterApprovalChannel(async () => {
+        if (rejected) {
+          resolveApprovalOverGatewayMock.mockRejectedValueOnce(
+            Object.assign(new Error("Approval requester unavailable: ineligible"), {
+              code: "APPROVAL_REQUESTER_UNAVAILABLE",
+            }),
+          );
+        }
+        const owner = { channelId: "test", isLive: () => true };
+        const channelIngress = await createHostChannelIngressRuntime(owner).resolveStable({
+          channelId: "test",
+          accountId: "default",
+          source: { actorKind: "human", eventKind: "message" },
+          subject: { stableId: senderId },
+          conversation: { kind: "direct", id: "synthetic-chat" },
+          contextBinding: {
+            agentId: "main",
+            sessionKey: "agent:main:synthetic",
+            messageId: "synthetic-command",
+            inboundEventKind: "user_request",
+          },
+          dmPolicy: "allowlist",
+          groupPolicy: "allowlist",
+          allowFrom: ["synthetic-requester", "synthetic-other"],
+        });
+        const ctx = await createHostChannelInboundEventContextBuilder(
+          buildChannelInboundEventContext,
+          owner,
+        )({
+          channel: "test",
+          accountId: "default",
+          messageId: "synthetic-command",
+          from: "test:synthetic-chat",
+          sender: { id: senderId },
+          conversation: { kind: "direct", id: "synthetic-chat" },
+          route: { agentId: "main", routeSessionKey: "agent:main:synthetic" },
+          reply: { to: "test:synthetic-chat" },
+          message: { rawBody: `/approve ${id} once` },
+          channelIngress,
+        });
+        const params = buildApproveParams(
+          `/approve ${id} once`,
+          {},
+          { Provider: "test", SenderId: senderId },
+        );
+        params.ctx = ctx;
+        const result = await handleApproveCommand(params, true);
+        if (rejected) {
+          expect(result?.reply?.text).toContain("❌ Failed to submit approval");
+          expect(result?.reply?.text).toContain("Approval requester unavailable");
+          expect(result?.reply?.text).not.toContain("✅");
+        } else {
+          expect(result?.reply?.text).toContain("✅");
+        }
+        const request = approvalResolverRequest();
+        expect(request).toMatchObject({
+          approvalId: id,
+          approvalKind: id.split(":")[0],
+          decision: "allow-once",
+        });
+        expect(request.resolveMethod).toBeUndefined();
+        expect(
+          readAdmittedChannelApprovalActor(
+            request.admittedActor as Parameters<typeof readAdmittedChannelApprovalActor>[0],
+          )?.actor,
+        ).toMatchObject({
+          kind: "channel",
+          channel: "test",
+          accountId: "default",
+          senderId,
+          messageId: "synthetic-command",
+        });
+      });
+    },
+  );
+
+  it("rejects strict command display identity without authenticated admission", async () => {
+    await withRequesterApprovalChannel(async () => {
+      const result = await handleApproveCommand(
+        buildApproveParams(
+          "/approve plugin:synthetic once",
+          {},
+          {
+            Provider: "test",
+            SenderId: "synthetic-requester",
+            AccountId: "default",
+          },
+        ),
+        true,
+      );
+      expect(result?.reply?.text).toContain("Authenticated approval requester unavailable");
+      expect(resolveApprovalOverGatewayMock).not.toHaveBeenCalled();
+    });
   });
 
   function createTelegramApproveCfg(

@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
+import {
+  createHostNonUserTurnSource,
+  projectHostTurnSource,
+  type HostTurnSource,
+} from "../../infra/host-turn-source.js";
 import type { AgentTurnParams } from "./agent-runner-execution.types.js";
 import {
   createFollowupTurnTestTurn,
@@ -51,7 +56,11 @@ describe.each(["ordinary summary", "compacted sources", "deferred retry"] as con
       const firstAttempt = createDeferred();
       const releaseFirstAttempt = createDeferred();
       const completed = createDeferred();
-      const executions: Array<{ prompt: string; profile: string | undefined }> = [];
+      const executions: Array<{
+        prompt: string;
+        profile: string | undefined;
+        turnSource?: HostTurnSource;
+      }> = [];
       const sources: FollowupRun[] = [];
       let summaryAttempts = 0;
       let currentOwner = "owner-at-enqueue";
@@ -62,6 +71,7 @@ describe.each(["ordinary summary", "compacted sources", "deferred retry"] as con
       };
       const enqueue = (prompt: string, eligible: boolean | undefined) => {
         const source = createQueueTestRun({ prompt });
+        source.turnSource = createHostNonUserTurnSource("system");
         source.personalBootstrapEligible = eligible;
         source.run.sessionKey = key;
         source.run.bootstrapUserProfileId = `stale-source-owner-${sources.length}`;
@@ -78,6 +88,7 @@ describe.each(["ordinary summary", "compacted sources", "deferred retry"] as con
         executions.push({
           prompt: params.commandBody,
           profile: params.followupRun.run.bootstrapUserProfileId,
+          turnSource: params.followupRun.turnSource,
         });
         return { runId: "run-1", outcome: { kind: "rejected", payload: { text: "done" } } };
       });
@@ -178,6 +189,14 @@ describe.each(["ordinary summary", "compacted sources", "deferred retry"] as con
           path === "ordinary summary" ? [currentOwner, currentOwner] : [currentOwner],
         );
         expect(executions[0]?.profile).toBe(testCase.personalized ? currentOwner : undefined);
+        expect(
+          projectHostTurnSource(executions[0]?.turnSource, "synthetic-run", "synthetic-session")
+            .inputs,
+        ).toEqual(
+          sources
+            .slice(0, 2)
+            .flatMap((source) => projectHostTurnSource(source.turnSource, null, null).inputs),
+        );
       } finally {
         releaseFirstAttempt.resolve();
         clear();

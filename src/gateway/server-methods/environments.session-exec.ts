@@ -3,6 +3,7 @@ import {
   errorShape,
   validateEnvironmentsSessionExecParams,
 } from "../../../packages/gateway-protocol/src/index.js";
+import type { ApprovalExecution } from "../../agents/approval-execution.js";
 import { resolveExecDefaults } from "../../agents/exec-defaults.js";
 import { approveSessionEnvironmentCommand } from "./environments.session-exec-approval.js";
 import { captureSessionEnvironmentToolPolicy } from "./environments.session-tool-policy.js";
@@ -41,6 +42,7 @@ export const environmentsSessionExecHandlers: GatewayRequestHandlers = {
           action === "run" || action === "start" ? "exec" : "process",
         );
         let approved = false;
+        let approvalExecution: ApprovalExecution | undefined;
         const assertCurrent = () => {
           toolPolicy.assertAllowed();
           service.assertSessionAttachment(binding);
@@ -87,7 +89,7 @@ export const environmentsSessionExecHandlers: GatewayRequestHandlers = {
             policy.ask === "always" ||
             toolPolicy.cronExecAskAlways
           ) {
-            await approveSessionEnvironmentCommand({
+            approvalExecution = await approveSessionEnvironmentCommand({
               options,
               binding,
               argv: command.argv,
@@ -101,6 +103,7 @@ export const environmentsSessionExecHandlers: GatewayRequestHandlers = {
         }
         const assertDispatch = () => {
           assertCurrent();
+          approvalExecution?.assertCurrent();
           if (action === "run" || action === "start") {
             const cfg = context.getRuntimeConfig();
             const target = loadAccessorSessionEntryForGatewayTarget({

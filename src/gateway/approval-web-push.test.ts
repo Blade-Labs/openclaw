@@ -4,20 +4,37 @@ import { createDeferred } from "../../test/helpers/promise.js";
 import type { BoundWebPushSubscription } from "../infra/push-web.js";
 import { createTestApprovalManager } from "./exec-approval-manager.test-support.js";
 import type { ExecApprovalRecord } from "./exec-approval-manager.types.js";
+import { runApprovalRequestDeliveries } from "./server-methods/approval-request-delivery.js";
 
-const listDevicePairingMock = vi.fn();
-const listBoundWebPushSubscriptionsMock = vi.fn();
-const hasBoundWebPushSubscriptionsMock = vi.fn();
-const prepareWebPushNotificationSenderMock = vi.fn();
-const preparedWebPushSendMock = vi.fn();
-const prepareWebPushApprovalDeliveriesMock = vi.fn();
-const listWebPushApprovalDeliveryTargetsMock = vi.fn();
-const deleteWebPushApprovalDeliveryTargetsMock = vi.fn();
-const listTerminalWebPushApprovalDeliveryIdsMock = vi.fn();
-const resolveUserProfileIdMock = vi.fn();
-const resolveOperatorRolePolicyForProfileMock = vi.fn();
-const isApprovalRecordVisibleToClientMock = vi.fn();
-const getOperatorApprovalDetailedMock = vi.hoisted(() => vi.fn());
+const {
+  listDevicePairingMock,
+  listBoundWebPushSubscriptionsMock,
+  hasBoundWebPushSubscriptionsMock,
+  prepareWebPushNotificationSenderMock,
+  preparedWebPushSendMock,
+  prepareWebPushApprovalDeliveriesMock,
+  listWebPushApprovalDeliveryTargetsMock,
+  deleteWebPushApprovalDeliveryTargetsMock,
+  listTerminalWebPushApprovalDeliveryIdsMock,
+  resolveUserProfileIdMock,
+  resolveOperatorRolePolicyForProfileMock,
+  isApprovalRecordVisibleToClientMock,
+  getOperatorApprovalDetailedMock,
+} = vi.hoisted(() => ({
+  listDevicePairingMock: vi.fn(),
+  listBoundWebPushSubscriptionsMock: vi.fn(),
+  hasBoundWebPushSubscriptionsMock: vi.fn(),
+  prepareWebPushNotificationSenderMock: vi.fn(),
+  preparedWebPushSendMock: vi.fn(),
+  prepareWebPushApprovalDeliveriesMock: vi.fn(),
+  listWebPushApprovalDeliveryTargetsMock: vi.fn(),
+  deleteWebPushApprovalDeliveryTargetsMock: vi.fn(),
+  listTerminalWebPushApprovalDeliveryIdsMock: vi.fn(),
+  resolveUserProfileIdMock: vi.fn(),
+  resolveOperatorRolePolicyForProfileMock: vi.fn(),
+  isApprovalRecordVisibleToClientMock: vi.fn(),
+  getOperatorApprovalDetailedMock: vi.fn(),
+}));
 
 vi.mock("../infra/device-pairing.js", async () => {
   const actual = await vi.importActual<typeof import("../infra/device-pairing.js")>(
@@ -512,6 +529,60 @@ describe("approval Web Push delivery", () => {
     expect(getRuntimeConfig).toHaveBeenCalledOnce();
     expect(preparedWebPushSendMock).not.toHaveBeenCalled();
   });
+
+  it.for(
+    (["sender", "receipts"] as const).flatMap((stage) =>
+      [true, false].map((enabled) => ({ stage, enabled })),
+    ),
+  )(
+    "rechecks live requester-only policy after Web Push $stage preparation (enabled=$enabled)",
+    async ({ stage, enabled }, testContext) => {
+      const manager = createTestApprovalManager(testContext);
+      const record = manager.create(
+        { command: "echo synthetic" },
+        60_000,
+        "synthetic-live-web-push",
+      );
+      let strict = false;
+      record.requiresRequesterMatch = () => strict;
+      const current = boundSubscription("synthetic-device", null);
+      listBoundWebPushSubscriptionsMock.mockResolvedValue([current]);
+      listDevicePairingMock.mockReturnValue({
+        paired: [pairedOperator("synthetic-device", ["operator.approvals", "operator.read"])],
+      });
+      const started = createDeferred();
+      const preparation = createDeferred();
+      if (stage === "sender") {
+        prepareWebPushNotificationSenderMock.mockImplementationOnce(async () => {
+          started.resolve();
+          await preparation.promise;
+          return preparedWebPushSendMock;
+        });
+      } else {
+        prepareWebPushApprovalDeliveriesMock.mockImplementationOnce(async () => {
+          started.resolve();
+          await preparation.promise;
+          return [current.subscriptionId];
+        });
+      }
+      preparedWebPushSendMock.mockResolvedValue([
+        { ok: true, subscriptionId: current.subscriptionId, statusCode: 201 },
+      ]);
+      const { createApprovalWebPushDelivery } = await import("./approval-web-push.js");
+      const delivered = runApprovalRequestDeliveries({
+        context: {
+          getRuntimeConfig: () => ({}),
+          approvalWebPushDelivery: createApprovalWebPushDelivery({ getRuntimeConfig: () => ({}) }),
+        },
+        record,
+      });
+      await started.promise;
+      strict = enabled;
+      preparation.resolve();
+      await expect(delivered).resolves.toBe(!enabled);
+      expect(preparedWebPushSendMock).toHaveBeenCalledTimes(enabled ? 0 : 1);
+    },
+  );
 
   it.for(["resolved", "expired"] as const)(
     "does not send after the approval becomes %s during transport preparation",

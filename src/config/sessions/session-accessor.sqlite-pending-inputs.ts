@@ -8,6 +8,7 @@ import {
   isAgentEventLifecycleGenerationCurrent,
   registerAgentEventLifecycleRotationHandler,
 } from "../../infra/agent-events.js";
+import type { HostTurnSource } from "../../infra/host-turn-source.js";
 import {
   executeSqliteQuerySync,
   executeSqliteQueryTakeFirstSync,
@@ -47,6 +48,8 @@ export type SessionPendingInputOwner = {
   idempotencyKey: string;
   lifecycleGeneration: string;
   messageJson: string;
+  turnSource?: HostTurnSource;
+  sourceProvenanceJson?: string | null;
   config?: OpenClawConfig;
   assertCurrent: () => void;
   /** Published only after the exact input was consumed by a committed transcript write. */
@@ -324,6 +327,7 @@ export function claimCurrentSessionPendingInputDedupeRecovery(
     row.input_id === owner.inputId &&
     row.run_id === runId &&
     row.message_json === owner.messageJson &&
+    (row.source_provenance_json ?? null) === (owner.sourceProvenanceJson ?? null) &&
     row.state === "queued" &&
     row.consumed_event_id == null &&
     readSessionPendingInputOwnerIds(database, [row]).has(owner.inputId),
@@ -463,7 +467,8 @@ export function resolveSessionPendingInputAppend(
         !accepted ||
         accepted.input_id !== source.inputId ||
         accepted.lifecycle_generation !== source.lifecycleGeneration ||
-        accepted.message_json !== source.messageJson
+        accepted.message_json !== source.messageJson ||
+        (accepted.source_provenance_json ?? null) !== (source.sourceProvenanceJson ?? null)
       ) {
         throw new SessionPendingInputCustodyError(
           "Collected input custody changed before transcript promotion",

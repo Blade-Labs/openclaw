@@ -10,7 +10,34 @@ import type {
   ExecApprovalManagerOptions,
   ExecApprovalRecord,
 } from "./exec-approval-manager.types.js";
-import type { insertOperatorApproval, OperatorApprovalKind } from "./operator-approval-store.js";
+import { insertOperatorApproval, type OperatorApprovalKind } from "./operator-approval-store.js";
+
+/** Recording a terminal rejection never restores the rejected request's execution authority. */
+export async function persistRequesterApprovalDenial<TPayload>(params: {
+  record: ExecApprovalRecord<TPayload>;
+  kind: OperatorApprovalKind;
+  persistence: ExecApprovalManagerOptions<TPayload>["persistence"];
+  assertCurrent: () => void;
+}) {
+  const approval = await prepareExecApprovalRegistration({
+    record: params.record,
+    kind: params.kind,
+    runtimeEpoch: params.persistence.runtimeEpoch,
+    presentation: prepareExecApprovalPresentation(params.kind, params.record.request, [
+      "allow-once",
+      "deny",
+    ]),
+  });
+  const result = await insertOperatorApproval({
+    approval: { ...approval, terminalReason: "requester-unavailable" },
+    databaseOptions: params.persistence.databaseOptions,
+    assertCurrent: params.assertCurrent,
+  });
+  if (result.outcome === "conflict" || result.record.decision !== "deny") {
+    throw new Error("requester denial conflicts with an existing approval");
+  }
+  return result.record;
+}
 
 // These opaque ids cross terminal, UI, push, and channel surfaces unchanged.
 const EXPLICIT_APPROVAL_ID_INVALID_CHAR_PATTERN = /[^A-Za-z0-9._:-]/;
@@ -114,6 +141,7 @@ export async function prepareExecApprovalRegistration<TPayload>(params: {
   }
   return {
     id: record.id,
+    ...(record.authorization ? { authorization: record.authorization } : {}),
     kind: params.kind,
     presentation: params.presentation,
     requester: {

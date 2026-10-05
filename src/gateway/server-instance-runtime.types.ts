@@ -32,6 +32,11 @@ export type GatewayInstanceAgentDispatchOptions = {
 
 export type GatewayApprovalEventPublisher = {
   publishRequested: (kind: ChannelApprovalKind, request: unknown) => number;
+  deliverRequester?: (kind: ChannelApprovalKind, request: unknown) => Promise<boolean>;
+  reportBlockedRequest?: (
+    kind: ChannelApprovalKind,
+    request: unknown,
+  ) => Promise<"sent" | "no-unique-chat" | "failed">;
   publishResolved: (kind: ChannelApprovalKind, resolved: unknown) => void;
 };
 

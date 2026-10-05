@@ -1,5 +1,10 @@
 import type { DecisionReceiptV1 } from "../../../packages/gateway-protocol/src/index.js";
 import type { GatewayContextResolver } from "../../gateway/server-methods/types.js";
+import { readHostTurnSource, type HostTurnSource } from "../../infra/host-turn-source.js";
+import type {
+  ChannelSourceActor,
+  ChannelSourceMessage,
+} from "../../infra/turn-source-provenance.js";
 import {
   createChannelAdmissionDecisionReceipt,
   type ChannelAdmissionDecisionReceiptInput,
@@ -15,6 +20,8 @@ import {
   contextHandoffMatches,
   type ChannelIngressResolutionScope,
 } from "./admission-evidence-scope-key.js";
+import { prepareChannelAdmissionTurnSource } from "./admission-source.js";
+import { admitChannelApprovalActor, type AdmittedChannelActor } from "./approval-actor.js";
 import type { ChannelIngressHostOwner, ChannelParticipantInput } from "./ingress-host-owner.js";
 import type {
   ChannelIngressContextBinding,
@@ -58,6 +65,8 @@ type ConsumedChannelAdmissionEvidence = Readonly<{
 }>;
 
 type ChannelIngressResolutionBinding = Readonly<{
+  sourceActor: ChannelSourceActor;
+  sourceMessage?: ChannelSourceMessage;
   channelId: string;
   accountId?: string;
   rawPrincipalRef: string | number | null | undefined;
@@ -149,6 +158,7 @@ class AdmissionEvidence implements ChannelAdmissionEvidence {
 }
 
 class PreparedChannelAdmissionEvidence {
+  #turnSource: HostTurnSource | undefined;
   #consumed = false;
   #evidence: ChannelAdmissionEvidence | undefined;
   #resolver: GatewayContextResolver | undefined;
@@ -158,10 +168,12 @@ class PreparedChannelAdmissionEvidence {
     evidence: ChannelAdmissionEvidence | undefined,
     resolver?: GatewayContextResolver,
     owner?: ChannelIngressHostOwner,
+    turnSource?: HostTurnSource,
   ) {
     this.#evidence = evidence;
     this.#resolver = resolver;
     this.#owner = owner;
+    this.#turnSource = turnSource;
     this.#gatewayContext = owner?.resolveGatewayContext?.();
     Object.setPrototypeOf(this, null);
     Object.freeze(this);
@@ -179,11 +191,22 @@ class PreparedChannelAdmissionEvidence {
         ? value.#evidence
         : unknownChannelAdmissionEvidence(AdmissionEvidence.read(value.#evidence)?.audit),
       resolver: current ? value.#resolver : undefined,
+      turnSource: current ? value.#turnSource : undefined,
+      assertCurrent: () => {
+        if (
+          !value.#owner?.isLive() ||
+          value.#owner.resolveGatewayContext?.() !== value.#gatewayContext
+        ) {
+          throw new Error("channel approval actor owner is no longer current");
+        }
+      },
     };
   }
 }
 
 type ContextAdmissionValue = {
+  assertCurrent?: () => void;
+  turnSource?: HostTurnSource;
   scope: string | undefined;
   evidence: ChannelAdmissionEvidence | undefined;
   resolver?: GatewayContextResolver;
@@ -283,6 +306,8 @@ function participantContribution(params: {
 }
 
 export function recordChannelIngressResolution(params: {
+  sourceActor?: ChannelSourceActor;
+  sourceMessage?: ChannelSourceMessage;
   result: ResolvedChannelMessageIngress;
   owner?: ChannelIngressHostOwner;
   participantInput?: ChannelParticipantInput;
@@ -299,6 +324,15 @@ export function recordChannelIngressResolution(params: {
   }
   const activeOwner = owner;
   const binding = Object.freeze({
+    sourceActor: Object.freeze({
+      ...(params.sourceActor ?? {
+        channel: params.channelId,
+        accountId: params.accountId ?? "default",
+        senderId: "",
+        actorKind: "unknown",
+      }),
+    }),
+    sourceMessage: params.sourceMessage ? Object.freeze({ ...params.sourceMessage }) : undefined,
     channelId: params.channelId,
     accountId: params.accountId,
     rawPrincipalRef: params.rawPrincipalRef,
@@ -336,11 +370,13 @@ export function prepareHostChannelContextAdmissionEvidence(params: {
   contextParams: object;
 }): PreparedChannelAdmissionEvidence {
   const audit = params.owner?.resolveGatewayContext?.()?.channelAdmissionAudit;
+  const unavailableSource = () => prepareChannelAdmissionTurnSource(params);
   if (params.ingress === "unsupported") {
     return new PreparedChannelAdmissionEvidence(
       unsupportedChannelAdmissionEvidence(audit),
       undefined,
       params.owner,
+      unavailableSource(),
     );
   }
   const results =
@@ -420,6 +456,9 @@ export function prepareHostChannelContextAdmissionEvidence(params: {
     valid ? combineChannelAdmissionEvidence(sources) : unknownChannelAdmissionEvidence(audit),
     valid ? params.owner?.resolveGatewayContext : undefined,
     params.owner,
+    valid
+      ? prepareChannelAdmissionTurnSource({ ...params, bindings: validBindings })
+      : unavailableSource(),
   );
 }
 
@@ -435,6 +474,8 @@ export function bindHostChannelContextAdmissionEvidence(params: {
     scope,
     evidence: scope !== undefined ? prepared?.evidence : unknownChannelAdmissionEvidence(audit),
     resolver: scope !== undefined ? prepared?.resolver : undefined,
+    turnSource: scope !== undefined ? prepared?.turnSource : undefined,
+    assertCurrent: scope !== undefined ? prepared?.assertCurrent : undefined,
   });
 }
 export function readChannelContextAdmissionEvidence(
@@ -446,6 +487,38 @@ export function readChannelContextGatewayContextResolver(
   context: object,
 ): GatewayContextResolver | undefined {
   return readContextAdmission(context)?.resolver;
+}
+
+export function readChannelContextTurnSource(context: object): HostTurnSource | undefined {
+  const admission = readContextAdmission(context);
+  return admission?.scope !== undefined && admission.scope === finalizedContextScopeKey(context)
+    ? admission.turnSource
+    : undefined;
+}
+
+/** Commands retain the original authenticated event, independently of audit collection. */
+export function readChannelContextApprovalActor(context: object): AdmittedChannelActor | undefined {
+  const admission = readContextAdmission(context);
+  const source = readChannelContextTurnSource(context);
+  const facts = readHostTurnSource(source);
+  const input = facts.inputs[0];
+  if (
+    !admission?.assertCurrent ||
+    facts.completeness !== "complete" ||
+    facts.inputs.length !== 1 ||
+    input?.origin !== "user"
+  ) {
+    return undefined;
+  }
+  return admitChannelApprovalActor(
+    { kind: "channel", ...input.actor, messageId: input.message.messageId },
+    () => {
+      admission.assertCurrent?.();
+      if (readChannelContextTurnSource(context) !== source) {
+        throw new Error("channel approval actor context changed");
+      }
+    },
+  );
 }
 
 /** Preserve private evidence only when its owner explicitly replaces an unchanged context. */
@@ -469,6 +542,8 @@ export function copyChannelParticipantAdmissionEvidence(source: object, target: 
     evidence: safeEvidence,
     resolver: sameScope && !resolverConflict ? original.resolver : undefined,
     resolverConflict,
+    turnSource: sameScope && !resolverConflict ? original.turnSource : undefined,
+    assertCurrent: sameScope && !resolverConflict ? original.assertCurrent : undefined,
   });
 }
 

@@ -173,6 +173,7 @@ function createChannelIngressResolverForOwner(
         accountId: base.accountId,
         identity: base.identity,
         subject: input.subject,
+        source: input.source,
         conversation: input.conversation,
         contextBinding: input.contextBinding,
         event: channelIngressEvent({
@@ -562,6 +563,30 @@ async function resolveChannelMessageIngressForOwner(
     channelId,
     accountId: params.accountId,
     rawPrincipalRef: params.subject.stableId,
+    sourceActor: {
+      channel: channelId,
+      accountId: params.accountId,
+      senderId: senderId
+        ? (params.identity.primary.normalizeSubject ?? params.identity.primary.normalize)
+          ? ((params.identity.primary.normalizeSubject ?? params.identity.primary.normalize)?.(
+              senderId,
+            ) ?? "")
+          : senderId
+        : "",
+      actorKind: params.source?.actorKind ?? "unknown",
+    },
+    sourceMessage: params.contextBinding
+      ? {
+          messageId: params.contextBinding.messageId ?? "",
+          conversationId: params.conversation.id,
+          conversationKind: params.conversation.kind,
+          ...(params.conversation.threadId ? { threadId: params.conversation.threadId } : {}),
+          eventKind: params.source?.eventKind ?? "unknown",
+          ...(params.source?.edited !== undefined ? { edited: params.source.edited } : {}),
+          ...(params.source?.teamId ? { teamId: params.source.teamId } : {}),
+          ...(params.source?.enterpriseId ? { enterpriseId: params.source.enterpriseId } : {}),
+        }
+      : undefined,
     scope: {
       conversation: {
         kind: params.conversation.kind,

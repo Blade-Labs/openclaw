@@ -77,3 +77,11 @@ export {
   formatChannelApprovalResolvedLabel,
 } from "./approval-terminal.js";
 export { createNativeApprovalControlRegistry } from "./approval-native-controls.js";
+export type {
+  ApprovalRequesterBinding,
+  ApprovalRequestAuthorization,
+  ApprovalResolvingActor,
+  ApprovalWaitDecisionResult,
+} from "../infra/approval-requester-binding.js";
+
+export type { ChannelApprovalResolutionRuntimeV2 } from "../infra/approval-gateway-runtime.types.js";

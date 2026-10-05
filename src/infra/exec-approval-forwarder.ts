@@ -4,6 +4,7 @@ import { resolveChannelDefaultAccountId } from "../channels/plugins/helpers.js";
 import {
   getLoadedChannelPlugin,
   resolveChannelApprovalAdapter,
+  resolveChannelApprovalCapability,
 } from "../channels/plugins/index.js";
 import { getRuntimeConfig } from "../config/config.js";
 import type {
@@ -11,6 +12,7 @@ import type {
   ExecApprovalForwardTarget,
 } from "../config/types.approvals.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { requiresApprovalRequesterMatch } from "../gateway/approval-request-policy.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { channelRouteDedupeKey } from "../plugin-sdk/channel-route.js";
 import { runWithRetainedGatewayRootWork } from "../process/gateway-work-admission.js";
@@ -23,6 +25,7 @@ import {
   type ApprovalNativeRouteCoordinator,
 } from "./approval-native-route-coordinator.js";
 import { matchesApprovalRequestFilters } from "./approval-request-filters.js";
+import type { ApprovalRequestAuthorization } from "./approval-requester-binding.js";
 import type { ChannelApprovalKind } from "./approval-types.js";
 import {
   buildForwardedExecApprovalExpired,
@@ -52,6 +55,7 @@ type ResolveSessionTargetFn = (params: {
 type ForwardTarget = ExecApprovalForwardTarget & { source: "session" | "target" };
 
 type ApprovalRouteRequest = {
+  authorization?: ApprovalRequestAuthorization;
   agentId?: string | null;
   sessionKey?: string | null;
   turnSourceChannel?: string | null;
@@ -61,6 +65,7 @@ type ApprovalRouteRequest = {
 };
 
 type PendingApproval = {
+  requiresRequesterMatch?: () => boolean;
   routeRequest: ApprovalRouteRequest;
   targets: ForwardTarget[];
 };
@@ -216,6 +221,7 @@ function extractApprovalRouteRequest(
     return null;
   }
   return {
+    authorization: request.authorization,
     agentId: request.agentId ?? null,
     sessionKey: request.sessionKey ?? null,
     turnSourceChannel: request.turnSourceChannel ?? null,
@@ -273,6 +279,9 @@ async function deliverToTargets(params: {
     try {
       const payload = params.buildPayload(target);
       await params.beforeDeliver?.(target, payload);
+      if (params.shouldSend && !params.shouldSend()) {
+        return;
+      }
       const send = await params.deliver({
         cfg: params.cfg,
         channel,
@@ -382,6 +391,24 @@ function createApprovalHandlers<
     );
   };
 
+  const isRequesterOnly = (route?: ApprovalRouteRequest | null): boolean => {
+    const cfg = params.getConfig();
+    return (
+      requiresApprovalRequesterMatch(route?.authorization, cfg, params.strategy.kind) ||
+      Boolean(
+        route?.turnSourceChannel &&
+        route.turnSourceAccountId &&
+        resolveChannelApprovalCapability(
+          getLoadedChannelPlugin(route.turnSourceChannel),
+        )?.resolveRequestPolicy?.({
+          cfg,
+          accountId: route.turnSourceAccountId,
+          approvalKind: params.strategy.kind,
+        })?.requireResolverMatch,
+      )
+    );
+  };
+
   const deliverResolved = async (resolved: TResolved, entry?: PendingApproval): Promise<void> => {
     const cfg = params.getConfig();
     const routeRequest = entry?.routeRequest ?? extractApprovalRouteRequest(resolved.request);
@@ -394,7 +421,7 @@ function createApprovalHandlers<
             routeRequest,
           })
         : []);
-    if (!targets.length) {
+    if (!targets.length || entry?.requiresRequesterMatch?.() || isRequesterOnly(routeRequest)) {
       return;
     }
     await deliverToTargets({
@@ -407,6 +434,7 @@ function createApprovalHandlers<
           target,
         }),
       deliver: params.deliver,
+      shouldSend: () => !entry?.requiresRequesterMatch?.() && !isRequesterOnly(routeRequest),
     });
   };
 
@@ -415,8 +443,17 @@ function createApprovalHandlers<
     const config = params.strategy.config(cfg);
     const requestId = request.id;
     const routeRequest = extractApprovalRouteRequest(request.request) ?? {};
+    let requesterOnly = isRequesterOnly(routeRequest);
+    const requiresRequesterMatch = () => (requesterOnly ||= isRequesterOnly(routeRequest));
+    if (requesterOnly) {
+      return false;
+    }
     // Register before route lookup so a fast resolution cannot overtake and resurrect delivery.
-    const pendingEntry = pending.begin(requestId, { routeRequest, targets: [] });
+    const pendingEntry = pending.begin(requestId, {
+      routeRequest,
+      targets: [],
+      requiresRequesterMatch,
+    });
     let filteredTargets: ForwardTarget[];
     try {
       filteredTargets = await resolveTargets({ cfg, config, routeRequest });
@@ -424,12 +461,12 @@ function createApprovalHandlers<
       pending.remove(requestId, pendingEntry);
       throw error;
     }
-    if (filteredTargets.length === 0) {
+    if (filteredTargets.length === 0 || requiresRequesterMatch()) {
       pending.remove(requestId, pendingEntry);
       return false;
     }
 
-    pendingEntry.value = { routeRequest, targets: filteredTargets };
+    pendingEntry.value = { routeRequest, targets: filteredTargets, requiresRequesterMatch };
     const expiresInMs = Math.max(0, request.expiresAtMs - params.nowMs());
     pending.scheduleExpiry(pendingEntry, expiresInMs, (expired) =>
       trackDelivery(() =>
@@ -437,6 +474,7 @@ function createApprovalHandlers<
           cfg,
           targets: expired.value.targets,
           buildPayload: () => ({ text: params.strategy.buildExpiredText(request) }),
+          shouldSend: () => !requiresRequesterMatch(),
           deliver: params.deliver,
         }),
       ).catch((err: unknown) => {
@@ -473,7 +511,7 @@ function createApprovalHandlers<
           });
         },
         deliver: params.deliver,
-        shouldSend: () => pending.isCurrent(pendingEntry),
+        shouldSend: () => pending.isCurrent(pendingEntry) && !requiresRequesterMatch(),
       }).then(() => pending.completeDelivery(pendingEntry, pendingEntry.value)),
     ).catch((err: unknown) => {
       log.error(

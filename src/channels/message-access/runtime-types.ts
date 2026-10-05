@@ -4,6 +4,10 @@
  * Defines identity descriptors, resolver inputs, route access, and resolved access results.
  */
 import type { AccessGroupConfig } from "../../config/types.access-groups.js";
+import type {
+  ChannelSourceActor,
+  ChannelSourceMessage,
+} from "../../infra/turn-source-provenance.js";
 import type { InboundEventKind } from "../inbound-event/kind.js";
 import type { IdentifierAuthentication } from "./identifier-authentication.js";
 import type {
@@ -197,6 +201,9 @@ export type ChannelIngressAccessGroupMembershipResolver = (params: {
 
 /** Complete input for resolving one inbound channel message or event. */
 export type ResolveChannelMessageIngressParams = {
+  /** Authenticated adapter facts; core supplies account, sender and message scope. */
+  source?: Pick<ChannelSourceActor, "actorKind"> &
+    Pick<ChannelSourceMessage, "eventKind" | "edited" | "teamId" | "enterpriseId">;
   /** Channel id used for config, diagnostics, access groups, and pairing-store reads. */
   channelId: ChannelIngressChannelId;
   /** Account id scoped to this channel instance. */

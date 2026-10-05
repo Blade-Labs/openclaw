@@ -900,37 +900,42 @@ describe("operator approval store", () => {
     });
   });
 
-  it("terminalizes a corrupt pending row and never returns it as approvable", async () => {
-    const databaseOptions = getSuiteDatabaseOptions();
-    await insertOperatorApproval({
-      approval: approval("corrupt", { createdAtMs: 5_000 }),
-      databaseOptions,
-    });
-    const database = openOpenClawStateDatabase(databaseOptions);
-    const stateDb = getNodeSqliteKysely<OperatorApprovalDatabase>(database.db);
-    executeSqliteQuerySync(
-      database.db,
-      stateDb
-        .updateTable("operator_approvals")
-        .set({ presentation_json: "{not-json" })
-        .where("approval_id", "=", "corrupt"),
-    );
+  it.each(["presentation_json", "authorization_json", "resolver_actor_json"] as const)(
+    "terminalizes malformed %s and never returns the pending row as approvable",
+    async (column) => {
+      const databaseOptions = getSuiteDatabaseOptions();
+      await insertOperatorApproval({
+        approval: approval("corrupt", { createdAtMs: 5_000 }),
+        databaseOptions,
+      });
+      const database = openOpenClawStateDatabase(databaseOptions);
+      const stateDb = getNodeSqliteKysely<OperatorApprovalDatabase>(database.db);
+      executeSqliteQuerySync(
+        database.db,
+        stateDb
+          .updateTable("operator_approvals")
+          .set({ [column]: "{not-json" })
+          .where("approval_id", "=", "corrupt"),
+      );
 
-    expect(
-      await getOperatorApprovalDetailed({ id: "corrupt", nowMs: 2_000, databaseOptions }),
-    ).toEqual({
-      outcome: "corrupt",
-    });
-    expect(await getOperatorApproval({ id: "corrupt", nowMs: 2_000, databaseOptions })).toBeNull();
-    expect(rawApprovalRow(databaseOptions, "corrupt")).toMatchObject({
-      status: "denied",
-      decision: "deny",
-      terminal_reason: "storage-corrupt",
-      resolver_kind: "system",
-      resolved_at_ms: 5_000,
-      updated_at_ms: 5_000,
-    });
-  });
+      expect(
+        await getOperatorApprovalDetailed({ id: "corrupt", nowMs: 2_000, databaseOptions }),
+      ).toEqual({
+        outcome: "corrupt",
+      });
+      expect(
+        await getOperatorApproval({ id: "corrupt", nowMs: 2_000, databaseOptions }),
+      ).toBeNull();
+      expect(rawApprovalRow(databaseOptions, "corrupt")).toMatchObject({
+        status: "denied",
+        decision: "deny",
+        terminal_reason: "storage-corrupt",
+        resolver_kind: "system",
+        resolved_at_ms: 5_000,
+        updated_at_ms: 5_000,
+      });
+    },
+  );
 
   it("fails closed for forged terminal status tuples", async () => {
     const databaseOptions = createDatabaseOptions();

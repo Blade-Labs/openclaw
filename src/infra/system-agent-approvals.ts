@@ -1,7 +1,12 @@
+import type {
+  ApprovalRequestAuthorization,
+  ApprovalResolvingActor,
+} from "./approval-requester-binding.js";
 // OpenClaw system-agent approval payload kept live until operator decision.
 import type { ExecApprovalDecision } from "./exec-approvals-core.js";
 
 export type SystemAgentApprovalRequestPayload = {
+  authorization?: ApprovalRequestAuthorization;
   title: string;
   description: string;
   command: string;
@@ -28,6 +33,7 @@ export type SystemAgentApprovalRequest = {
 export type SystemAgentApprovalApplicationStatus = "applied" | "not-applied";
 
 export type SystemAgentApprovalResolved = {
+  resolvedByActor?: ApprovalResolvingActor | null;
   id: string;
   decision: ExecApprovalDecision;
   resolvedBy?: string | null;

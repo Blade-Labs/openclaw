@@ -31,6 +31,7 @@ import {
   restorePreparedUserTurnOperationalMetaForRuntime,
   rewritePersistedSteerTargetRunId,
 } from "./user-turn-transcript.metadata.js";
+import { pendingInputReceipts, turnSources } from "./user-turn-transcript.source.js";
 import type {
   CreateUserTurnTranscriptRecorderParams,
   PersistUserTurnTranscriptParams,
@@ -44,10 +45,6 @@ import type {
   UserTurnTranscriptUpdateMode,
 } from "./user-turn-transcript.types.js";
 
-const pendingInputReceipts = new WeakMap<
-  UserTurnTranscriptRecorder,
-  () => Awaited<ReturnType<typeof stageSessionPendingInput>>
->();
 const originalInputCommitNotifiers = new WeakMap<
   UserTurnTranscriptRecorder,
   (anchor: TranscriptEntryAnchor) => void
@@ -554,6 +551,7 @@ export function createUserTurnTranscriptRecorder(
           { ...target, ...runtimeTarget },
           {
             ...options,
+            turnSource: turnSources.get(recorder),
             requestFingerprint: params.pendingInputRequestFingerprint,
             trackCompletion: params.trackInputCompletion,
             replaySourceSessionKeys: params.pendingInputReplaySourceSessionKeys,
@@ -732,3 +730,8 @@ if (process.env.VITEST || process.env.NODE_ENV === "test") {
     persistUserTurnTranscript,
   };
 }
+
+export {
+  bindUserTurnTranscriptTurnSource,
+  readUserTurnTranscriptTurnSource,
+} from "./user-turn-transcript.source.js";

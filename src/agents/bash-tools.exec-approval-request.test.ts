@@ -4,6 +4,7 @@
  * and lazy command highlighting for host/node approval payloads.
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { requesterAuthorization } from "../gateway/approval-requester.test-support.js";
 import { DEFAULT_APPROVAL_TIMEOUT_MS } from "./bash-tools.exec-runtime.js";
 
 const commandExplainerMock = vi.hoisted(() => ({
@@ -122,6 +123,52 @@ describe("exec approval requests", () => {
       toolCallId: "tool-1",
     });
   });
+
+  it.each([null, "allow-always", "invalid"])(
+    "denies strict waits without one-shot consent (%s)",
+    async (decision) => {
+      vi.mocked(callGatewayTool).mockResolvedValueOnce({ decision, terminalReason: "timeout" });
+      await expect(
+        resolveRegisteredExecApprovalDecision({
+          approvalId: "synthetic-strict",
+          preResolvedDecision: undefined,
+          authorization: requesterAuthorization(),
+        }),
+      ).resolves.toBe("deny");
+    },
+  );
+
+  it("denies a missing strict request instead of returning permissive timeout fallback", async () => {
+    vi.mocked(callGatewayTool).mockRejectedValueOnce(new Error("approval expired or not found"));
+    await expect(
+      resolveRegisteredExecApprovalDecision({
+        approvalId: "synthetic-missing",
+        preResolvedDecision: undefined,
+        authorization: requesterAuthorization(),
+      }),
+    ).resolves.toBe("deny");
+  });
+
+  it.each(["allow-always", "allow-once"] as const)(
+    "retains stricter wait authorization for decision %s",
+    async (decision) => {
+      const authorization = requesterAuthorization();
+      const onAuthorization = vi.fn();
+      vi.mocked(callGatewayTool).mockResolvedValueOnce({
+        decision,
+        authorization,
+      });
+      await expect(
+        resolveRegisteredExecApprovalDecision({
+          approvalId: "synthetic-strengthened",
+          preResolvedDecision: undefined,
+          authorization: requesterAuthorization(false),
+          onAuthorization,
+        }),
+      ).resolves.toBe(decision === "allow-once" ? "allow-once" : "deny");
+      expect(onAuthorization).toHaveBeenCalledWith(authorization);
+    },
+  );
 
   it("distinguishes run abort cancellation from unchanged timeout fallback", async () => {
     vi.mocked(callGatewayTool)

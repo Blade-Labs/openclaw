@@ -3,6 +3,7 @@ import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
+import type { ChannelApprovalNativeTarget } from "../channels/plugins/approval-native.types.js";
 import type {
   ChannelApprovalNativeDeliveryPlan,
   ChannelApprovalNativePlannedTarget,
@@ -14,6 +15,7 @@ import {
   resolveApprovalRoutedElsewhereNoticeText,
 } from "./approval-native-route-notice.js";
 import { buildChannelApprovalNativeTargetKey } from "./approval-native-target-key.js";
+import { reportBlockedRequesterNotice } from "./approval-requester-notice.js";
 import type { ApprovalRequestChannelRouteClass, ChannelApprovalKind } from "./approval-types.js";
 import type { ExecApprovalRequest } from "./exec-approvals.js";
 import type { PluginApprovalRequest } from "./plugin-approvals.js";
@@ -34,6 +36,10 @@ type ApprovalRouteRuntimeRecord = {
   accountId?: string | null;
   requestGateway: GatewayRequestFn;
   shouldHandle: (request: ApprovalRequest) => boolean;
+  resolveRequesterNoticeTarget?: (
+    request: ApprovalRequest,
+    kind: ChannelApprovalKind,
+  ) => Promise<ChannelApprovalNativeTarget | null>;
   classifyRoute: (request: ApprovalRequest) => ApprovalRequestChannelRouteClass;
 };
 
@@ -460,6 +466,10 @@ async function maybeFinalizeApprovalRouteNotice(
   if (!entry) {
     return;
   }
+  if (entry.request.request.authorization?.policy.requireResolverMatch) {
+    clearPendingApprovalRouteNotice(state, approvalId);
+    return;
+  }
   const selection = state.selections.get(approvalId);
   if (!selection) {
     return;
@@ -513,6 +523,10 @@ export function createApprovalNativeRouteReporter(params: {
   accountId?: string | null;
   requestGateway: GatewayRequestFn;
   shouldHandle: (request: ApprovalRequest) => boolean;
+  resolveRequesterNoticeTarget?: (
+    request: ApprovalRequest,
+    kind: ChannelApprovalKind,
+  ) => Promise<ChannelApprovalNativeTarget | null>;
   classifyRoute: (request: ApprovalRequest) => ApprovalRequestChannelRouteClass;
 }) {
   return createApprovalNativeRouteReporterForState(defaultCoordinatorState, params);
@@ -527,6 +541,10 @@ function createApprovalNativeRouteReporterForState(
     accountId?: string | null;
     requestGateway: GatewayRequestFn;
     shouldHandle: (request: ApprovalRequest) => boolean;
+    resolveRequesterNoticeTarget?: (
+      request: ApprovalRequest,
+      kind: ChannelApprovalKind,
+    ) => Promise<ChannelApprovalNativeTarget | null>;
     classifyRoute: (request: ApprovalRequest) => ApprovalRequestChannelRouteClass;
   },
 ) {
@@ -608,6 +626,7 @@ function createApprovalNativeRouteReporterForState(
         requestGateway: params.requestGateway,
         shouldHandle: params.shouldHandle,
         classifyRoute: params.classifyRoute,
+        resolveRequesterNoticeTarget: params.resolveRequesterNoticeTarget,
       });
       registered = true;
     },
@@ -668,6 +687,10 @@ function createApprovalNativeRouteReporterForState(
 export type ApprovalNativeRouteCoordinator = {
   createReporter: typeof createApprovalNativeRouteReporter;
   hasActiveRuntime: typeof hasActiveApprovalNativeRouteRuntime;
+  reportBlockedRequest: (
+    kind: ChannelApprovalKind,
+    request: ApprovalRequest,
+  ) => Promise<"sent" | "no-unique-chat" | "failed">;
   close: () => void;
 };
 
@@ -685,6 +708,15 @@ export function createApprovalNativeRouteCoordinator(): ApprovalNativeRouteCoord
   return {
     createReporter: (params) => createApprovalNativeRouteReporterForState(state, params),
     hasActiveRuntime: (params) => hasActiveApprovalNativeRouteRuntimeForState(state, params),
+    reportBlockedRequest: (kind, request) =>
+      reportBlockedRequesterNotice({
+        kind,
+        request,
+        runtimes: [...state.activeRuntimes.values()],
+        isCurrent: (runtime) =>
+          !state.closed &&
+          [...state.activeRuntimes.values()].includes(runtime as ApprovalRouteRuntimeRecord),
+      }),
     close: () => {
       // Closing retires this Gateway-owned coordinator permanently. Delayed channel
       // startup must not repopulate routes belonging to the retired instance.

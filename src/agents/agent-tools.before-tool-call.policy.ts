@@ -7,6 +7,7 @@
  */
 import type { ToolLoopWarning } from "@openclaw/agent-core";
 import { getRuntimeConfig } from "../config/config.js";
+import { classifyApprovalRequester } from "../infra/approval-requester-binding.js";
 import { freezeDiagnosticTraceContext } from "../infra/diagnostic-trace-context.js";
 import { getGlobalHookRunnerRegistry } from "../plugins/hook-runner-global-state.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
@@ -42,12 +43,16 @@ import {
   resolveToolErrorDiagnostic,
   unwrapErrorCause,
 } from "./agent-tools.before-tool-call.diagnostics.js";
-import { consumeBatchAdmittedToolCall } from "./agent-tools.before-tool-call.state.js";
+import {
+  consumeBatchAdmittedToolCall,
+  recordSourceForToolCall,
+} from "./agent-tools.before-tool-call.state.js";
 import type {
   BeforeToolCallPolicyDiagnosticState,
   HookContext,
   HookOutcome,
 } from "./agent-tools.before-tool-call.types.js";
+import { retainApprovalExecutions, type ApprovalExecution } from "./approval-execution.js";
 import {
   getCodeModeExecBeforeHookMetadataForToolKind,
   reconcileCodeModeExecBeforeHookParams,
@@ -100,7 +105,7 @@ export function consumeFinalClientVoiceToolConfirmation(args: {
   });
 }
 
-export async function runBeforeToolCallHook(args: {
+export async function runBeforeToolCallHook(input: {
   toolName: string;
   params: unknown;
   toolKind?: PluginHookToolKind;
@@ -110,6 +115,26 @@ export async function runBeforeToolCallHook(args: {
   signal?: AbortSignal;
   approvalMode?: "request" | "report" | "deny" | "defer";
 }): Promise<HookOutcome> {
+  let args = input;
+  const source = args.ctx?.readSource?.() ?? args.ctx?.source;
+  if (source) {
+    const binding = classifyApprovalRequester(source);
+    const requester =
+      binding.state === "bound"
+        ? {
+            ...args.ctx?.requester,
+            channel: binding.channel,
+            accountId: binding.accountId,
+            senderId: binding.senderId,
+          }
+        : binding.state === "mixed"
+          ? undefined
+          : args.ctx?.requester;
+    args = { ...args, ctx: { ...args.ctx, source, requester } };
+    if (args.toolCallId) {
+      recordSourceForToolCall(args.toolCallId, args.ctx?.runId, source);
+    }
+  }
   const toolName = normalizeToolPolicyName(args.toolName || "tool");
   const params = args.params;
   let loopWarning: ToolLoopWarning | undefined;
@@ -233,6 +258,7 @@ export async function runBeforeToolCallHook(args: {
       ...(args.toolCallId && { toolCallId: args.toolCallId }),
       ...(args.ctx?.channelId && { channelId: args.ctx.channelId }),
       ...(args.ctx?.requester ? { requester: args.ctx.requester } : {}),
+      ...(args.ctx?.source ? { source: args.ctx.source } : {}),
     });
     const toolContext = buildToolContext(toolIdentity);
     // Policies form a mutation chain. Reconcile each decision against the prior
@@ -293,6 +319,7 @@ export async function runBeforeToolCallHook(args: {
     }
     let trustedApprovalParams: unknown;
     let trustedApprovalResolution: PluginApprovalResolution | undefined;
+    const approvalExecutions: ApprovalExecution[] = [];
     if (trustedPolicyResult?.requireApproval) {
       const approvalOutcome = await resolveBeforeToolCallApprovalOutcome({
         result: trustedPolicyResult,
@@ -312,6 +339,7 @@ export async function runBeforeToolCallHook(args: {
         }
         trustedApprovalParams = approvalOutcome.params;
         trustedApprovalResolution = approvalOutcome.approvalResolution;
+        approvalExecutions.push(...(approvalOutcome.approvalExecutions ?? []));
       }
     }
     const policyAdjustedParams = trustedApprovalParams ?? trustedPolicyResult?.params ?? params;
@@ -335,6 +363,12 @@ export async function runBeforeToolCallHook(args: {
         signal: args.signal,
       });
       if (finalApprovalOutcome) {
+        if (!finalApprovalOutcome.blocked) {
+          retainApprovalExecutions(finalApprovalOutcome, [
+            ...approvalExecutions,
+            ...(finalApprovalOutcome.approvalExecutions ?? []),
+          ]);
+        }
         return withLoopWarning(finalApprovalOutcome);
       }
       const allowed: HookOutcome = {
@@ -345,6 +379,7 @@ export async function runBeforeToolCallHook(args: {
         markPrivateDecision(allowed, "ownerDecision");
         allowed.approvalResolution = trustedApprovalResolution;
       }
+      retainApprovalExecutions(allowed, approvalExecutions);
       return withLoopWarning(allowed);
     }
     const hookEventParams = isPlainObject(policyAdjustedParams) ? policyAdjustedParams : {};
@@ -406,6 +441,7 @@ export async function runBeforeToolCallHook(args: {
         }
         finalParams = approvalOutcome.params;
         finalApprovalResolution = approvalOutcome.approvalResolution ?? finalApprovalResolution;
+        approvalExecutions.push(...(approvalOutcome.approvalExecutions ?? []));
       }
     }
 
@@ -426,6 +462,12 @@ export async function runBeforeToolCallHook(args: {
       signal: args.signal,
     });
     if (finalApprovalOutcome) {
+      if (!finalApprovalOutcome.blocked) {
+        retainApprovalExecutions(finalApprovalOutcome, [
+          ...approvalExecutions,
+          ...(finalApprovalOutcome.approvalExecutions ?? []),
+        ]);
+      }
       return withLoopWarning(finalApprovalOutcome);
     }
     const allowed: HookOutcome = {
@@ -438,6 +480,7 @@ export async function runBeforeToolCallHook(args: {
     if (finalApprovalResolution) {
       allowed.approvalResolution = finalApprovalResolution;
     }
+    retainApprovalExecutions(allowed, approvalExecutions);
     return withLoopWarning(allowed);
   } catch (err) {
     const toolCallId = args.toolCallId ? ` toolCallId=${args.toolCallId}` : "";

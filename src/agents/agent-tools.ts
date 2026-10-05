@@ -17,6 +17,7 @@ import { getActiveSecretsRuntimeConfigSnapshot } from "../secrets/runtime-state.
 import { GATEWAY_OWNER_ONLY_CORE_TOOLS } from "../security/dangerous-tools.js";
 import type { SkillSnapshot } from "../skills/types.js";
 import { resolveGatewayMessageChannel } from "../utils/message-channel.js";
+import { captureAdmittedRunSource, type AdmittedRunContext } from "./admitted-run-context.js";
 import { resolveSessionAgentId } from "./agent-scope.js";
 import {
   bindAssembledAgentToolActionDescriptor,
@@ -96,6 +97,7 @@ export { resolveToolLoopDetectionConfig } from "./tool-loop-detection-config.js"
 export function createOpenClawCodingToolsInternal(
   options?: OpenClawCodingToolsOptions,
   skillReadResources?: SkillSnapshot["resolvedSkills"],
+  admittedRunContext?: AdmittedRunContext,
 ): AnyAgentTool[] {
   const sandbox = options?.sandbox?.enabled ? options.sandbox : undefined;
   const isMemoryFlushRun = options?.trigger === "memory";
@@ -765,6 +767,9 @@ export function createOpenClawCodingToolsInternal(
   } satisfies PluginHookToolRequesterContext;
   const hasRequester = Object.keys(requester).length > 0;
   const hookContext = {
+    ...(admittedRunContext
+      ? { readSource: () => captureAdmittedRunSource(admittedRunContext).source }
+      : {}),
     agentId: executionAgentId,
     ...(options?.config ? { config: options.config } : {}),
     cwd: codingRoot,

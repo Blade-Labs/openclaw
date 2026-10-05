@@ -1,3 +1,4 @@
+import type { ApprovalExecution } from "../agents/approval-execution.js";
 import type { ExecApprovalDecision } from "../infra/exec-approvals-core.js";
 import type { NodeSession } from "./node-registry.js";
 import type {
@@ -7,6 +8,8 @@ import type {
 
 export type NodeInvokePlacementGrantAuthorization = {
   binding?: PlacementStandingGrantMintSpec;
+  requiresRequesterMatch?: () => boolean;
+  execution?: ApprovalExecution;
 };
 
 type PlacementGrantResolution =
@@ -114,6 +117,9 @@ export function consumeNodeInvokePlacementGrant(params: {
     return "not-required";
   }
   try {
+    if (params.authorization.requiresRequesterMatch?.()) {
+      return "rejected";
+    }
     return params.runtime?.consume(params.authorization.binding).outcome === "consumed"
       ? "consumed"
       : "rejected";

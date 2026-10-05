@@ -362,6 +362,15 @@ export async function applyPluginNodeInvokePolicy(params: {
         message: "approved runtime authority closed before node dispatch",
       });
     }
+    try {
+      standingGrantAuthorization.execution?.assertCurrent();
+    } catch {
+      return deny("node_approval_authority_closed", {
+        ok: false,
+        code: "APPROVAL_AUTHORITY_CLOSED",
+        message: "approval resolver authority closed before node dispatch",
+      });
+    }
     recordNodeDecision({
       pluginId: entry.pluginId,
       outcome: "allowed",
@@ -398,6 +407,7 @@ export async function applyPluginNodeInvokePolicy(params: {
       isDispatchAuthorized: () => {
         try {
           sessionAuthority?.assertCurrent();
+          standingGrantAuthorization.execution?.assertCurrent();
         } catch {
           return false;
         }

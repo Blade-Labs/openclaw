@@ -1,5 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type TestContext } from "vitest";
+import { requesterAuthorization } from "../../gateway/approval-requester.test-support.js";
+import { createTestApprovalManager } from "../../gateway/exec-approval-manager.test-support.js";
+import { createGatewayRequestContext } from "../../gateway/server-request-context.js";
+import { makeContextParams } from "../../gateway/server-request-context.test-support.js";
+import type { PluginApprovalRequestPayload } from "../../infra/plugin-approvals.js";
+import * as operandBinding from "../../infra/system-run-approval-binding.js";
 import { createDeferredCore } from "../../shared/deferred.js";
+import { withGatewayToolCallerIdentity } from "../tools/gateway-caller-context.js";
 import { callGatewayTool } from "../tools/gateway.js";
 import { createAdmittedHostCapabilityTestFixture } from "./host-capability.test-support.js";
 import { nativeHookRelayState } from "./native-hook-relay-state.js";
@@ -32,7 +39,199 @@ afterEach(async () => {
   await testing.clearNativeHookRelaysForTests();
 });
 
+async function createResolvedPermissionFixture(test: TestContext, strict = true) {
+  const manager = createTestApprovalManager<PluginApprovalRequestPayload>(test, {
+    approvalKind: "plugin",
+  });
+  const record = manager.create(
+    { title: "Synthetic permission", description: "Synthetic native tool permission" },
+    60_000,
+    "synthetic-native-permission",
+  );
+  record.authorization = requesterAuthorization(strict);
+  await manager.register(record, 60_000);
+  let resolverCurrent = true;
+  await manager.resolveDetailed(
+    record.id,
+    "allow-once",
+    {
+      kind: "channel",
+      id: "synthetic-requester",
+      actor: {
+        kind: "channel",
+        channel: "test",
+        accountId: "default",
+        senderId: "synthetic-requester",
+        actorKind: "human",
+      },
+    },
+    null,
+    "operator",
+    {
+      assertCurrent: () => {
+        if (!resolverCurrent) {
+          throw new Error("Synthetic resolver revoked");
+        }
+      },
+    },
+  );
+  const context = createGatewayRequestContext(
+    makeContextParams({ pluginApprovalManager: manager }),
+  );
+  const relay = registerNativeHookRelay({
+    provider: "codex",
+    relayId: "synthetic-permission-relay",
+    sessionId: "synthetic-session",
+    runId: "synthetic-run",
+  });
+  const invoke = () =>
+    withGatewayToolCallerIdentity(
+      {
+        agentId: "main",
+        sessionKey: "synthetic-session",
+        gatewayContextResolver: () => context,
+      },
+      () =>
+        invokeNativeHookRelay({
+          provider: "codex",
+          relayId: relay.relayId,
+          event: "permission_request",
+          rawPayload: {
+            tool_name: "Bash",
+            tool_use_id: "synthetic-permission-call",
+            tool_input: { command: "sh synthetic-script" },
+          },
+        }),
+    );
+  return {
+    manager,
+    record,
+    relay,
+    invoke,
+    revoke: () => {
+      resolverCurrent = false;
+    },
+    result: { id: record.id, decision: "allow-once", authorization: record.authorization },
+  };
+}
+
 describe("native hook relay approval wait handling", () => {
+  it.for([
+    { strict: true, revoke: true },
+    { strict: true, revoke: false },
+    { strict: false, revoke: true },
+    { strict: false, revoke: false },
+  ])(
+    "retains resolver authority through native operand verification (strict=$strict, revoke=$revoke)",
+    async ({ strict, revoke }, test) => {
+      const fixture = await createResolvedPermissionFixture(test, strict);
+      const entered = createDeferredCore();
+      const release = createDeferredCore();
+      vi.spyOn(operandBinding, "prepareSystemRunMutableFileBinding").mockResolvedValue({
+        ok: true,
+        binding: {
+          commands: [["sh", "synthetic-script"]],
+          operands: [
+            {
+              kind: "mutable",
+              argv: ["sh", "synthetic-script"],
+              snapshot: {
+                argvIndex: 1,
+                path: "/tmp/synthetic-script",
+                sha256: "synthetic-digest",
+              },
+            },
+          ],
+        },
+      });
+      vi.spyOn(operandBinding, "revalidateSystemRunMutableFileBinding").mockImplementation(
+        async () => {
+          entered.resolve();
+          await release.promise;
+          return { ok: true };
+        },
+      );
+      mockCallGatewayTool.mockResolvedValueOnce(fixture.result);
+      const running = fixture.invoke();
+      void running.catch(() => {});
+      try {
+        await Promise.race([
+          entered.promise,
+          running.then(() => {
+            throw new Error("Permission returned before operand verification");
+          }),
+        ]);
+        if (revoke) {
+          fixture.revoke();
+        }
+        release.resolve();
+        const response = await running;
+        expect(JSON.parse(response.stdout).hookSpecificOutput.decision.behavior).toBe(
+          revoke ? "deny" : "allow",
+        );
+        expect(Boolean(fixture.manager.getLiveSnapshot(fixture.record.id)?.consumedAtMs)).toBe(
+          !revoke,
+        );
+      } finally {
+        release.resolve();
+        await Promise.allSettled([running]);
+        fixture.relay.unregister();
+      }
+    },
+  );
+
+  it("allows only one duplicate strict native callback to redeem a shared approval", async (test) => {
+    const fixture = await createResolvedPermissionFixture(test);
+    const bothPrepared = createDeferredCore();
+    const requestEntered = createDeferredCore();
+    const decision = createDeferredCore<typeof fixture.result>();
+    let prepared = 0;
+    vi.spyOn(operandBinding, "prepareSystemRunMutableFileBinding").mockImplementation(async () => {
+      prepared += 1;
+      if (prepared === 2) {
+        bothPrepared.resolve();
+      }
+      await bothPrepared.promise;
+      return { ok: true, binding: { commands: [], operands: [] } };
+    });
+    mockCallGatewayTool.mockImplementationOnce(async () => {
+      requestEntered.resolve();
+      return await decision.promise;
+    });
+    const first = fixture.invoke();
+    const duplicate = fixture.invoke();
+    void first.catch(() => {});
+    void duplicate.catch(() => {});
+    try {
+      await Promise.race([
+        requestEntered.promise,
+        first.then(() => {
+          throw new Error("Permission returned before shared approval");
+        }),
+        duplicate.then(() => {
+          throw new Error("Duplicate returned before shared approval");
+        }),
+      ]);
+      expect(
+        [...nativeHookRelayState.pendingPermissionApprovals.values()].map((entry) => entry.waiters),
+      ).toEqual([2]);
+      decision.resolve(fixture.result);
+      const responses = await Promise.all([first, duplicate]);
+      expect(
+        responses
+          .map((response) => JSON.parse(response.stdout).hookSpecificOutput.decision.behavior)
+          .toSorted((left: string, right: string) => left.localeCompare(right)),
+      ).toEqual(["allow", "deny"]);
+      expect(mockCallGatewayTool).toHaveBeenCalledOnce();
+      expect(fixture.manager.getLiveSnapshot(fixture.record.id)?.consumedAtMs).toBeTruthy();
+    } finally {
+      bothPrepared.resolve();
+      decision.resolve(fixture.result);
+      await Promise.allSettled([first, duplicate]);
+      fixture.relay.unregister();
+    }
+  });
+
   it.each([
     {
       name: "relay/run tuple",

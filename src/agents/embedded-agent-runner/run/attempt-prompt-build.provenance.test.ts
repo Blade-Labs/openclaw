@@ -190,6 +190,11 @@ describe("prompt-build hook context input provenance", () => {
     expect(captured).toHaveLength(1);
     expect(captured[0]).toMatchObject({
       trigger: "user",
+      source: {
+        version: 1,
+        runId: "provenance-hook-inter-session",
+        inputs: [{ origin: "system" }],
+      },
       inputProvenance: {
         kind: "inter_session",
         sourceSessionKey: "agent:main:session-a",

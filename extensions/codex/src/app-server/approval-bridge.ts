@@ -65,6 +65,11 @@ type SanitizedApprovalPreview = {
   omitted: boolean;
 };
 
+type PolicyApprovalExecutions = Extract<
+  Awaited<ReturnType<EmbeddedRunAttemptParams["hostCapabilities"]["runBeforeToolCall"]>>,
+  { blocked: false }
+>["approvalExecutions"];
+
 /**
  * Handles one app-server approval request for the active thread/turn, returning
  * the app-server response payload when the request belongs to this run.
@@ -108,6 +113,16 @@ export async function handleCodexAppServerApprovalRequest(params: {
     | undefined;
   let mutableFileApprovalRequiresOneShot = false;
   let approvalId: string | undefined;
+  let approvalExecutions: PolicyApprovalExecutions;
+  let privateApproval = params.paramsForRun.hostCapabilities.requiresRequesterMatch?.() === true;
+  const emitProgress = (data: AgentApprovalEventData) => {
+    privateApproval ||=
+      params.paramsForRun.hostCapabilities.requiresRequesterMatch?.() === true ||
+      approvalExecutions?.some((execution) => execution.requiresMatch()) === true;
+    if (!privateApproval) {
+      emitApprovalEvent(params.paramsForRun, data);
+    }
+  };
   const resolvePolicyApproval = async (
     outcome: Extract<AppServerApprovalOutcome, "denied" | "approved-once" | "approved-session">,
     message = approvalResolutionMessage(outcome),
@@ -145,9 +160,17 @@ export async function handleCodexAppServerApprovalRequest(params: {
     // Recheck after byte revalidation before releasing a grant to Codex.
     params.signal?.throwIfAborted();
     if (resolvedOutcome !== "denied") {
+      for (const execution of approvalExecutions ?? []) {
+        await execution.redeem();
+        await execution.revalidate();
+      }
+      params.signal?.throwIfAborted();
       params.paramsForRun.hostCapabilities.assertActive();
+      for (const execution of approvalExecutions ?? []) {
+        execution.assertCurrent();
+      }
     }
-    emitApprovalEvent(params.paramsForRun, {
+    emitProgress({
       phase: "resolved",
       kind: context.kind,
       status: resolvedOutcome === "denied" ? "denied" : "approved",
@@ -206,6 +229,7 @@ export async function handleCodexAppServerApprovalRequest(params: {
       policyOutcome?.outcome === "approved-once" ||
       policyOutcome?.outcome === "approved-session"
     ) {
+      approvalExecutions = policyOutcome.approvalExecutions;
       return await resolvePolicyApproval(policyOutcome.outcome);
     }
     const canAutoApproveConcreteToolCall =
@@ -243,10 +267,11 @@ export async function handleCodexAppServerApprovalRequest(params: {
       allowedDecisions,
     });
     approvalId = requestResult?.id;
+    privateApproval ||= requestResult?.authorization?.policy.requireResolverMatch === true;
     params.signal?.throwIfAborted();
     if (!approvalId) {
       recordNativeToolFailureDisposition(params, context, "failed");
-      emitApprovalEvent(params.paramsForRun, {
+      emitProgress({
         phase: "resolved",
         kind: context.kind,
         status: "unavailable",
@@ -258,7 +283,7 @@ export async function handleCodexAppServerApprovalRequest(params: {
       return buildApprovalResponse(params.method, context.requestParams, "denied");
     }
 
-    emitApprovalEvent(params.paramsForRun, {
+    emitProgress({
       phase: "requested",
       kind: context.kind,
       status: "pending",
@@ -278,6 +303,8 @@ export async function handleCodexAppServerApprovalRequest(params: {
           hostCapabilities: params.paramsForRun.hostCapabilities,
         });
     params.signal?.throwIfAborted();
+    approvalExecutions = approvalResult?.approvalExecutions;
+    privateApproval ||= approvalResult?.authorization?.policy.requireResolverMatch === true;
     const approvalTimedOut = approvalResult?.terminalReason === "timeout";
     const outcome = mapExecDecisionToOutcome(approvalResult?.decision);
     if (approvalTimedOut) {
@@ -287,10 +314,17 @@ export async function handleCodexAppServerApprovalRequest(params: {
     }
 
     if (outcome === "approved-once" || outcome === "approved-session") {
+      if (privateApproval && !approvalExecutions?.length) {
+        return await resolvePolicyApproval(
+          "denied",
+          "Requester approval execution custody is unavailable.",
+          approvalId,
+        );
+      }
       return await resolvePolicyApproval(outcome, approvalResolutionMessage(outcome), approvalId);
     }
 
-    emitApprovalEvent(params.paramsForRun, {
+    emitProgress({
       phase: "resolved",
       kind: context.kind,
       status: outcome,
@@ -314,7 +348,7 @@ export async function handleCodexAppServerApprovalRequest(params: {
       context,
       cancelled && params.signal ? resolveCodexToolAbortTerminalReason(params.signal) : "failed",
     );
-    emitApprovalEvent(params.paramsForRun, {
+    emitProgress({
       phase: "resolved",
       kind: context.kind,
       status: cancelled ? "failed" : "unavailable",
@@ -505,7 +539,7 @@ type ApprovalPolicyOutcome =
       reason: string;
       failureDisposition?: Exclude<BeforeToolCallFailureDisposition, "blocked">;
     }
-  | { outcome: "approved-once" | "approved-session" }
+  | { outcome: "approved-once" | "approved-session"; approvalExecutions?: PolicyApprovalExecutions }
   | { outcome: "allowed" };
 
 async function runOpenClawToolPolicyForApprovalRequest(params: {
@@ -549,7 +583,10 @@ async function runOpenClawToolPolicyForApprovalRequest(params: {
     nativeRelayOutcome?.outcome === "approved-once" ||
     nativeRelayOutcome?.outcome === "approved-session"
   ) {
-    return { outcome: nativeRelayOutcome.outcome };
+    return {
+      outcome: nativeRelayOutcome.outcome,
+      approvalExecutions: nativeRelayOutcome.approvalExecutions,
+    };
   }
   if (nativeRelayOutcome?.handled) {
     return { outcome: "allowed" };
@@ -582,6 +619,7 @@ async function runOpenClawToolPolicyForApprovalRequest(params: {
       // Generic plugin approval `allow-always` is plugin-owned durability, not
       // Codex session trust. Keep the app-server request scoped to this item.
       outcome: "approved-once",
+      approvalExecutions: outcome.approvalExecutions,
     };
   }
   return { outcome: "allowed" };
@@ -611,6 +649,7 @@ async function runNativeRelayToolPolicyForApprovalRequest(params: {
       handled: true;
       blocked?: false;
       outcome?: "approved-once" | "approved-session";
+      approvalExecutions?: PolicyApprovalExecutions;
     }
   | undefined
 > {
@@ -650,7 +689,11 @@ async function runNativeRelayToolPolicyForApprovalRequest(params: {
       } as const;
     }
     return approvalOutcome?.outcome === "approved-once"
-      ? ({ handled: true, outcome: approvalOutcome.outcome } as const)
+      ? ({
+          handled: true,
+          outcome: approvalOutcome.outcome,
+          approvalExecutions: approvalOutcome.approvalExecutions,
+        } as const)
       : ({ handled: true } as const);
   };
   if (

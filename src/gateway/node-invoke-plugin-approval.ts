@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
+import { prepareApprovalExecution } from "../agents/approval-execution.js";
 import { sanitizeApprovalScope } from "../infra/approval-scope.js";
 import {
   sanitizeExecApprovalDisplayText,
@@ -12,15 +13,23 @@ import { resolvePluginApprovalTimeoutMs } from "../infra/plugin-approvals.js";
 import type { OpenClawPluginNodeInvokePolicyContext } from "../plugins/types.js";
 import type { AgentRuntimeIdentity } from "./agent-runtime-identity-token.js";
 import {
+  bindApprovalRequestAuthorization,
+  prepareApprovalRequestAuthorization,
+} from "./approval-request-authorization.js";
+import {
   resolveNodeInvokePlacementGrant,
   retainResolvedNodeInvokePlacementGrant,
   type NodeInvokePlacementGrantOwner,
   type NodeInvokePlacementGrantAuthorization,
 } from "./node-invoke-placement-grant.js";
 import type { NodeSession } from "./node-registry.js";
-import { bindApprovalRequesterMetadata } from "./server-methods/approval-shared.js";
+import { createInternalApprovalResponse } from "./server-methods/approval-internal-response.js";
+import {
+  bindApprovalRequesterMetadata,
+  registerPendingApprovalRecord,
+} from "./server-methods/approval-shared.js";
 import { handlePendingPluginApprovalRequest } from "./server-methods/plugin-approval-request-delivery.js";
-import type { GatewayClient, GatewayRequestContext, RespondFn } from "./server-methods/types.js";
+import type { GatewayClient, GatewayRequestContext } from "./server-methods/types.js";
 
 function sanitizeOptionalMeta(value?: string | null): string | null {
   const normalized = normalizeOptionalString(value);
@@ -106,8 +115,15 @@ export function createPluginNodeInvokeApprovalRuntime(params: {
       if (!params.isCurrent()) {
         throw new Error("agent runtime approval authority is no longer active");
       }
-      const requestedDecisions =
-        input.allowedDecisions === undefined
+      const prepared = prepareApprovalRequestAuthorization({
+        cfg: params.context.getRuntimeConfig(),
+        approvalKind: "plugin",
+        identity: callerIdentity,
+      });
+      params.standingGrantAuthorization.requiresRequesterMatch = prepared.requiresRequesterMatch;
+      const requestedDecisions = prepared.authorization.policy.requireResolverMatch
+        ? prepared.authorization.policy.allowedDecisions
+        : input.allowedDecisions === undefined
           ? undefined
           : resolveCanonicalPluginApprovalRequestAllowedDecisions({
               allowedDecisions: input.allowedDecisions,
@@ -194,13 +210,32 @@ export function createPluginNodeInvokeApprovalRuntime(params: {
           return true;
         };
       }
+      bindApprovalRequestAuthorization({
+        record,
+        cfg: params.context.getRuntimeConfig(),
+        approvalKind: "plugin",
+        identity: callerIdentity,
+        prepared,
+      });
       bindApprovalRequesterMetadata({ record, client: params.client });
-      const respond: RespondFn = () => {};
-      const { decision: decisionPromise } = await manager.register(record, timeoutMs);
+      const response = createInternalApprovalResponse();
+      const registration = await registerPendingApprovalRecord({
+        manager,
+        record,
+        timeoutMs,
+        respond: response.respond,
+        context: params.context,
+        throwStorageErrors: true,
+      });
+      response.throwIfFailed();
+      if (!registration) {
+        throw new Error("Plugin approval registration failed");
+      }
+      const { decision: decisionPromise } = registration;
       await handlePendingPluginApprovalRequest({
         manager,
         record,
-        respond,
+        respond: response.respond,
         context: params.context,
         // The carried connection is turn provenance, not the presenter. Keep
         // a sole-reviewer operator eligible for this internally minted prompt.
@@ -209,15 +244,27 @@ export function createPluginNodeInvokeApprovalRuntime(params: {
         getIosPushDelivery: () => params.context.pluginApprovalIosPushDelivery,
         source: "node-policy",
       });
+      response.throwIfFailed();
+      const unavailableDecision = () =>
+        record.requiresRequesterMatch?.() ? ("deny" as const) : null;
       let decision = manager.projectDecisionIfActive(record.id, await decisionPromise);
       if (!params.isCurrent()) {
-        return { id: record.id, decision: null };
+        return { id: record.id, decision: unavailableDecision() };
       }
-      if (
-        decision === "allow-once" &&
-        !(await manager.consumeAllowOnce(record.id, `plugin.node.invoke:${record.id}`))
-      ) {
-        return { id: record.id, decision: null };
+      if (decision === "allow-once" || decision === "allow-always") {
+        const execution = prepareApprovalExecution({
+          id: record.id,
+          kind: "plugin",
+          manager,
+          authorization: record.authorization,
+          consumeAllowOnce: decision === "allow-once",
+        });
+        try {
+          await execution.redeem();
+          params.standingGrantAuthorization.execution = execution;
+        } catch {
+          return { id: record.id, decision: unavailableDecision() };
+        }
       }
       decision = manager.projectDecisionIfActive(record.id, decision);
       if (
@@ -229,7 +276,7 @@ export function createPluginNodeInvokeApprovalRuntime(params: {
           authorization: params.standingGrantAuthorization,
         })
       ) {
-        return { id: record.id, decision: null };
+        return { id: record.id, decision: unavailableDecision() };
       }
       return { id: record.id, decision };
     },

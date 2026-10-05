@@ -1,4 +1,8 @@
 import type { ExecutionIdentityAdmissionToken } from "../audit/execution-identity-admission.js";
+import type {
+  ApprovalRequestAuthorization,
+  ApprovalResolvingActor,
+} from "../infra/approval-requester-binding.js";
 import type { ExecApprovalDecision, ExecApprovalRequestPayload } from "../infra/exec-approvals.js";
 import type { OpenClawStateDatabaseOptions } from "../state/openclaw-state-db.js";
 import type { AgentRuntimeDelegatedAuthority } from "./agent-runtime-identity-token.js";
@@ -22,6 +26,13 @@ export type ExecApprovalResolutionSource = "operator" | "auto-review";
 
 export type ExecApprovalRecord<TPayload = ExecApprovalRequestPayload> = {
   id: string;
+  authorization?: ApprovalRequestAuthorization;
+  resolvedByActor?: ApprovalResolvingActor | null;
+  assertRequesterCurrent?: () => void;
+  /** Private source-account policy survives unavailable public source projections. */
+  requiresRequesterMatch?: () => boolean;
+  /** The winning actor retains its account lifetime and current approver eligibility. */
+  assertResolverCurrent?: () => void;
   request: TPayload;
   createdAtMs: number;
   expiresAtMs: number;

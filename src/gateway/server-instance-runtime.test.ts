@@ -1,8 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS } from "../../packages/gateway-client/src/timeouts.js";
 import { createDeferred } from "../../test/helpers/promise.js";
+import {
+  admitChannelApprovalActor,
+  readAdmittedChannelApprovalActor,
+} from "../channels/message-access/approval-actor.js";
 import type { ChannelPlugin } from "../channels/plugins/types.public.js";
+import { withGatewayNativeApprovalRuntime } from "../infra/approval-gateway-runtime-context.js";
 import type { GatewayNativeApprovalMethod } from "../infra/approval-gateway-runtime-methods.js";
+import {
+  createChannelApprovalHandlerFromCapability,
+  createChannelApprovalNativeRuntimeAdapter,
+} from "../infra/approval-handler-runtime.js";
 import type { ExecApprovalRequest } from "../infra/exec-approvals.js";
 import { findDeliveryIntentOwner } from "../infra/outbound/delivery-queue-storage.js";
 import {
@@ -15,6 +24,7 @@ import { trackAsyncWork } from "../shared/async-work-scope.js";
 import { createTestRegistry } from "../test-utils/channel-plugins.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { captureAgentTurnPrincipal } from "./agent-turn/principal.js";
+import { requesterAuthorization } from "./approval-requester.test-support.js";
 import { APPROVALS_SCOPE, WRITE_SCOPE } from "./method-scopes.js";
 import { createGatewayMethodRegistry } from "./methods/registry.js";
 import { createGatewayInstanceRuntime } from "./server-instance-runtime.js";
@@ -335,6 +345,198 @@ describe("createGatewayInstanceRuntime", () => {
     expect(getGatewayRecoveryRuntime()).toBe(second.recovery);
     second.close();
     expect(getGatewayRecoveryRuntime()).toBeUndefined();
+  });
+
+  it("delivers strict requests only through one matching account and preserves admitted actors", async () => {
+    const actor = admitChannelApprovalActor(
+      {
+        kind: "channel",
+        channel: "test",
+        accountId: "default",
+        senderId: "synthetic-requester",
+        actorKind: "human",
+      },
+      () => {},
+    );
+    const context = createContext();
+    const runtime = createGatewayInstanceRuntime({
+      getContext: () => context,
+      getMethodRegistry: () =>
+        createRegistry({
+          "approval.resolve": ({ client, respond }) => {
+            respond(true, {
+              actor: client?.internal?.approvalActor
+                ? readAdmittedChannelApprovalActor(client.internal.approvalActor)?.actor
+                : null,
+            });
+          },
+        }),
+      isDispatchAvailable: () => true,
+    });
+    try {
+      expect(
+        await runtime.nativeApprovals.request("approval.resolve", {}, { approvalActor: actor }),
+      ).toMatchObject({
+        actor: {
+          kind: "channel",
+          channel: "test",
+          accountId: "default",
+          senderId: "synthetic-requester",
+        },
+      });
+      const selected = vi.fn(async () => true);
+      const general = vi.fn();
+      const other = vi.fn(async () => true);
+      runtime.nativeApprovals.subscribe({
+        eventKinds: new Set(["exec"]),
+        shouldHandle: () => true,
+        onRequested: general,
+        onResolved: vi.fn(),
+      });
+      runtime.nativeApprovals.subscribe({
+        channel: "test",
+        accountId: "other",
+        eventKinds: new Set(["exec"]),
+        shouldHandle: () => true,
+        onRequested: general,
+        onResolved: vi.fn(),
+        deliverRequester: other,
+      });
+      runtime.nativeApprovals.subscribe({
+        channel: "test",
+        accountId: "default",
+        eventKinds: new Set(["exec"]),
+        shouldHandle: () => true,
+        onRequested: general,
+        onResolved: vi.fn(),
+        deliverRequester: selected,
+      });
+      const request = {
+        id: "synthetic-exclusive",
+        request: { command: "echo synthetic", authorization: requesterAuthorization() },
+        createdAtMs: 1,
+        expiresAtMs: 100,
+      };
+      expect(runtime.approvalEvents.publishRequested("exec", request)).toBe(0);
+      await expect(runtime.approvalEvents.deliverRequester!("exec", request)).resolves.toBe(true);
+      expect(selected).toHaveBeenCalledOnce();
+      expect(general).not.toHaveBeenCalled();
+      expect(other).not.toHaveBeenCalled();
+      const duplicate = runtime.nativeApprovals.subscribe({
+        channel: "test",
+        accountId: "default",
+        eventKinds: new Set(["exec"]),
+        shouldHandle: () => true,
+        onRequested: general,
+        onResolved: vi.fn(),
+        deliverRequester: other,
+      });
+      await expect(runtime.approvalEvents.deliverRequester!("exec", request)).resolves.toBe(false);
+      expect(selected).toHaveBeenCalledOnce();
+      expect(other).not.toHaveBeenCalled();
+      duplicate();
+    } finally {
+      runtime.close();
+    }
+  });
+
+  it("delivers a strict Teams request through the composed native handler and Gateway", async () => {
+    const context = createContext();
+    const runtime = createGatewayInstanceRuntime({
+      getContext: () => context,
+      getMethodRegistry: () =>
+        createRegistry({ "exec.approval.list": ({ respond }) => respond(true, []) }),
+      isDispatchAvailable: () => true,
+    });
+    const deliverPending = vi.fn(async () => ({ messageId: "synthetic-card" }));
+    const authorization = requesterAuthorization();
+    const binding = authorization.requesterBinding;
+    if (binding.state !== "bound") {
+      throw new Error("Expected bound fixture requester");
+    }
+    const request: ExecApprovalRequest = {
+      id: "synthetic-teams-native",
+      request: {
+        command: "echo synthetic",
+        turnSourceChannel: "msteams",
+        turnSourceAccountId: "default",
+        authorization: {
+          ...authorization,
+          source: {
+            ...authorization.source,
+            inputs: authorization.source.inputs.map((input) =>
+              input.origin === "user"
+                ? Object.assign({}, input, {
+                    actor: Object.assign({}, input.actor, { channel: "msteams" }),
+                  })
+                : input,
+            ),
+          },
+          requesterBinding: { ...binding, channel: "msteams" },
+        },
+      },
+      createdAtMs: Date.now(),
+      expiresAtMs: Date.now() + 60_000,
+    };
+    // Keep the channel transport isolated while exercising the handler's real
+    // native-runtime subscription and the Gateway's exact account selection.
+    const handler = await withGatewayNativeApprovalRuntime(runtime.nativeApprovals, () =>
+      createChannelApprovalHandlerFromCapability({
+        label: "test/teams-native",
+        clientDisplayName: "Teams test approvals",
+        channel: "msteams",
+        channelLabel: "Microsoft Teams",
+        accountId: "default",
+        cfg: {},
+        capability: {
+          native: {
+            describeDeliveryCapabilities: () => ({
+              enabled: true,
+              preferredSurface: "origin",
+              supportsOriginSurface: true,
+              supportsApproverDmSurface: false,
+            }),
+            resolveRequesterTarget: () => ({ to: "conversation:synthetic-personal-chat" }),
+          },
+          nativeRuntime: createChannelApprovalNativeRuntimeAdapter({
+            eventKinds: ["exec"],
+            availability: { isConfigured: () => true, shouldHandle: () => true },
+            presentation: {
+              buildPendingPayload: ({ view }) => ({ title: view.title }),
+              buildResolvedResult: () => ({ kind: "leave" }),
+              buildExpiredResult: () => ({ kind: "leave" }),
+            },
+            transport: {
+              prepareTarget: ({ plannedTarget }) => ({
+                dedupeKey: plannedTarget.target.to,
+                target: plannedTarget.target,
+              }),
+              deliverPending,
+            },
+          }),
+        },
+      }),
+    );
+    if (!handler) {
+      runtime.close();
+      throw new Error("Expected Teams native handler");
+    }
+    try {
+      await handler.start();
+      expect(runtime.approvalEvents.publishRequested("exec", request)).toBe(0);
+      await expect(runtime.approvalEvents.deliverRequester!("exec", request)).resolves.toBe(true);
+      expect(deliverPending).toHaveBeenCalledOnce();
+      expect(deliverPending).toHaveBeenCalledWith(
+        expect.objectContaining({
+          accountId: "default",
+          preparedTarget: { to: "conversation:synthetic-personal-chat" },
+          request: expect.objectContaining({ id: request.id }),
+        }),
+      );
+    } finally {
+      await handler.stop();
+      runtime.close();
+    }
   });
 
   it("rejects methods outside each closed internal principal", async () => {

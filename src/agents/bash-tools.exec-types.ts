@@ -144,6 +144,8 @@ export type ExecToolApprovalReview = {
 
 /** Structured details returned by exec tool calls. */
 export type ExecToolDetails = {
+  approvalRequesterOnly?: true;
+  approvalAuthorization?: import("../infra/approval-requester-binding.js").ApprovalRequestAuthorization;
   approvalReviews?: readonly ExecToolApprovalReview[];
   approvalReviewOutcome?: "approved" | "denied" | "reviewing";
 } & (

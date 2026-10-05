@@ -10,7 +10,14 @@ import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import {
+  requesterAuthorization,
+  withRequesterApprovalChannel,
+} from "../gateway/approval-requester.test-support.js";
 import { GatewayClientRequestError } from "../gateway/client.js";
+import { createTestApprovalManager } from "../gateway/exec-approval-manager.test-support.js";
+import { createGatewayRequestContext } from "../gateway/server-request-context.js";
+import { makeContextParams } from "../gateway/server-request-context.test-support.js";
 import { createAbortError } from "../infra/abort-signal.js";
 import {
   onInternalDiagnosticEvent,
@@ -21,7 +28,16 @@ import {
   type DiagnosticEventPrivateData,
   type DiagnosticToolLoopEvent,
 } from "../infra/diagnostic-events.js";
-import { MAX_PLUGIN_APPROVAL_TIMEOUT_MS } from "../infra/plugin-approvals.js";
+import { setEmbeddedMode } from "../infra/embedded-mode.js";
+import {
+  EmbeddedPluginApprovalBroker,
+  setEmbeddedPluginApprovalBroker,
+  clearEmbeddedPluginApprovalBroker,
+} from "../infra/embedded-plugin-approval-broker.js";
+import {
+  MAX_PLUGIN_APPROVAL_TIMEOUT_MS,
+  type PluginApprovalRequestPayload,
+} from "../infra/plugin-approvals.js";
 import {
   getDiagnosticSessionActivitySnapshot,
   markDiagnosticArgumentChurnObservation,
@@ -51,10 +67,12 @@ import {
   runBeforeToolCallHook,
   wrapToolWithBeforeToolCallHook,
 } from "./agent-tools.before-tool-call.js";
+import { runWithToolExecutionValidation } from "./agent-tools.execution-validation.js";
 import { createOpenClawCodingTools } from "./agent-tools.js";
 import { createExecTool } from "./bash-tools.exec-run.js";
 import { createWriteTool } from "./sessions/index.js";
 import type { AnyAgentTool } from "./tools/common.js";
+import { withGatewayToolCallerIdentity } from "./tools/gateway-caller-context.js";
 import { callGatewayTool } from "./tools/gateway.js";
 
 const CRITICAL_THRESHOLD = 20;
@@ -2219,6 +2237,216 @@ describe("before_tool_call requireApproval handling", () => {
       signal: controller.signal,
     });
   }
+
+  it.for([
+    { strict: true, revoke: true },
+    { strict: true, revoke: false },
+    { strict: false, revoke: true },
+    { strict: false, revoke: false },
+  ])(
+    "retains plugin approval authority through final argument validation (strict=$strict, revoke=$revoke)",
+    async ({ strict, revoke }, test) => {
+      const manager = createTestApprovalManager<PluginApprovalRequestPayload>(test, {
+        approvalKind: "plugin",
+      });
+      const record = manager.create(
+        { title: "Synthetic approval", description: "Synthetic tool permission" },
+        60_000,
+        "synthetic-plugin-validation",
+      );
+      record.authorization = requesterAuthorization(strict);
+      await manager.register(record, 60_000);
+      let resolverCurrent = true;
+      await manager.resolveDetailed(
+        record.id,
+        "allow-once",
+        {
+          kind: "channel",
+          id: "synthetic-requester",
+          actor: {
+            kind: "channel",
+            channel: "test",
+            accountId: "default",
+            senderId: "synthetic-requester",
+            actorKind: "human",
+          },
+        },
+        null,
+        "operator",
+        {
+          assertCurrent: () => {
+            if (!resolverCurrent) {
+              throw new Error("Synthetic resolver revoked");
+            }
+          },
+        },
+      );
+      const context = createGatewayRequestContext(
+        makeContextParams({ pluginApprovalManager: manager }),
+      );
+      hookRunner.runBeforeToolCall.mockResolvedValue({
+        requireApproval: { title: "Synthetic approval", description: "Synthetic tool permission" },
+      });
+      mockCallGateway.mockResolvedValueOnce({
+        id: record.id,
+        decision: "allow-once",
+        authorization: record.authorization,
+      });
+      const execute = vi.fn().mockResolvedValue({ content: [], details: { ok: true } });
+      const tool = wrapToolWithBeforeToolCallHook(asAgentTool({ name: "synthetic", execute }), {
+        agentId: "main",
+        sessionKey: "synthetic-session",
+        loopDetection: { enabled: false },
+      });
+      const entered = createDeferredCore();
+      const release = createDeferredCore();
+      const callId = "synthetic-plugin-call";
+      const running = withGatewayToolCallerIdentity(
+        {
+          agentId: "main",
+          sessionKey: "synthetic-session",
+          gatewayContextResolver: () => context,
+        },
+        () =>
+          runWithToolExecutionValidation(
+            callId,
+            async () => {
+              entered.resolve();
+              await release.promise;
+            },
+            () => tool.execute(callId, {}, undefined, undefined),
+          ),
+      );
+      void running.catch(() => {});
+      try {
+        await Promise.race([
+          entered.promise,
+          running.then(() => {
+            throw new Error("Tool returned before final argument validation");
+          }),
+        ]);
+        resolverCurrent = !revoke;
+        release.resolve();
+        if (revoke) {
+          await expect(running).rejects.toThrow();
+          expect(execute).not.toHaveBeenCalled();
+          expect(manager.getLiveSnapshot(record.id)?.consumedAtMs).toBeFalsy();
+        } else {
+          await running;
+          expect(execute).toHaveBeenCalledOnce();
+          expect(manager.getLiveSnapshot(record.id)?.consumedAtMs).toBeTruthy();
+        }
+      } finally {
+        release.resolve();
+        await Promise.allSettled([running]);
+      }
+    },
+  );
+
+  it("shows a strict embedded approval denial without an operator prompt", async () => {
+    await withRequesterApprovalChannel(async () => {
+      const broker = new EmbeddedPluginApprovalBroker();
+      const listener = vi.fn();
+      broker.subscribe(listener);
+      setEmbeddedMode(true);
+      setEmbeddedPluginApprovalBroker(broker);
+      hookRunner.runBeforeToolCall.mockResolvedValue({
+        requireApproval: { title: "Synthetic approval", description: "Synthetic local action" },
+      });
+      try {
+        const result = await withGatewayToolCallerIdentity(
+          {
+            agentId: "main",
+            sessionKey: "synthetic-session",
+            turnSourceChannel: "test",
+            turnSourceAccountId: "default",
+          },
+          () =>
+            runBeforeToolCallHook({
+              toolName: "synthetic",
+              params: {},
+              ctx: { agentId: "main", sessionKey: "synthetic-session" },
+            }),
+        );
+        expect(result).toMatchObject({
+          blocked: true,
+          kind: "failure",
+          disposition: "blocked",
+          deniedReason: "plugin-approval-unavailable",
+          reason: "Approval requester unavailable: missing",
+        });
+        expect(listener).not.toHaveBeenCalled();
+        expect(broker.listPending()).toEqual([]);
+        expect(mockCallGateway).not.toHaveBeenCalled();
+      } finally {
+        broker.stop();
+        clearEmbeddedPluginApprovalBroker(broker);
+        setEmbeddedMode(false);
+      }
+    });
+  });
+
+  it.for([false, true])(
+    "retains embedded approval custody through final validation (retired=%s)",
+    async (retired) => {
+      const broker = new EmbeddedPluginApprovalBroker();
+
+      broker.subscribe((event) => {
+        if (event.event === "plugin.approval.requested") {
+          broker.resolve(event.payload.id, "allow-once");
+        }
+      });
+      setEmbeddedMode(true);
+      setEmbeddedPluginApprovalBroker(broker);
+      hookRunner.runBeforeToolCall.mockResolvedValue({
+        requireApproval: { title: "Synthetic approval", description: "Synthetic local action" },
+      });
+      const execute = vi.fn().mockResolvedValue({ content: [], details: { ok: true } });
+      const tool = wrapToolWithBeforeToolCallHook(asAgentTool({ name: "synthetic", execute }), {
+        agentId: "main",
+        sessionKey: "synthetic-session",
+        loopDetection: { enabled: false },
+      });
+      const entered = createDeferredCore();
+      const release = createDeferredCore();
+      const callId = "synthetic-embedded-validation";
+      const running = runWithToolExecutionValidation(
+        callId,
+        async () => {
+          entered.resolve();
+          await release.promise;
+        },
+        () => tool.execute(callId, {}, undefined, undefined),
+      );
+      void running.catch(() => {});
+      try {
+        await Promise.race([
+          entered.promise,
+          running.then(() => {
+            throw new Error("Tool returned before final validation");
+          }),
+        ]);
+        if (retired) {
+          broker.stop();
+        }
+        release.resolve();
+        if (retired) {
+          await expect(running).rejects.toThrow();
+          expect(execute).not.toHaveBeenCalled();
+        } else {
+          await running;
+          expect(execute).toHaveBeenCalledOnce();
+        }
+        expect(mockCallGateway).not.toHaveBeenCalled();
+      } finally {
+        release.resolve();
+        await Promise.allSettled([running]);
+        broker.stop();
+        clearEmbeddedPluginApprovalBroker(broker);
+        setEmbeddedMode(false);
+      }
+    },
+  );
 
   it("blocks without triggering approval when both block and requireApproval are set", async () => {
     hookRunner.runBeforeToolCall.mockResolvedValue({

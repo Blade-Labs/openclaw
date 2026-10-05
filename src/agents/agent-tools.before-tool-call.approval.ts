@@ -5,7 +5,9 @@
  */
 import { addTimerTimeoutGraceMs } from "@openclaw/normalization-core/number-coercion";
 import { getRuntimeConfig } from "../config/config.js";
+import { isApprovalRequesterPolicyError } from "../gateway/approval-requester-policy.js";
 import { GatewayClientRequestError } from "../gateway/client.js";
+import type { ApprovalRequestAuthorization } from "../infra/approval-requester-binding.js";
 import { sanitizeApprovalScope } from "../infra/approval-scope.js";
 import { isEmbeddedMode } from "../infra/embedded-mode.js";
 import { getEmbeddedPluginApprovalBroker } from "../infra/embedded-plugin-approval-broker.js";
@@ -34,6 +36,7 @@ import type {
   HookContext,
   HookOutcome,
 } from "./agent-tools.before-tool-call.types.js";
+import { prepareApprovalExecution, retainApprovalExecutions } from "./approval-execution.js";
 import { withGatewayToolApprovalOwner } from "./tools/gateway-caller-context.js";
 import { callGatewayTool } from "./tools/gateway.js";
 
@@ -241,11 +244,14 @@ async function requestPluginToolApproval(params: {
         resolution === PluginApprovalResolutions.ALLOW_ONCE ||
         resolution === PluginApprovalResolutions.ALLOW_ALWAYS
       ) {
-        return {
-          blocked: false,
-          params: mergeParamsWithApprovalOverrides(params.baseParams, params.overrideParams),
-          approvalResolution: resolution,
-        };
+        return retainApprovalExecutions(
+          {
+            blocked: false as const,
+            params: mergeParamsWithApprovalOverrides(params.baseParams, params.overrideParams),
+            approvalResolution: resolution,
+          },
+          result.approvalExecutions ?? [],
+        );
       }
       if (resolution === PluginApprovalResolutions.DENY) {
         return pluginApprovalDeniedOutcome(params.baseParams);
@@ -289,6 +295,7 @@ async function requestPluginToolApproval(params: {
       status?: string;
       decision?: unknown;
       deliveryRoute?: string;
+      authorization?: ApprovalRequestAuthorization;
     } = await withGatewayToolApprovalOwner(
       approval.pluginId,
       async () =>
@@ -334,6 +341,7 @@ async function requestPluginToolApproval(params: {
       };
     }
     const hasImmediateDecision = Object.hasOwn(requestResult ?? {}, "decision");
+    let authorization = requestResult.authorization;
     let decision: unknown;
     if (hasImmediateDecision) {
       decision = requestResult?.decision;
@@ -358,6 +366,7 @@ async function requestPluginToolApproval(params: {
       const waitResult: {
         id?: string;
         decision?: unknown;
+        authorization?: ApprovalRequestAuthorization;
       } = await callGatewayTool(
         "plugin.approval.waitDecision",
         // Buffer beyond the approval timeout so the gateway can clean up
@@ -369,6 +378,9 @@ async function requestPluginToolApproval(params: {
       // Bind the verdict to the request that parked this call. A stale or
       // misrouted reply must never release a different tool gate.
       decision = waitResult?.id === id ? waitResult.decision : undefined;
+      if (waitResult?.id === id) {
+        authorization = waitResult.authorization ?? authorization;
+      }
     }
     const resolution = resolvePermittedPluginApprovalResolution(decision, allowedDecisions);
     notifyPluginApprovalResolution(approval, resolution);
@@ -376,11 +388,21 @@ async function requestPluginToolApproval(params: {
       resolution === PluginApprovalResolutions.ALLOW_ONCE ||
       resolution === PluginApprovalResolutions.ALLOW_ALWAYS
     ) {
-      return {
-        blocked: false,
-        params: mergeParamsWithApprovalOverrides(params.baseParams, params.overrideParams),
-        approvalResolution: resolution,
-      };
+      return retainApprovalExecutions(
+        {
+          blocked: false as const,
+          params: mergeParamsWithApprovalOverrides(params.baseParams, params.overrideParams),
+          approvalResolution: resolution,
+        },
+        [
+          prepareApprovalExecution({
+            id,
+            kind: "plugin",
+            authorization,
+            consumeAllowOnce: resolution === PluginApprovalResolutions.ALLOW_ONCE,
+          }),
+        ],
+      );
     }
     if (resolution === PluginApprovalResolutions.DENY) {
       return pluginApprovalDeniedOutcome(params.baseParams);
@@ -417,6 +439,16 @@ async function requestPluginToolApproval(params: {
         disposition: resolveToolErrorDiagnostic(err, signal).terminalReason,
         deniedReason: "plugin-approval",
         reason: "Approval cancelled (run aborted)",
+        params: params.baseParams,
+      };
+    }
+    if (isApprovalRequesterPolicyError(err)) {
+      return {
+        blocked: true,
+        kind: "failure",
+        disposition: "blocked",
+        deniedReason: "plugin-approval-unavailable",
+        reason: err.message,
         params: params.baseParams,
       };
     }

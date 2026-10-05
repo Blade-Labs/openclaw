@@ -2,6 +2,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { requesterAuthorization } from "../../gateway/approval-requester.test-support.js";
+import { createTestApprovalManager } from "../../gateway/exec-approval-manager.test-support.js";
+import { createGatewayRequestContext } from "../../gateway/server-request-context.js";
+import { makeContextParams } from "../../gateway/server-request-context.test-support.js";
 import {
   makeExecutable,
   makeExecApprovalsTempDir,
@@ -10,8 +14,12 @@ import { loadExecApprovals, saveExecApprovals } from "../../infra/exec-approvals
 import {
   DEFAULT_PLUGIN_APPROVAL_TIMEOUT_MS,
   PLUGIN_APPROVAL_DETAIL_MAX_LENGTH,
+  type PluginApprovalRequestPayload,
 } from "../../infra/plugin-approvals.js";
+import * as operandBinding from "../../infra/system-run-approval-binding.js";
 import { APPROVAL_SCRIPT_OPERAND_DRIFT_DENIED_MESSAGE } from "../../infra/system-run-approval-binding.js";
+import { createDeferredCore } from "../../shared/deferred.js";
+import { withGatewayToolCallerIdentity } from "../tools/gateway-caller-context.js";
 import { callGatewayTool } from "../tools/gateway.js";
 import {
   requestCliNativeToolApproval,
@@ -49,6 +57,187 @@ describe("resolveCliNativeToolApprovalPlan", () => {
 });
 
 describe("requestCliNativeToolApproval", () => {
+  it("refuses strict native approval when the resolver closes during operand verification", async (test) => {
+    const manager = createTestApprovalManager<PluginApprovalRequestPayload>(test, {
+      approvalKind: "plugin",
+    });
+    const record = manager.create(
+      { title: "synthetic native", description: "synthetic input" },
+      60_000,
+      "synthetic-native-binding",
+    );
+    record.authorization = requesterAuthorization();
+    await manager.register(record, 60_000);
+    let current = true;
+    await manager.resolveDetailed(
+      record.id,
+      "allow-once",
+      {
+        kind: "channel",
+        id: "synthetic-requester",
+        actor: {
+          kind: "channel",
+          channel: "test",
+          accountId: "default",
+          senderId: "synthetic-requester",
+          actorKind: "human",
+        },
+      },
+      null,
+      "operator",
+      {
+        assertCurrent: () => {
+          if (!current) {
+            throw new Error("synthetic revoked");
+          }
+        },
+      },
+    );
+    const context = createGatewayRequestContext(
+      makeContextParams({ pluginApprovalManager: manager }),
+    );
+    const entered = createDeferredCore();
+    const release = createDeferredCore();
+    vi.spyOn(operandBinding, "prepareSystemRunMutableFileBinding").mockResolvedValue({
+      ok: true,
+      binding: {
+        commands: [["echo", "synthetic"]],
+        operands: [
+          {
+            kind: "mutable",
+            argv: ["echo", "synthetic"],
+            snapshot: {
+              argvIndex: 0,
+              path: "/tmp/synthetic-script",
+              sha256: "synthetic-digest",
+            },
+          },
+        ],
+      },
+    });
+    vi.spyOn(operandBinding, "revalidateSystemRunMutableFileBinding").mockImplementation(
+      async () => {
+        entered.resolve();
+        await release.promise;
+        return { ok: true };
+      },
+    );
+    mockCallGatewayTool.mockResolvedValueOnce({
+      id: record.id,
+      decision: "allow-once",
+      authorization: record.authorization,
+    });
+    const request = withGatewayToolCallerIdentity(
+      {
+        agentId: "main",
+        sessionKey: "synthetic-session",
+        gatewayContextResolver: () => context,
+      },
+      () =>
+        requestCliNativeToolApproval({
+          toolName: "Bash",
+          toolInput: { command: "echo synthetic" },
+          pluginId: "synthetic-cli",
+          ask: "always",
+          requireRequesterMatch: true,
+        }),
+    );
+    await entered.promise;
+    current = false;
+    release.resolve();
+    await expect(request).resolves.toEqual({ kind: "deny", reason: "unavailable" });
+    expect(manager.getLiveSnapshot(record.id)?.consumedAtMs).toBeFalsy();
+  });
+
+  it("retains strict native one-use redemption through the final caller boundary", async (test) => {
+    const manager = createTestApprovalManager<PluginApprovalRequestPayload>(test, {
+      approvalKind: "plugin",
+    });
+    const record = manager.create(
+      { title: "synthetic native", description: "synthetic input" },
+      60_000,
+      "synthetic-native-redemption",
+    );
+    record.authorization = requesterAuthorization();
+    await manager.register(record, 60_000);
+    let current = true;
+    await manager.resolveDetailed(
+      record.id,
+      "allow-once",
+      {
+        kind: "channel",
+        id: "synthetic-requester",
+        actor: {
+          kind: "channel",
+          channel: "test",
+          accountId: "default",
+          senderId: "synthetic-requester",
+          actorKind: "human",
+        },
+      },
+      null,
+      "operator",
+      {
+        assertCurrent: () => {
+          if (!current) {
+            throw new Error("synthetic revoked");
+          }
+        },
+      },
+    );
+    const context = createGatewayRequestContext(
+      makeContextParams({ pluginApprovalManager: manager }),
+    );
+    mockCallGatewayTool.mockResolvedValueOnce({
+      id: record.id,
+      decision: "allow-once",
+      authorization: record.authorization,
+    });
+    const outcome = await withGatewayToolCallerIdentity(
+      {
+        agentId: "main",
+        sessionKey: "synthetic-session",
+        gatewayContextResolver: () => context,
+      },
+      () =>
+        requestCliNativeToolApproval({
+          toolName: "WebFetch",
+          toolInput: { url: "https://example.test" },
+          pluginId: "synthetic-cli",
+          ask: "always",
+          requireRequesterMatch: true,
+        }),
+    );
+    expect(outcome.kind).toBe("allow");
+    if (outcome.kind !== "allow" || !outcome.redeem) {
+      throw new Error("missing strict redemption");
+    }
+    await outcome.redeem();
+    expect(manager.getLiveSnapshot(record.id)?.consumedDecision).toBe("allow-once");
+    await expect(outcome.redeem()).rejects.toThrow();
+    current = false;
+    expect(() => outcome.assertCurrent?.()).toThrow();
+  });
+
+  it("rejects allow-always and offers only one-shot decisions under requester policy", async () => {
+    mockCallGatewayTool.mockResolvedValueOnce({
+      id: "synthetic-strict-native",
+      decision: "allow-always",
+    });
+    await expect(
+      requestCliNativeToolApproval({
+        toolName: "WebFetch",
+        toolInput: { url: "https://example.test" },
+        pluginId: "synthetic-cli",
+        ask: "on-miss",
+        requireRequesterMatch: true,
+      }),
+    ).resolves.toEqual({ kind: "deny", reason: "unavailable" });
+    expect(mockCallGatewayTool.mock.calls[0]?.[2]).toMatchObject({
+      allowedDecisions: ["allow-once", "deny"],
+    });
+  });
+
   it.each(["gog calendar list", "absolute"])(
     "auto-allows and records an allowlisted native command: %s",
     async (input) => {

@@ -26,6 +26,7 @@ import {
   resolvePluginApprovalTimeoutMs,
   truncatePluginApprovalDetail,
 } from "../../infra/plugin-approvals.js";
+import { bindApprovalRequestAuthorization } from "../approval-request-authorization.js";
 import type { ExecApprovalManager } from "../exec-approval-manager.js";
 import { resolveRequestedSessionAgentId } from "../session-request-agent.js";
 import { resolveStoredSessionKeyForAgentStore } from "../session-store-key.js";
@@ -220,6 +221,12 @@ export function createPluginApprovalHandlers(
       ) {
         record.executionIdentityToken = trustedAgentRuntime.executionIdentity;
       }
+      bindApprovalRequestAuthorization({
+        record,
+        cfg: context.getRuntimeConfig(),
+        approvalKind: "plugin",
+        identity: trustedAgentRuntime,
+      });
       bindApprovalRequesterMetadata({ record, client });
       if (client?.internal?.approvalRuntime === true) {
         bindApprovalReviewerDeviceIds({
@@ -256,6 +263,9 @@ export function createPluginApprovalHandlers(
       await handleApprovalWaitDecision({
         manager,
         inputId: (params as { id?: string }).id,
+        context,
+        consumeAllowOnce: (params as { consumeAllowOnce?: unknown }).consumeAllowOnce,
+        validateConsumed: (params as { validateConsumed?: unknown }).validateConsumed,
         client,
         ...(client?.authenticatedUserProfile ? { getCfg: context.getRuntimeConfig } : {}),
         respond,

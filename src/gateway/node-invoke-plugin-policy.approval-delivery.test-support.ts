@@ -1,15 +1,23 @@
 import { expect, it, vi } from "vitest";
-import { createOperationalRunInstanceRef } from "../agents/admitted-run-context.js";
+import {
+  createOperationalRunInstanceRef,
+  getAdmittedRunDelegatedAuthority,
+  prepareAgentRunAdmission,
+} from "../agents/admitted-run-context.js";
+import { validateAgentRunDelegatedAuthority } from "../infra/agent-run-registry.js";
+import { createHostChannelTurnSource } from "../infra/host-turn-source.js";
 import type {
   PluginApprovalRequest,
   PluginApprovalRequestPayload,
 } from "../infra/plugin-approvals.js";
 import { createDeferredCore } from "../shared/deferred.js";
+import { withRequesterApprovalChannel } from "./approval-requester.test-support.js";
 import { createTestApprovalFixture } from "./exec-approval-manager.test-support.js";
 import { applyPluginNodeInvokePolicy } from "./node-invoke-plugin-policy.js";
 import {
   createApprovalRequestPolicy,
   createContext,
+  createDemoPolicy,
   createNodeSession,
   createOperatorClient,
   DEMO_COMMAND,
@@ -218,4 +226,167 @@ export function registerNodePolicyApprovalDeliveryTests() {
       expect(replacementExpired.mock.contexts).toEqual([context.pluginApprovalIosPushDelivery]);
     });
   });
+  it.for([false, true].flatMap((strict) => [false, true].map((revoke) => ({ strict, revoke }))))(
+    "retains resolver eligibility across pairing recheck (strict=$strict, revoke=$revoke)",
+    async ({ strict, revoke }, testContext) => {
+      const fixture = createTestApprovalFixture<PluginApprovalRequestPayload>(testContext, {
+        approvalKind: "plugin",
+        validateAgentRuntimeDelegatedAuthority: validateAgentRunDelegatedAuthority,
+      });
+      await fixture.run(async () => {
+        setDangerousDemoCommandRegistry([
+          createDemoPolicy(async (policy) => {
+            const approval = await policy.approvals?.request({
+              title: "Synthetic node action",
+              description: "Approve the declared synthetic command",
+            });
+            if (approval?.decision !== "allow-once") {
+              return { ok: false, code: "APPROVAL_DENIED", message: "Synthetic action denied" };
+            }
+            return await policy.invokeNode();
+          }),
+        ]);
+        let eligible = true;
+        await withRequesterApprovalChannel(
+          async () => {
+            const operationalRunInstance =
+              createOperationalRunInstanceRef("synthetic-node-pairing");
+            const admission = prepareAgentRunAdmission({
+              cfg: {},
+              sessionKey: "agent:main:synthetic-node",
+              facts: {
+                runId: operationalRunInstance.runId,
+                agentId: "main",
+                ingress: { kind: "system", boundary: "synthetic-test", state: "present" },
+              },
+              operationalRunInstance,
+              turnSource: createHostChannelTurnSource({
+                actor: {
+                  channel: "test",
+                  accountId: "default",
+                  senderId: "synthetic-requester",
+                  actorKind: "human",
+                },
+                message: {
+                  messageId: "synthetic-node-message",
+                  conversationId: "synthetic-node-chat",
+                  conversationKind: "direct",
+                  eventKind: "message",
+                },
+              }),
+            });
+            const pairingEntered = createDeferredCore();
+            const pairingRelease = createDeferredCore();
+            try {
+              const admitted = await admission.admit("plugin-harness");
+              const authority = getAdmittedRunDelegatedAuthority(admitted);
+              if (!authority) {
+                throw new Error("Missing synthetic admission authority");
+              }
+              const delivered = createDeferredCore<string>();
+              const { context, invoke } = createContext({
+                pluginApprovalManager: fixture.manager,
+                hasExecApprovalClients: () => true,
+                validateAgentRuntimeApprovalAuthority: (identity) =>
+                  validateAgentRunDelegatedAuthority(identity.delegatedAuthority),
+              });
+              context.approvalEvents = {
+                publishRequested: (_kind, request) => {
+                  delivered.resolve((request as { id: string }).id);
+                  return 1;
+                },
+                publishResolved: vi.fn(),
+                deliverRequester: async (_kind, request) => {
+                  delivered.resolve((request as { id: string }).id);
+                  return true;
+                },
+              };
+              const pending = fixture.track(
+                applyPluginNodeInvokePolicy({
+                  context,
+                  client: null,
+                  agentRuntimeIdentity: {
+                    kind: "agentRuntime",
+                    agentId: "main",
+                    sessionKey: "agent:main:synthetic-node",
+                    operationalRunInstance,
+                    delegatedAuthority: { ...authority, kind: "local" },
+                    turnSourceChannel: "test",
+                    turnSourceAccountId: "default",
+                  },
+                  nodeSession: createNodeSession(),
+                  command: DEMO_COMMAND,
+                  params: DEMO_PARAMS,
+                  isInvocationCurrent: async () => {
+                    pairingEntered.resolve();
+                    await pairingRelease.promise;
+                    return true;
+                  },
+                }),
+              );
+              const id = await Promise.race([
+                delivered.promise,
+                pending.then(() => {
+                  throw new Error("Node policy ended before approval delivery");
+                }),
+              ]);
+              expect(
+                await fixture.manager.resolveDetailed(
+                  id,
+                  "allow-once",
+                  {
+                    kind: "channel",
+                    id: "test:default",
+                    actor: {
+                      kind: "channel",
+                      channel: "test",
+                      accountId: "default",
+                      senderId: "synthetic-requester",
+                      actorKind: "human",
+                    },
+                  },
+                  null,
+                  "operator",
+                  {
+                    assertCurrent: () => {
+                      if (!eligible) {
+                        throw new Error("Synthetic resolver revoked");
+                      }
+                    },
+                  },
+                ),
+              ).toMatchObject({ outcome: "resolved" });
+              await Promise.race([
+                pairingEntered.promise,
+                pending.then(() => {
+                  throw new Error("Node policy ended before pairing recheck");
+                }),
+              ]);
+              expect((await fixture.manager.getSnapshot(id))?.consumedDecision).toBe("allow-once");
+              eligible = !revoke;
+              pairingRelease.resolve();
+              await expect(pending).resolves.toMatchObject(
+                revoke
+                  ? {
+                      ok: false,
+                      code: "APPROVAL_AUTHORITY_CLOSED",
+                      details: { nodeCommandDispatched: false },
+                    }
+                  : { ok: true },
+              );
+              expect(invoke).toHaveBeenCalledTimes(revoke ? 0 : 1);
+              if (!revoke) {
+                eligible = false;
+                expect(invoke.mock.calls[0]?.[0]?.isDispatchAuthorized?.()).toBe(false);
+              }
+            } finally {
+              pairingRelease.resolve();
+              admission.close();
+            }
+          },
+          { strict: () => strict, eligible: () => eligible },
+        );
+      });
+    },
+  );
 }

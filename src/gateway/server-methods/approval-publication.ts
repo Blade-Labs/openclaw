@@ -10,6 +10,7 @@ import type {
   PluginApprovalResolved,
 } from "../../infra/plugin-approvals.js";
 import type { SystemAgentApprovalRequestPayload } from "../../infra/system-agent-approvals.js";
+import { requiresApprovalRequesterMatch } from "../approval-request-policy.js";
 import type { ExecApprovalRecord } from "../exec-approval-manager.js";
 import type { OperatorApprovalRecord } from "../operator-approval-store.js";
 import { broadcastApprovalResolvedEvent } from "./approval-shared.js";
@@ -72,6 +73,7 @@ export async function publishAppliedApprovalResolution(params: {
     id: params.record.id,
     decision,
     resolvedBy,
+    resolvedByActor: params.record.resolvedByActor,
     ts,
     request: params.liveRecord.request,
     ...(params.record.kind === "system-agent" &&
@@ -97,6 +99,12 @@ export async function publishAppliedApprovalResolution(params: {
     nativeApprovalKind === "plugin" ||
     nativeApprovalKind === "system-agent"
   ) {
+    if (
+      params.liveRecord?.requiresRequesterMatch?.() === true &&
+      !params.record.authorization?.policy.requireResolverMatch
+    ) {
+      return;
+    }
     // Native approval routes are instance-local, so publish the canonical CAS
     // winner directly instead of reconnecting to the Gateway over WebSocket.
     if (nativeApprovalKind !== "system-agent" || params.record.status !== "allowed") {
@@ -105,6 +113,16 @@ export async function publishAppliedApprovalResolution(params: {
         approvalKind: nativeApprovalKind,
         run: () => params.context.approvalEvents?.publishResolved(nativeApprovalKind, event),
       });
+    }
+    if (
+      params.liveRecord?.requiresRequesterMatch?.() === true ||
+      requiresApprovalRequesterMatch(
+        params.record.authorization,
+        params.context.getRuntimeConfig(),
+        params.record.kind,
+      )
+    ) {
+      return;
     }
     const webPushDelivery = params.context.approvalWebPushDelivery;
     if (webPushDelivery && (nativeApprovalKind === "exec" || nativeApprovalKind === "plugin")) {

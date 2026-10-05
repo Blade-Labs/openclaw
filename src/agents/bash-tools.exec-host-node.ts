@@ -429,6 +429,7 @@ export async function executeNodeHostCommand(
         const outcome = await execHostShared.resolveExecApprovalWaitOutcome({
           approvalId,
           preResolvedDecision,
+          authorization: approvalRoute.authorization,
           signal: params.signal,
           askFallback,
           resolveTimedOut: async () => {
@@ -488,6 +489,7 @@ export async function executeNodeHostCommand(
           const approvalOutcome = await execHostShared.resolveExecApprovalWaitOutcome({
             approvalId,
             preResolvedDecision,
+            authorization: approvalRoute.authorization,
             signal: params.signal,
             askFallback,
             resolveTimedOut: async () => {
@@ -642,6 +644,7 @@ export async function executeNodeHostCommand(
           allowedDecisions,
           nodeId: target.nodeId,
           processContinuationAvailable: params.processContinuationAvailable,
+          authorization: approvalRoute.authorization,
         });
       }
     }

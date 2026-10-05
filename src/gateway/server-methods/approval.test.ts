@@ -3,13 +3,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   type ApprovalHistoryResult,
   validateApprovalGetResult,
   validateApprovalHistoryResult,
   validateApprovalResolveResult,
 } from "../../../packages/gateway-protocol/src/index.js";
+import { createDeferred } from "../../../test/helpers/promise.js";
+import { admitChannelApprovalActor } from "../../channels/message-access/approval-actor.js";
 import { upsertSessionEntryCore } from "../../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { ExecApprovalForwarder } from "../../infra/exec-approval-forwarder.js";
@@ -35,6 +37,11 @@ import {
 import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
 import { ensureProfileForEmail, setUserProfileRole } from "../../state/user-profiles.js";
 import { withEnvAsync } from "../../test-utils/env.js";
+import { bindApprovalRequestAuthorization } from "../approval-request-authorization.js";
+import {
+  requesterAuthorization,
+  withRequesterApprovalChannel,
+} from "../approval-requester.test-support.js";
 import { ExecApprovalManager } from "../exec-approval-manager.js";
 import {
   createTestApprovalManager,
@@ -43,18 +50,20 @@ import {
 import type { ExecApprovalManagerOptions } from "../exec-approval-manager.types.js";
 import { getOperatorApprovalDetailed, insertOperatorApproval } from "../operator-approval-store.js";
 import * as operatorApprovalStore from "../operator-approval-store.js";
-
-async function getOperatorApproval(params: Parameters<typeof getOperatorApprovalDetailed>[0]) {
-  const result = await getOperatorApprovalDetailed({ nowMs: Date.now(), ...params });
-  return result.outcome === "found" ? result.record : null;
-}
-import { createDeferred } from "../../../test/helpers/promise.js";
 import {
   cancelAgentRuntimeBoundApprovals,
   cancelUnboundRunApprovals,
 } from "./approval-run-cancellation.js";
 import { createApprovalHandlers } from "./approval.js";
+import { createExecApprovalHandlers } from "./exec-approval.js";
+import { createPluginApprovalHandlers } from "./plugin-approval.js";
+import { systemAgentHandlers } from "./system-agent.js";
 import type { GatewayRequestHandlerOptions } from "./types.js";
+
+async function getOperatorApproval(params: Parameters<typeof getOperatorApprovalDetailed>[0]) {
+  const result = await getOperatorApprovalDetailed({ nowMs: Date.now(), ...params });
+  return result.outcome === "found" ? result.record : null;
+}
 
 const prepareApprovalChannelCustodyMock = vi.hoisted(() => vi.fn());
 
@@ -134,6 +143,7 @@ async function registerExec(
     id: string;
     request?: Partial<ExecApprovalRequestPayload>;
     expiresAtMs?: number;
+    strict?: boolean;
     requester?: {
       connId?: string | null;
       deviceId?: string | null;
@@ -153,6 +163,9 @@ async function registerExec(
     600_000,
     params.id,
   );
+  if (params.strict) {
+    record.authorization = requesterAuthorization();
+  }
   record.requestedByConnId = params.requester?.connId ?? null;
   record.requestedByDeviceId =
     params.requester && "deviceId" in params.requester
@@ -177,6 +190,7 @@ async function registerPlugin(
     id: string;
     request?: Partial<PluginApprovalRequestPayload>;
     reviewerDeviceIds?: string[];
+    strict?: boolean;
   },
 ) {
   const record = manager.create(
@@ -193,6 +207,9 @@ async function registerPlugin(
     600_000,
     params.id,
   );
+  if (params.strict) {
+    record.authorization = requesterAuthorization();
+  }
   record.requestedByDeviceId = "requester-device";
   record.requestedByClientId = "requester-client";
   record.requestedByDeviceTokenAuth = true;
@@ -204,6 +221,7 @@ async function registerPlugin(
 async function registerSystemAgent(
   manager: ExecApprovalManager<SystemAgentApprovalRequestPayload>,
   id: string,
+  strict = false,
 ) {
   const record = manager.create(
     {
@@ -219,6 +237,9 @@ async function registerSystemAgent(
     600_000,
     id,
   );
+  if (strict) {
+    record.authorization = requesterAuthorization();
+  }
   const decision = (await manager.register(record, 600_000)).decision;
   return { record, decision };
 }
@@ -293,6 +314,17 @@ function approvalFromResult(result: unknown) {
 }
 
 describe("unified approval handlers", () => {
+  beforeEach(() => {
+    prepareApprovalChannelCustodyMock.mockReset().mockImplementation(({ reviewer }) =>
+      reviewer.channel === "test"
+        ? {
+            resolverId: `test:${reviewer.accountId}`,
+            authorizes: (record: { request: { turnSourceAccountId?: string } }) =>
+              (record.request.turnSourceAccountId ?? "default") === reviewer.accountId,
+          }
+        : null,
+    );
+  });
   afterEach(async () => {
     vi.restoreAllMocks();
     for (const manager of managersForCleanup.splice(0)) {
@@ -307,6 +339,420 @@ describe("unified approval handlers", () => {
       );
       await closeOpenClawStateDatabaseByPathAsync(path.join(dir, "state.sqlite"));
       fs.rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  it.for([false, true])(
+    "keeps requester-only requests out of all three pending-list RPCs (frozen=%s)",
+    async (frozen) => {
+      let strict = false;
+      await withRequesterApprovalChannel(
+        async () => {
+          const databaseOptions = createDatabaseOptions();
+          const managers = createManagers(databaseOptions);
+          const client = createClient({ scopes: ["operator.admin"] });
+          const context = createContext();
+          context.systemAgentApprovalManager = managers.systemAgent;
+          const history = createApprovalHandlers({
+            execApprovalManager: managers.exec,
+            pluginApprovalManager: managers.plugin,
+            systemAgentApprovalManager: managers.systemAgent,
+            databaseOptions,
+          });
+          for (const [manager, handlers, method] of [
+            [managers.exec, createExecApprovalHandlers(managers.exec), "exec.approval.list"],
+            [
+              managers.plugin,
+              createPluginApprovalHandlers(managers.plugin),
+              "plugin.approval.list",
+            ],
+            [managers.systemAgent, systemAgentHandlers, "openclaw.approval.list"],
+          ] as const) {
+            const record = manager.create(
+              {
+                command: "echo synthetic",
+                title: "Synthetic approval",
+                description: "Synthetic pending-list permission",
+                proposalHash: "a".repeat(64),
+                allowedDecisions: ["allow-once", "deny"],
+                agentId: "main",
+                sessionKey: "agent:main:child",
+                sessionId: "synthetic-system-session",
+              },
+              600_000,
+              `${manager.approvalKind}:synthetic-hydration`,
+            );
+            if (frozen) {
+              record.authorization = requesterAuthorization();
+            } else {
+              bindApprovalRequestAuthorization<typeof record.request>({
+                record,
+                cfg: {},
+                approvalKind: manager.approvalKind,
+                identity: { turnSourceChannel: "test", turnSourceAccountId: "default" },
+              });
+            }
+            await manager.register(record, 600_000);
+            const list = async () => {
+              const respond = vi.fn();
+              await expectDefined(
+                handlers[method],
+                "pending-list handler",
+              )({
+                req: { id: "synthetic-list", type: "req", method, params: {} },
+                params: {},
+                client,
+                context,
+                isWebchatConnect: () => false,
+                respond,
+              });
+              expect(respond.mock.calls[0]?.[0]).toBe(true);
+              return respond.mock.calls[0]?.[1];
+            };
+            expect(await list()).toEqual(
+              frozen ? [] : [expect.objectContaining({ id: record.id })],
+            );
+            strict = true;
+            expect(await list()).toEqual([]);
+            strict = false;
+            expect(await list()).toEqual([]);
+            // Listing is delivery; existing authorized terminal inspection remains available.
+            await manager.expire(record.id);
+            const result = await invoke({
+              handlers: history,
+              method: "approval.get",
+              body: { id: record.id },
+              client,
+            });
+            expect(result.ok).toBe(true);
+            expect(approvalFromResult(result.result)).toMatchObject({
+              id: record.id,
+              status: "expired",
+            });
+          }
+        },
+        { strict: () => strict },
+      );
+    },
+  );
+
+  it("resolves a strict system-agent request with the admitted requester and rejects terminal retries from others", async () => {
+    await withRequesterApprovalChannel(async () => {
+      const databaseOptions = createDatabaseOptions();
+      const managers = createManagers(databaseOptions);
+      const pending = await registerSystemAgent(
+        managers.systemAgent,
+        "system-agent:synthetic-requester",
+        true,
+      );
+      const handlers = createApprovalHandlers({
+        execApprovalManager: managers.exec,
+        pluginApprovalManager: managers.plugin,
+        systemAgentApprovalManager: managers.systemAgent,
+        databaseOptions,
+      });
+      const actor = admitChannelApprovalActor(
+        {
+          kind: "channel",
+          channel: "test",
+          accountId: "default",
+          senderId: "synthetic-requester",
+          actorKind: "human",
+          interactionId: "synthetic-click",
+        },
+        () => {},
+      );
+      const client = {
+        ...createClient({ internal: true })!,
+        internal: { approvalRuntime: true, approvalActor: actor },
+      };
+      const body = { id: pending.record.id, kind: "system-agent", decision: "allow-once" };
+      const result = await invoke({ handlers, method: "approval.resolve", body, client });
+      expect(result.ok).toBe(true);
+      expect(result.result).toMatchObject({
+        applied: true,
+        approval: {
+          authorization: pending.record.authorization,
+          resolvedByActor: {
+            kind: "channel",
+            senderId: "synthetic-requester",
+            interactionId: "synthetic-click",
+          },
+        },
+      });
+      await expect(pending.decision).resolves.toBe("allow-once");
+      expect(
+        (await invoke({ handlers, method: "approval.resolve", body, client })).result,
+      ).toMatchObject({ applied: false });
+      const other = await invoke({
+        handlers,
+        method: "approval.resolve",
+        body,
+        client: createClient({ scopes: ["operator.admin"] }),
+      });
+      expect(other.ok).toBe(false);
+      expect(other.error).toMatchObject({ details: { code: "APPROVAL_REQUESTER_UNAVAILABLE" } });
+      expect(
+        (await managers.systemAgent.getSnapshot(pending.record.id))?.resolvedByActor,
+      ).toMatchObject({ senderId: "synthetic-requester" });
+    });
+  });
+
+  it.each([false, true])(
+    "keeps admitted channel custody with requester matching=%s",
+    async (strict) => {
+      await withRequesterApprovalChannel(
+        async () => {
+          const databaseOptions = createDatabaseOptions();
+          const managers = createManagers(databaseOptions);
+          const foreign = await registerExec(managers.exec, {
+            id: "synthetic-custody-foreign",
+            strict,
+            request: { turnSourceChannel: "test", turnSourceAccountId: "other" },
+          });
+          const owned = await registerExec(managers.exec, {
+            id: "synthetic-custody-owned",
+            strict,
+            request: { turnSourceChannel: "test", turnSourceAccountId: "default" },
+          });
+          const handlers = createApprovalHandlers({
+            execApprovalManager: managers.exec,
+            pluginApprovalManager: managers.plugin,
+            databaseOptions,
+          });
+          const actor = admitChannelApprovalActor(
+            {
+              kind: "channel",
+              channel: "test",
+              accountId: "default",
+              senderId: "synthetic-requester",
+              actorKind: "human",
+            },
+            () => {},
+          );
+          const client = {
+            ...createClient({ internal: true })!,
+            internal: { approvalRuntime: true, approvalActor: actor },
+          };
+          const rejected = await invoke({
+            handlers,
+            method: "approval.resolve",
+            body: {
+              id: foreign.record.id,
+              kind: "exec",
+              decision: "allow-once",
+              reviewer: { channel: "test", accountId: "other", senderId: "synthetic-requester" },
+            },
+            client,
+          });
+          expect(rejected.ok).toBe(false);
+          expect((await managers.exec.getSnapshot(foreign.record.id))?.decision).toBeUndefined();
+          const accepted = await invoke({
+            handlers,
+            method: "approval.resolve",
+            body: { id: owned.record.id, kind: "exec", decision: "allow-once" },
+            client,
+          });
+          expect(accepted.ok).toBe(true);
+          await expect(owned.decision).resolves.toBe("allow-once");
+        },
+        { strict: () => strict },
+      );
+    },
+  );
+
+  it.each([false, true])(
+    "rechecks the admitted approver at worker pre-commit with requester matching=%s",
+    async (strict) => {
+      let eligible = true;
+      await withRequesterApprovalChannel(
+        async () => {
+          const databaseOptions = createDatabaseOptions();
+          const managers = createManagers(databaseOptions);
+          const pending = await registerExec(managers.exec, {
+            id: "synthetic-revoked-approver",
+            strict,
+          });
+          const handlers = createApprovalHandlers({
+            execApprovalManager: managers.exec,
+            pluginApprovalManager: managers.plugin,
+            databaseOptions,
+          });
+          const actor = admitChannelApprovalActor(
+            {
+              kind: "channel",
+              channel: "test",
+              accountId: "default",
+              senderId: "synthetic-requester",
+              actorKind: "human",
+            },
+            () => {},
+          );
+          const entered = createDeferred();
+          const release = createDeferred();
+          const resolve = operatorApprovalStore.resolveOperatorApproval;
+          vi.spyOn(operatorApprovalStore, "resolveOperatorApproval").mockImplementation(
+            async (input) => {
+              entered.resolve();
+              await release.promise;
+              return await resolve(input);
+            },
+          );
+          const result = invoke({
+            handlers,
+            method: "approval.resolve",
+            body: { id: pending.record.id, kind: "exec", decision: "allow-once" },
+            client: {
+              ...createClient({ internal: true })!,
+              internal: { approvalRuntime: true, approvalActor: actor },
+            },
+          });
+          await entered.promise;
+          eligible = false;
+          release.resolve();
+          expect((await result).ok).toBe(false);
+          expect((await managers.exec.getSnapshot(pending.record.id))?.decision).not.toBe(
+            "allow-once",
+          );
+          expect(
+            (await getOperatorApproval({ id: pending.record.id, databaseOptions }))?.decision,
+          ).not.toBe("allow-once");
+        },
+        { strict: () => strict, eligible: () => eligible },
+      );
+    },
+  );
+
+  it("resolves advertised eight-character slugs within authenticated requester custody", async () => {
+    await withRequesterApprovalChannel(async () => {
+      const databaseOptions = createDatabaseOptions();
+      const managers = createManagers(databaseOptions);
+      const owned = await registerExec(managers.exec, {
+        id: "12345678-owned",
+        strict: true,
+        request: { turnSourceChannel: "test", turnSourceAccountId: "default" },
+      });
+      const foreign = await registerExec(managers.exec, {
+        id: "12345678-foreign",
+        strict: true,
+        request: { turnSourceChannel: "test", turnSourceAccountId: "other" },
+      });
+      const handlers = createApprovalHandlers({
+        execApprovalManager: managers.exec,
+        pluginApprovalManager: managers.plugin,
+        databaseOptions,
+      });
+      const actor = admitChannelApprovalActor(
+        {
+          kind: "channel",
+          channel: "test",
+          accountId: "default",
+          senderId: "synthetic-requester",
+          actorKind: "human",
+          messageId: "synthetic-approve-command",
+        },
+        () => {},
+      );
+      const result = await invoke({
+        handlers,
+        method: "approval.resolve",
+        body: { id: "12345678", kind: "exec", decision: "allow-once" },
+        client: {
+          ...createClient({ internal: true })!,
+          internal: { approvalRuntime: true, approvalActor: actor },
+        },
+      });
+      expect(result.result).toMatchObject({ applied: true, approval: { id: owned.record.id } });
+      await expect(owned.decision).resolves.toBe("allow-once");
+      expect((await managers.exec.getSnapshot(foreign.record.id))?.decision).toBeUndefined();
+    });
+  });
+
+  it("refuses strict operator, admin, public reviewer and wrong-actor verdicts including malformed denial", async () => {
+    const databaseOptions = createDatabaseOptions();
+    const managers = createManagers(databaseOptions);
+    const handlers = createApprovalHandlers({
+      execApprovalManager: managers.exec,
+      pluginApprovalManager: managers.plugin,
+      systemAgentApprovalManager: managers.systemAgent,
+      databaseOptions,
+    });
+    const cases = [
+      {
+        manager: managers.exec,
+        pending: await registerExec(managers.exec, {
+          id: "synthetic-strict-exec",
+          strict: true,
+          reviewerDeviceIds: [],
+        }),
+      },
+      {
+        manager: managers.plugin,
+        pending: await registerPlugin(managers.plugin, {
+          id: "synthetic-strict-plugin",
+          strict: true,
+          reviewerDeviceIds: [],
+        }),
+      },
+      {
+        manager: managers.systemAgent,
+        pending: await registerSystemAgent(
+          managers.systemAgent,
+          "system-agent:synthetic-strict",
+          true,
+        ),
+      },
+    ];
+    for (const {
+      manager,
+      pending: { record },
+    } of cases) {
+      const wrongActor = admitChannelApprovalActor(
+        {
+          kind: "channel",
+          channel: "test",
+          accountId: "default",
+          senderId: "synthetic-other",
+          actorKind: "human",
+          interactionId: "synthetic-interaction",
+        },
+        () => {},
+      );
+      for (const decision of ["allow-once", "deny", "malformed"] as const) {
+        for (const client of [
+          createClient({ scopes: ["operator.admin"] }),
+          createClient({ internal: true }),
+          {
+            ...createClient({ internal: true })!,
+            internal: { approvalRuntime: true, approvalActor: wrongActor },
+          },
+        ]) {
+          const response = await invoke({
+            handlers,
+            method: "approval.resolve",
+            body: { id: record.id, kind: manager.approvalKind, decision },
+            client,
+          });
+          expect(response.ok).toBe(false);
+          expect(response.error).toMatchObject({
+            details: { code: "APPROVAL_REQUESTER_UNAVAILABLE" },
+          });
+          expect((await manager.getSnapshot(record.id))?.resolvedAtMs).toBeUndefined();
+        }
+      }
+      const response = await invoke({
+        handlers,
+        method: "approval.resolve",
+        body: {
+          id: record.id,
+          kind: manager.approvalKind,
+          decision: "deny",
+          reviewer: { channel: "test", accountId: "default", senderId: "synthetic-requester" },
+        },
+        client: createClient({ internal: true }),
+      });
+      expect(response.ok).toBe(false);
+      expect((await manager.getSnapshot(record.id))?.resolvedAtMs).toBeUndefined();
     }
   });
 

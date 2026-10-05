@@ -21,7 +21,10 @@ import {
 } from "../../../plugins/hook-agent-context.js";
 import type { getGlobalHookRunner } from "../../../plugins/hook-runner-global.js";
 import { buildInterSessionPromptContext } from "../../../sessions/input-provenance.js";
-import { resolveAdmittedRunActiveAssertion } from "../../admitted-run-context.js";
+import {
+  captureAdmittedRunSource,
+  resolveAdmittedRunActiveAssertion,
+} from "../../admitted-run-context.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../../defaults.js";
 import {
   buildAgentInternalEventContext,
@@ -156,6 +159,7 @@ export async function prepareEmbeddedAttemptPromptAssembly(input: {
     modelId: attempt.model.id,
     trigger: attempt.trigger,
     inputProvenance: attempt.inputProvenance,
+    source: captureAdmittedRunSource(attempt.admittedRunContext).source,
     ...buildAgentHookContextChannelFields(attempt),
     ...buildAgentHookContextIdentityFields({
       trigger: attempt.trigger,

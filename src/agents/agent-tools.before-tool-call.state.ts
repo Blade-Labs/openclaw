@@ -3,7 +3,28 @@
  * The adapter and wrapper both consult this map so later execution can use the
  * normalized payload selected by hook processing.
  */
+import type { TurnSourceProvenance } from "../infra/turn-source-provenance.js";
+
 export const adjustedParamsByToolCallId = new Map<string, unknown>();
+const sourceByToolCallId = new Map<string, TurnSourceProvenance>();
+
+export function recordSourceForToolCall(
+  toolCallId: string,
+  runId: string | undefined,
+  source: TurnSourceProvenance,
+): void {
+  sourceByToolCallId.set(buildAdjustedParamsKey({ runId, toolCallId }), source);
+}
+
+export function consumeSourceForToolCall(
+  toolCallId: string,
+  runId?: string,
+): TurnSourceProvenance | undefined {
+  const key = buildAdjustedParamsKey({ runId, toolCallId });
+  const source = sourceByToolCallId.get(key);
+  sourceByToolCallId.delete(key);
+  return source;
+}
 export const preExecutionBlockedToolCallIds = new Set<string>();
 export const structuredReplaySafeToolCallIds = new Set<string>();
 const startedToolCallIds = new Set<string>();
@@ -115,6 +136,11 @@ export function releaseBatchAdmittedToolCalls(
 /** Remove unused batch-admission markers when their embedded run ends. */
 export function clearBatchAdmittedToolCallsForRun(runId: string): void {
   const prefix = `${runId}:`;
+  for (const key of sourceByToolCallId.keys()) {
+    if (key.startsWith(prefix)) {
+      sourceByToolCallId.delete(key);
+    }
+  }
   for (const key of batchAdmittedToolCallIds) {
     if (key.startsWith(prefix)) {
       batchAdmittedToolCallIds.delete(key);
@@ -125,9 +151,26 @@ export function clearBatchAdmittedToolCallsForRun(runId: string): void {
 /** Clear adjusted tool parameters between isolated tests. */
 export function resetAdjustedParamsByToolCallIdForTests(): void {
   adjustedParamsByToolCallId.clear();
+  sourceByToolCallId.clear();
   preExecutionBlockedToolCallIds.clear();
   trackedToolCallIds.clear();
   startedToolCallIds.clear();
   structuredReplaySafeToolCallIds.clear();
   batchAdmittedToolCallIds.clear();
+}
+
+const MAX_TRACKED_BLOCKED_CALLS = 1024;
+
+export function recordPreExecutionBlockedToolCall(toolCallId?: string, runId?: string): void {
+  if (!toolCallId) {
+    return;
+  }
+  preExecutionBlockedToolCallIds.add(buildAdjustedParamsKey({ runId, toolCallId }));
+  while (preExecutionBlockedToolCallIds.size > MAX_TRACKED_BLOCKED_CALLS) {
+    const oldest = preExecutionBlockedToolCallIds.values().next().value;
+    if (!oldest) {
+      break;
+    }
+    preExecutionBlockedToolCallIds.delete(oldest);
+  }
 }

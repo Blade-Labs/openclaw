@@ -187,6 +187,7 @@ describe("Full Access delegated chat", () => {
     });
     const context = {
       systemAgentSessions: sessions,
+      getRuntimeConfig: () => ({}),
       systemAgentApprovalManager: manager,
       broadcast,
       broadcastToConnIds: vi.fn(),
@@ -224,6 +225,47 @@ describe("Full Access delegated chat", () => {
       approvalDatabasePath,
     };
   }
+
+  it("suppresses application subscribers when private requester policy strengthens", async () => {
+    const {
+      manager,
+      authority,
+      operationalRunInstance,
+      context,
+      callChat,
+      requested,
+      runConfigSet,
+    } = await createDelegatedChatFixture("typed", "durable");
+    const publishResolved = vi.fn();
+    context.approvalEvents = { publishRequested: () => 0, publishResolved };
+    const pending = withGatewayToolCallerIdentity(
+      {
+        agentId: "main",
+        sessionKey: "agent:main:main",
+        operationalRunInstance,
+        approvalAuthority: authority,
+      },
+      () =>
+        callChat({
+          sessionId: "delegate-full",
+          message: "config set logging.level debug",
+          delegation: { agentId: "main", sessionKey: "agent:main:main" },
+        }),
+    );
+    await requested.promise;
+    const record = expectDefined(
+      (await manager.listPendingRecords())[0],
+      "pending requester policy test",
+    );
+    record.requiresRequesterMatch = () => true;
+    await manager.forceDenyDetailed(record.id, "requester-unavailable", {
+      kind: "system",
+      id: null,
+    });
+    await pending;
+    expect(publishResolved).not.toHaveBeenCalled();
+    expect(runConfigSet).not.toHaveBeenCalled();
+  });
 
   it.each([
     "apply",

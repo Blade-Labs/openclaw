@@ -4,12 +4,17 @@ import {
 } from "@openclaw/normalization-core/error-coercion";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import {
+  appendAdmittedRunSource,
+  canAppendAdmittedRunSource,
+} from "../../agents/admitted-run-context.js";
+import {
   QuestionAnswerUnconfirmedError,
   QuestionDispatchRefusedError,
   QuestionDispatchUnsupportedError,
 } from "../../agents/harness/gateway-question-dispatch.js";
 import { SessionPendingInputCustodyError } from "../../config/sessions/session-pending-input-custody-error.js";
 import { getAgentRunContext } from "../../infra/agent-run-registry.js";
+import { readHostTurnSource } from "../../infra/host-turn-source.js";
 import { hasPromptImageInput } from "../../media/prompt-image-input.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import {
@@ -29,6 +34,7 @@ import {
   type ReplyOperation,
 } from "./reply-run-registry.contracts.js";
 import {
+  admittedRunByOperation,
   getAttachedBackend,
   isReplyRunEvidenceStale,
   replyRunState,
@@ -168,6 +174,7 @@ export function resolveReplyMessageInjectionRejection(params: {
   options?: ReplyBackendQueueMessageOptions;
   allowPendingUserInputAnswer?: false;
   assertCurrent?: () => void;
+  sourceBound?: boolean;
 }):
   | {
       reason: ReplyMessageInjectionRejectionReason;
@@ -197,7 +204,11 @@ export function resolveReplyMessageInjectionRejection(params: {
     );
   };
   const injection = backend
-    ? resolveReplyBackendMessageInjection(backend, canInject, params.assertCurrent !== undefined)
+    ? resolveReplyBackendMessageInjection(
+        backend,
+        canInject,
+        params.sourceBound ?? params.assertCurrent !== undefined,
+      )
     : undefined;
   if (!backend || !injection) {
     return { reason: "injection_unavailable" };
@@ -316,8 +327,35 @@ export function beginReplyMessageInjectionTarget(
   options?: ReplyMessageInjectionOptions,
 ): ReplyMessageInjectionAttempt {
   const operation = target[replyMessageInjectionTargetOperation];
-  const { toolAuthorityOverlay, assertCurrent, allowPendingUserInputAnswer, ...backendOptions } =
-    options ?? {};
+  const {
+    toolAuthorityOverlay,
+    assertCurrent: assertIncomingCurrent,
+    allowPendingUserInputAnswer,
+    turnSource,
+    ...backendOptions
+  } = options ?? {};
+  const admittedRun = admittedRunByOperation.get(operation);
+  if (
+    readHostTurnSource(turnSource).requireResolverMatch ||
+    (admittedRun && !canAppendAdmittedRunSource(admittedRun, turnSource))
+  ) {
+    return {
+      targetRunId: target.runId,
+      acceptance: Promise.resolve(false),
+      outcome: Promise.resolve({ status: "rejected", reason: "source_requires_followup" }),
+    };
+  }
+  const assertCurrent = admittedRun
+    ? () => {
+        assertIncomingCurrent?.();
+        if (
+          admittedRunByOperation.get(operation) !== admittedRun ||
+          !canAppendAdmittedRunSource(admittedRun, turnSource)
+        ) {
+          throw new Error("turn source must be admitted as a follow-up");
+        }
+      }
+    : assertIncomingCurrent;
   const projectedToolAuthorityFingerprint = toolAuthorityOverlay
     ? operation.projectToolAuthorityFingerprint(toolAuthorityOverlay)
     : backendOptions.toolAuthorityFingerprint;
@@ -334,6 +372,7 @@ export function beginReplyMessageInjectionTarget(
     options: queueOptions,
     allowPendingUserInputAnswer,
     assertCurrent,
+    sourceBound: assertIncomingCurrent !== undefined,
   });
   if (!("injection" in resolved)) {
     const immediateRejection = {
@@ -395,7 +434,13 @@ export function beginReplyMessageInjectionTarget(
       return;
     }
     acceptanceSettled = true;
-    acceptance.resolve(accepted);
+    try {
+      if (accepted && admittedRun) {
+        appendAdmittedRunSource(admittedRun, turnSource);
+      }
+    } finally {
+      acceptance.resolve(accepted);
+    }
     queueOptions?.onQueueAccepted?.(accepted);
   };
   const runtimeQueueOptions: ReplyBackendQueueMessageOptions = {
@@ -421,6 +466,11 @@ export function beginReplyMessageInjectionTarget(
   };
   let queued: Promise<void | ReplyBackendQueueMessageResult>;
   try {
+    // V2 owns the existing final source-authority check. Legacy backends need
+    // only the additional descriptive-source check when an admitted run exists.
+    if (admittedRun && resolved.backend.messageInjectionV2?.version !== 2) {
+      assertCurrent?.();
+    }
     queued = resolved.injection.queueMessage(text, runtimeQueueOptions);
   } catch (error) {
     return {

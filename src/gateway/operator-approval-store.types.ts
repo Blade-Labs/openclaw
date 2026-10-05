@@ -3,6 +3,10 @@ import type { ApprovalPresentation } from "../../packages/gateway-protocol/src/s
 import type { DecisionReceiptV1 } from "../../packages/gateway-protocol/src/schema/audit-run.js";
 import type { ExecutionIdentityAdmissionToken } from "../audit/execution-identity-admission.js";
 import type {
+  ApprovalRequestAuthorization,
+  ApprovalResolvingActor,
+} from "../infra/approval-requester-binding.js";
+import type {
   DB as OpenClawStateKyselyDatabase,
   OperatorApprovals,
 } from "../state/openclaw-state-db.generated.js";
@@ -14,6 +18,7 @@ export type OperatorApprovalTerminalReason =
   | "user"
   | "timeout"
   | "malformed-verdict"
+  | "requester-unavailable"
   | "no-route"
   | "run-aborted"
   | "gateway-restart"
@@ -35,11 +40,14 @@ type OperatorApprovalSource = {
 };
 
 export type OperatorApprovalResolver = {
+  actor?: ApprovalResolvingActor;
   kind: OperatorApprovalResolverKind;
   id: string | null;
 };
 
 export type OperatorApprovalRecord = {
+  authorization?: ApprovalRequestAuthorization;
+  resolvedByActor?: ApprovalResolvingActor | null;
   id: string;
   resolutionRef: string;
   kind: OperatorApprovalKind;
@@ -62,6 +70,9 @@ export type OperatorApprovalRecord = {
 };
 
 export type NewOperatorApproval = {
+  /** A rejected strict request is terminal at insertion and never offers a grant. */
+  terminalReason?: "requester-unavailable";
+  authorization?: ApprovalRequestAuthorization;
   id: string;
   kind: OperatorApprovalKind;
   presentation: ApprovalPresentation;

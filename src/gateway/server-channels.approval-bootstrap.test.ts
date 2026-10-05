@@ -3,9 +3,13 @@
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
+import { readAdmittedChannelApprovalActor } from "../channels/message-access/approval-actor.js";
 import type { ChannelId, ChannelPlugin } from "../channels/plugins/types.public.js";
 import { getGatewayNativeApprovalRuntime } from "../infra/approval-gateway-runtime-context.js";
-import type { GatewayNativeApprovalRuntime } from "../infra/approval-gateway-runtime.types.js";
+import type {
+  ChannelApprovalResolutionRuntimeV2,
+  GatewayNativeApprovalRuntime,
+} from "../infra/approval-gateway-runtime.types.js";
 import {
   createSubsystemLogger,
   runtimeForLogger,
@@ -202,9 +206,48 @@ describe("server-channels approval bootstrap", () => {
       }),
     ).toEqual({ token: "tracked" });
 
+    const approvalRuntime = channelRuntime.runtimeContexts.get<ChannelApprovalResolutionRuntimeV2>({
+      channelId: "discord",
+      accountId: DEFAULT_ACCOUNT_ID,
+      capability: "approval.gateway",
+    });
+    expect(approvalRuntime?.version).toBe(2);
+    const actor = approvalRuntime!.admitInteractionActor({
+      senderId: "synthetic-requester",
+      actorKind: "human",
+      interactionId: "synthetic-click",
+    });
+    expect(readAdmittedChannelApprovalActor(actor)?.actor).toEqual({
+      kind: "channel",
+      channel: "discord",
+      accountId: DEFAULT_ACCOUNT_ID,
+      senderId: "synthetic-requester",
+      actorKind: "human",
+      interactionId: "synthetic-click",
+    });
+    await approvalRuntime!.resolve(
+      { id: "system-agent:synthetic", kind: "system-agent", decision: "deny" },
+      actor,
+    );
+    expect(nativeApprovalRuntime.request).toHaveBeenCalledWith(
+      "approval.resolve",
+      { id: "system-agent:synthetic", kind: "system-agent", decision: "deny" },
+      { approvalActor: actor },
+    );
+    await expect(
+      approvalRuntime!.resolve(
+        { id: "synthetic", kind: "exec", decision: "deny" },
+        { kind: "admitted-channel-actor" },
+      ),
+    ).rejects.toThrow("does not belong to this account");
+
     await manager.stopChannel("discord", DEFAULT_ACCOUNT_ID);
     await stopped.promise;
 
+    expect(() => readAdmittedChannelApprovalActor(actor)).toThrow("closed");
+    await expect(
+      approvalRuntime!.resolve({ id: "synthetic", kind: "exec", decision: "deny" }, actor),
+    ).rejects.toThrow("closed");
     expect(stopApprovalBootstrap).toHaveBeenCalledTimes(1);
     expect(
       channelRuntime.runtimeContexts.get({

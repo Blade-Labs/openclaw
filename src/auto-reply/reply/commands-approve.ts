@@ -1,6 +1,7 @@
 import { expectDefined } from "@openclaw/normalization-core";
 // Implements approval commands for pending tool and execution requests.
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import { readChannelContextApprovalActor } from "../../channels/message-access/admission-evidence.js";
 import {
   getChannelPlugin,
   resolveChannelApprovalCapability,
@@ -179,6 +180,57 @@ export async function handleApproveCommandFromContext(
   const approvalCapability = resolveChannelApprovalCapability(
     getChannelPlugin(params.command.channel),
   );
+  const strict =
+    approvalCapability?.resolveRequestPolicy?.({
+      cfg: params.cfg,
+      accountId: effectiveAccountId ?? "default",
+      approvalKind: parsed.id.startsWith("system-agent:")
+        ? "system-agent"
+        : parsed.id.startsWith("plugin:")
+          ? "plugin"
+          : "exec",
+    })?.requireResolverMatch === true;
+  let actor: ReturnType<typeof readChannelContextApprovalActor>;
+  try {
+    actor = readChannelContextApprovalActor(params.ctx);
+  } catch {
+    return {
+      shouldContinue: false,
+      reply: { text: "❌ Authenticated approval requester unavailable. Send your request again." },
+    };
+  }
+  if (strict || (actor && parsed.id.startsWith("system-agent:"))) {
+    if (!actor) {
+      return {
+        shouldContinue: false,
+        reply: {
+          text: "❌ Authenticated approval requester unavailable. Send your request again.",
+        },
+      };
+    }
+    try {
+      await resolveApprovalOverGateway({
+        cfg: params.cfg,
+        approvalId: parsed.id,
+        decision: parsed.decision,
+        approvalKind: parsed.id.startsWith("system-agent:")
+          ? "system-agent"
+          : parsed.id.startsWith("plugin:")
+            ? "plugin"
+            : "exec",
+        admittedActor: actor,
+      });
+      return {
+        shouldContinue: false,
+        reply: { text: `✅ Approval ${parsed.decision} submitted for ${parsed.id}.` },
+      };
+    } catch (error) {
+      return {
+        shouldContinue: false,
+        reply: { text: `❌ Failed to submit approval: ${formatApprovalSubmitError(error)}` },
+      };
+    }
+  }
   const commandBehaviors = new Map<ChannelApprovalKind, ApproveCommandBehavior | undefined>();
   for (const approvalKind of ["exec", "plugin"] as const) {
     commandBehaviors.set(
@@ -218,6 +270,7 @@ export async function handleApproveCommandFromContext(
           }
         : {}),
       resolveMethod,
+      ...(actor ? { admittedActor: actor } : {}),
       clientDisplayName: `Chat approval (${resolvedBy})`,
     });
   };

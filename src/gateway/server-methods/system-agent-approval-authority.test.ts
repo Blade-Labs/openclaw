@@ -1,7 +1,10 @@
 // Covers exact delegated approval authority and closure fences.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
-import { createOperationalRunInstanceRef } from "../../agents/admitted-run-context.js";
+import {
+  prepareAgentRunAdmission,
+  createOperationalRunInstanceRef,
+} from "../../agents/admitted-run-context.js";
 import { withGatewayToolCallerIdentity } from "../../agents/tools/gateway-caller-context.js";
 import {
   claimAgentRunDelegatedAuthority,
@@ -10,10 +13,13 @@ import {
   validateAgentRunDelegatedAuthority,
 } from "../../infra/agent-run-registry.js";
 import type { ExecApprovalDecision } from "../../infra/exec-approvals.js";
+import { createHostChannelTurnSource } from "../../infra/host-turn-source.js";
 import type { SystemAgentApprovalRequestPayload } from "../../infra/system-agent-approvals.js";
+import { withRequesterApprovalChannel } from "../approval-requester.test-support.js";
 import { createTestApprovalManager } from "../exec-approval-manager.test-support.js";
 import type { WorkerSessionTurnClaim } from "../worker-environments/placement-record.js";
 import { prepareDelegatedSystemAgentApproval } from "./system-agent-approval.js";
+import * as systemAgentExecution from "./system-agent-execution.js";
 import type { SystemAgentChatSession } from "./system-agent.js";
 import type { GatewayRequestContext } from "./types.js";
 
@@ -51,6 +57,252 @@ describe("prepareDelegatedSystemAgentApproval", () => {
     owner: { kind: "worker", environmentId: "worker-1", ownerEpoch: 1 },
   });
 
+  it.for(["queue", "config preparation"] as const)(
+    "refuses a system-agent write when its resolver is revoked during %s",
+    async (phase, testContext) => {
+      let eligible = true;
+      await withRequesterApprovalChannel(
+        async () => {
+          const instance = createOperationalRunInstanceRef("synthetic-system-write");
+          const admission = prepareAgentRunAdmission({
+            cfg: {},
+            facts: {
+              runId: instance.runId,
+              agentId: "main",
+              ingress: { kind: "system", boundary: "synthetic-test", state: "present" },
+            },
+            operationalRunInstance: instance,
+            sessionKey: "agent:main:synthetic-write",
+            turnSource: createHostChannelTurnSource({
+              actor: {
+                channel: "test",
+                accountId: "default",
+                senderId: "synthetic-requester",
+                actorKind: "human",
+              },
+              message: {
+                messageId: "synthetic-message",
+                conversationId: "synthetic-dm",
+                conversationKind: "direct",
+                eventKind: "message",
+              },
+            }),
+          });
+          await admission.admit("plugin-harness");
+          const held = createDeferred();
+          const entered = createDeferred();
+          const applicationQueued = createDeferred();
+          const write = vi.fn();
+          const proposal = {
+            operation: { kind: "config-set" as const, path: "logging.level", value: "debug" },
+            hash: "d".repeat(64),
+          };
+          const session = {
+            engine: {
+              historyLength: () => 0,
+              historySince: () => [],
+              noteAssistantMessage: vi.fn(),
+              getPendingOperatorProposal: () => proposal,
+              resolveOperatorApproval: async (
+                decision: ExecApprovalDecision | null,
+                _hash: string,
+                guard?: () => void,
+              ) => {
+                if (decision !== "allow-once") {
+                  return null;
+                }
+                if (phase === "config preparation") {
+                  entered.resolve();
+                  await held.promise;
+                }
+                guard?.();
+                write();
+                return { text: "Synthetic applied", action: "none" as const, applied: true };
+              },
+            },
+            lastUsedAt: 1,
+            ownerKey: "agent:main:synthetic-write",
+          } as unknown as SystemAgentChatSession;
+          const sessions = new Map([["synthetic-system-session", session]]);
+          const manager = createTestApprovalManager<SystemAgentApprovalRequestPayload>(
+            testContext,
+            {
+              approvalKind: "system-agent",
+              resolveAllowedDecisions: (request) => request.allowedDecisions,
+              validateAgentRuntimeDelegatedAuthority: validateAgentRunDelegatedAuthority,
+            },
+          );
+          const context = {
+            systemAgentApprovalManager: manager,
+            getRuntimeConfig: () => ({}),
+            broadcast: vi.fn(),
+            approvalEvents: {
+              deliverRequester: async () => true,
+              publishRequested: vi.fn(),
+              publishResolved: vi.fn(),
+            },
+          } as unknown as GatewayRequestContext;
+          let queued: Promise<void> | undefined;
+          let restoreQueueSpy: (() => void) | undefined;
+          try {
+            const resolution = await withGatewayToolCallerIdentity(
+              {
+                agentId: "main",
+                sessionKey: "agent:main:synthetic-write",
+                operationalRunInstance: instance,
+              },
+              () =>
+                resolveTestProposal({
+                  context,
+                  sessions,
+                  session,
+                  sessionId: "synthetic-system-session",
+                  delegation: {},
+                  proposal,
+                }),
+            );
+            if (resolution.kind !== "approval") {
+              throw new Error("Expected pending approval");
+            }
+            if (phase === "queue") {
+              queued = systemAgentExecution.runSystemAgentGatewayTask(async () => {
+                entered.resolve();
+                await held.promise;
+              });
+              await entered.promise;
+              const runTask = systemAgentExecution.runSystemAgentGatewayTask;
+              const spy = vi
+                .spyOn(systemAgentExecution, "runSystemAgentGatewayTask")
+                .mockImplementation((task) => {
+                  const application = runTask(task);
+                  applicationQueued.resolve();
+                  return application;
+                });
+              restoreQueueSpy = () => spy.mockRestore();
+            }
+            expect(
+              (
+                await manager.resolveDetailed(
+                  resolution.id,
+                  "allow-once",
+                  {
+                    kind: "channel",
+                    id: "synthetic-requester",
+                    actor: {
+                      kind: "channel",
+                      channel: "test",
+                      accountId: "default",
+                      senderId: "synthetic-requester",
+                      actorKind: "human",
+                    },
+                  },
+                  null,
+                  "operator",
+                  {
+                    assertCurrent: () => {
+                      if (!eligible) {
+                        throw new Error("Synthetic resolver revoked");
+                      }
+                    },
+                  },
+                )
+              ).outcome,
+            ).toBe("resolved");
+            await Promise.race([
+              phase === "config preparation" ? entered.promise : applicationQueued.promise,
+              resolution.completion.then(() => {
+                throw new Error("Application finished before config preparation");
+              }),
+            ]);
+            eligible = false;
+            held.resolve();
+            await expect(resolution.completion).resolves.toMatchObject({ applied: false });
+            expect(write).not.toHaveBeenCalled();
+          } finally {
+            held.resolve();
+            await queued;
+            restoreQueueSpy?.();
+            admission.close();
+          }
+        },
+        { eligible: () => eligible },
+      );
+    },
+  );
+
+  it("terminally rejects a strict delegated request without admitted source and clears its proposal", async (testContext) => {
+    await withRequesterApprovalChannel(async () => {
+      const proposal = { operation: { kind: "gateway-restart" as const }, hash: "c".repeat(64) };
+      const deniedReply = { text: "Synthetic change denied", action: "none", applied: false };
+      const resolveOperatorApproval = vi.fn().mockResolvedValue(deniedReply);
+      const session = {
+        engine: {
+          historyLength: () => 0,
+          historySince: () => [],
+          noteAssistantMessage: vi.fn(),
+          getPendingOperatorProposal: () => proposal,
+          resolveOperatorApproval,
+        },
+        lastUsedAt: 1,
+        ownerKey: "agent:main:synthetic",
+      } as unknown as SystemAgentChatSession;
+      const sessions = new Map([["synthetic-delegation", session]]);
+      const manager = createTestApprovalManager<SystemAgentApprovalRequestPayload>(testContext, {
+        approvalKind: "system-agent",
+        resolveAllowedDecisions: (request) => request.allowedDecisions,
+        validateAgentRuntimeDelegatedAuthority: validateAgentRunDelegatedAuthority,
+      });
+      const broadcast = vi.fn();
+      const reportBlockedRequest = vi.fn(async () => "no-unique-chat" as const);
+      const context = {
+        systemAgentApprovalManager: manager,
+        getRuntimeConfig: () => ({}),
+        broadcast,
+        logGateway: { error: vi.fn() },
+        approvalEvents: { reportBlockedRequest },
+      } as unknown as GatewayRequestContext;
+      const operationalRunInstance = createOperationalRunInstanceRef("synthetic-delegated-run");
+      const authority = claimAgentRunDelegatedAuthority(operationalRunInstance);
+      try {
+        await expect(
+          withGatewayToolCallerIdentity(
+            {
+              agentId: "main",
+              sessionKey: "agent:main:synthetic",
+              operationalRunInstance,
+              turnSourceChannel: "test",
+              turnSourceAccountId: "default",
+            },
+            () =>
+              resolveTestProposal({
+                context,
+                sessions,
+                session,
+                sessionId: "synthetic-delegation",
+                delegation: { agentId: "main", sessionKey: "agent:main:synthetic" },
+                proposal,
+              }),
+          ),
+        ).rejects.toMatchObject({
+          code: "APPROVAL_REQUESTER_UNAVAILABLE",
+          terminalReason: "requester-unavailable",
+        });
+        expect(session.pendingApproval).toBeUndefined();
+        expect(resolveOperatorApproval).toHaveBeenCalledWith(
+          "deny",
+          proposal.hash,
+          expect.any(Function),
+          undefined,
+        );
+        expect(await manager.listPendingRecords()).toEqual([]);
+        expect(broadcast).not.toHaveBeenCalled();
+        expect(reportBlockedRequest).toHaveBeenCalledOnce();
+      } finally {
+        releaseAgentRunDelegatedAuthority(authority);
+      }
+    });
+  });
+
   it("refuses to apply a delegated change after its run authority closes", async (testContext) => {
     const proposal = {
       operation: { kind: "gateway-restart" as const },
@@ -75,6 +327,7 @@ describe("prepareDelegatedSystemAgentApproval", () => {
       validateAgentRuntimeDelegatedAuthority: validateAgentRunDelegatedAuthority,
     });
     const context = {
+      getRuntimeConfig: () => ({}),
       systemAgentApprovalManager: manager,
       broadcast: vi.fn(),
     } as unknown as GatewayRequestContext;
@@ -158,6 +411,7 @@ describe("prepareDelegatedSystemAgentApproval", () => {
     });
     const publishResolved = vi.fn();
     const context = {
+      getRuntimeConfig: () => ({}),
       systemAgentApprovalManager: manager,
       broadcast: vi.fn(),
       approvalEvents: { publishRequested: vi.fn(), publishResolved },
@@ -305,6 +559,7 @@ describe("prepareDelegatedSystemAgentApproval", () => {
     });
     const publishResolved = vi.fn();
     const context = {
+      getRuntimeConfig: () => ({}),
       systemAgentApprovalManager: manager,
       broadcast: vi.fn(),
       approvalEvents: { publishRequested: vi.fn(), publishResolved },
@@ -384,6 +639,7 @@ describe("prepareDelegatedSystemAgentApproval", () => {
         validateAgentRunDelegatedAuthority(authority) && workerTurnActive,
     });
     const context = {
+      getRuntimeConfig: () => ({}),
       systemAgentApprovalManager: manager,
       broadcast: vi.fn(),
       approvalEvents: { publishRequested: vi.fn(), publishResolved: vi.fn() },
@@ -447,6 +703,7 @@ describe("prepareDelegatedSystemAgentApproval", () => {
         validateAgentRuntimeDelegatedAuthority: validateAgentRunDelegatedAuthority,
       });
       const context = {
+        getRuntimeConfig: () => ({}),
         systemAgentApprovalManager: manager,
         broadcast: vi.fn(),
         validateAgentRuntimeApprovalAuthority: () => true,

@@ -14,7 +14,10 @@ import {
   closeOpenClawAgentDatabasesForTest,
   openOpenClawAgentDatabase,
 } from "./openclaw-agent-db.js";
-import { ensureSessionPendingInputsSchema } from "./openclaw-agent-pending-inputs-schema.js";
+import {
+  ensureSessionPendingInputsSchema,
+  hasPendingInputConsumptionColumn,
+} from "./openclaw-agent-pending-inputs-schema.js";
 import { OPENCLAW_AGENT_SCHEMA_SQL } from "./openclaw-agent-schema.js";
 import { tableHasColumn, tableExists } from "./openclaw-state-db-schema-helpers.js";
 
@@ -198,4 +201,30 @@ describe("pending input additive schema", () => {
       }
     },
   );
+
+  it("adds nullable source facts at first use without changing old rows or schema versions", () => {
+    const database = new DatabaseSync(":memory:");
+    try {
+      database.exec(
+        withoutCanonicalSessionValidationSchema(OPENCLAW_AGENT_SCHEMA_SQL).replace(
+          "  source_provenance_json TEXT,\n",
+          "",
+        ),
+      );
+      const version = database.prepare("PRAGMA user_version").get();
+      expect(tableHasColumn(database, "session_pending_inputs", "source_provenance_json")).toBe(
+        false,
+      );
+      expect(hasPendingInputConsumptionColumn(database)).toBe(true);
+      ensureSessionPendingInputsSchema(database);
+      expect(database.prepare("PRAGMA user_version").get()).toEqual(version);
+      const column = database
+        .prepare("PRAGMA table_info(session_pending_inputs)")
+        .all()
+        .find((entry) => entry.name === "source_provenance_json");
+      expect(column).toMatchObject({ type: "TEXT", notnull: 0, dflt_value: null });
+    } finally {
+      database.close();
+    }
+  });
 });

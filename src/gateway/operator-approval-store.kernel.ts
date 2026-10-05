@@ -89,6 +89,7 @@ export function insertOperatorApprovalInDatabase(
     audienceSessionKeysJson,
   };
   const executionIdentityBinding = normalizeExecutionIdentityBinding(input);
+  const requesterDenied = input.terminalReason === "requester-unavailable";
 
   return runOpenClawStateWriteTransaction((database) => {
     const stateDb = getNodeSqliteKysely<OperatorApprovalDatabase>(database.db);
@@ -112,8 +113,12 @@ export function insertOperatorApprovalInDatabase(
           approval_id: id,
           resolution_ref: resolutionRef,
           kind: input.kind,
-          status: "pending",
+          status: requesterDenied ? "denied" : "pending",
           presentation_json: presentationJson,
+          authorization_json: input.authorization ? JSON.stringify(input.authorization) : null,
+          resolver_actor_json: requesterDenied
+            ? JSON.stringify({ kind: "system", reason: "requester-unavailable" })
+            : null,
           requested_by_device_id: normalizeNullableString(input.requester?.deviceId),
           requested_by_client_id: normalizeNullableString(input.requester?.clientId),
           requested_by_device_token_auth: input.requester?.deviceTokenAuth === true ? 1 : 0,
@@ -129,10 +134,10 @@ export function insertOperatorApprovalInDatabase(
           created_at_ms: input.createdAtMs,
           expires_at_ms: input.expiresAtMs,
           updated_at_ms: input.createdAtMs,
-          decision: null,
-          terminal_reason: null,
-          resolved_at_ms: null,
-          resolver_kind: null,
+          decision: requesterDenied ? "deny" : null,
+          terminal_reason: requesterDenied ? "no-route" : null,
+          resolved_at_ms: requesterDenied ? input.createdAtMs : null,
+          resolver_kind: requesterDenied ? "system" : null,
           resolver_id: null,
           consumed_at_ms: null,
           consumed_by: null,

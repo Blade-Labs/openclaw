@@ -9,6 +9,7 @@ import { normalizeChatType } from "../../../channels/chat-type.js";
 import { resolveSessionStorePathCore } from "../../../config/sessions.js";
 import { loadSessionEntryReadOnly } from "../../../config/sessions/session-accessor.js";
 // Drains queued follow-up runs while preserving route and session identity.
+import { canCombineHostTurnSources } from "../../../infra/host-turn-source.js";
 import {
   channelRouteCompactKey,
   channelRouteDedupeKey,
@@ -263,7 +264,11 @@ function splitCollectItemsByDeliveryContext(items: FollowupRun[]): FollowupRun[]
 
   for (const item of items) {
     const itemKey = resolveFollowupDeliveryContextKey(item);
-    if (currentGroup.length === 0 || itemKey === currentKey) {
+    if (
+      currentGroup.length === 0 ||
+      (itemKey === currentKey &&
+        canCombineHostTurnSources([...currentGroup, item].map((run) => run.turnSource)))
+    ) {
       currentGroup.push(item);
       currentKey = itemKey;
       continue;
@@ -861,7 +866,10 @@ function resolveOverflowSummarySourceGroup(queue: {
   const contextKey = resolveFollowupDeliveryContextKey(source);
   const sources: FollowupRun[] = [];
   for (const candidate of queue.summarySources) {
-    if (resolveFollowupDeliveryContextKey(candidate) !== contextKey) {
+    if (
+      resolveFollowupDeliveryContextKey(candidate) !== contextKey ||
+      !canCombineHostTurnSources([...sources, candidate].map((run) => run.turnSource))
+    ) {
       break;
     }
     sources.push(candidate);
@@ -946,6 +954,7 @@ async function runSyntheticOverflowSummary(params: {
     abortSignal: params.abortSignal,
     explicitSkillSelections: runtimeMetadata.explicitSkillSelections,
     channelAdmissionEvidence: runtimeMetadata.channelAdmissionEvidence,
+    turnSource: runtimeMetadata.turnSource,
     operatorAuthority: runtimeMetadata.operatorAuthority,
     personalBootstrapEligible: runtimeMetadata.personalBootstrapEligible,
     toolsAllow: runtimeMetadata.toolsAllow,
@@ -987,21 +996,40 @@ async function drainElidedOverflowSummary(params: {
   if (!entry) {
     return false;
   }
-  const retainedSources =
-    params.queue.summaryElisions.length === 1
+  const elidedSources: FollowupRun[] = [];
+  for (const candidate of entry.sources) {
+    if (!canCombineHostTurnSources([...elidedSources, candidate].map((run) => run.turnSource))) {
+      break;
+    }
+    elidedSources.push(candidate);
+  }
+  const retainedCandidates =
+    params.queue.summaryElisions.length === 1 && elidedSources.length === entry.sources.length
       ? resolveOverflowSummarySourceGroup(params.queue).filter(
           (source) => resolveFollowupDeliveryContextKey(source) === entry.contextKey,
         )
       : [];
+  const retainedSources: FollowupRun[] = [];
+  for (const candidate of retainedCandidates) {
+    if (
+      !canCombineHostTurnSources(
+        [...elidedSources, ...retainedSources, candidate].map((run) => run.turnSource),
+      )
+    ) {
+      break;
+    }
+    retainedSources.push(candidate);
+  }
   const source = retainedSources.at(-1) ?? entry.sources.at(-1);
   if (!source) {
     return false;
   }
-  const elidedCount = entry.sources.length;
-  const elidedSources = [...entry.sources];
+  const elidedCount = elidedSources.length;
   const droppedCount = elidedCount + retainedSources.length;
   const retainedSummaryLines = resolveQueueSummaryLines(params.queue, retainedSources);
-  const summaryLines = [...entry.summaryLines, ...retainedSummaryLines].slice(-params.queue.cap);
+  const summaryLines = [...entry.summaryLines.slice(0, elidedCount), ...retainedSummaryLines].slice(
+    -params.queue.cap,
+  );
   const prompt = previewQueueSummaryPrompt({
     state: {
       droppedCount,

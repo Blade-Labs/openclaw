@@ -1,4 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../../test/helpers/promise.js";
+import {
+  requesterAuthorization,
+  withRequesterApprovalChannel,
+} from "../../gateway/approval-requester.test-support.js";
+import { createTestApprovalManager } from "../../gateway/exec-approval-manager.test-support.js";
+import * as operatorApprovalStore from "../../gateway/operator-approval-store.js";
+import { createGatewayRequestContext } from "../../gateway/server-request-context.js";
+import { makeContextParams } from "../../gateway/server-request-context.test-support.js";
+import { createHostChannelTurnSource } from "../../infra/host-turn-source.js";
+import type { PluginApprovalRequestPayload } from "../../infra/plugin-approvals.js";
 import type { CliBackendToolPermissionResult } from "../../plugins/cli-backend.types.js";
 import {
   initializeGlobalHookRunner,
@@ -6,8 +17,11 @@ import {
 } from "../../plugins/hook-runner-global.js";
 import type { PluginHookHandlerMap } from "../../plugins/hook-types.js";
 import { createMockPluginRegistry } from "../../plugins/hooks.test-fixtures.js";
+import { appendAdmittedRunSource } from "../admitted-run-context.js";
 import * as beforeToolCall from "../agent-tools.before-tool-call.js";
+import { consumeSourceForToolCall } from "../agent-tools.before-tool-call.state.js";
 import { createCliJsonlStreamingParser } from "../cli-output-stream.js";
+import { withGatewayToolCallerIdentity } from "../tools/gateway-caller-context.js";
 import { callGatewayTool } from "../tools/gateway.js";
 import { createCliEventHandlers } from "./execute-events.js";
 import {
@@ -48,6 +62,216 @@ afterEach(() => {
 });
 
 describe("plugin-owned CLI native tool policy", () => {
+  it.each(["deny", "cancel", "dispose", "throw"] as const)(
+    "releases CLI provenance without a tool result on %s",
+    async (terminal) => {
+      const { context } = await createExecution({ nativeTools: ["WebFetch"] });
+      const cancellation = new AbortController();
+      const policyEntered = createDeferred();
+      const releasePolicy = createDeferred();
+      installBeforeToolCallHook(async () => {
+        if (terminal === "cancel") {
+          policyEntered.resolve();
+          await releasePolicy.promise;
+        }
+        if (terminal === "throw") {
+          throw new Error("Synthetic policy failure");
+        }
+        return terminal === "deny" ? { block: true, blockReason: "Synthetic denial" } : undefined;
+      });
+      await runPlugin(context, async function* (execution) {
+        const permission = execution.requestToolPermission({
+          toolName: "WebFetch",
+          toolInput: { resource: "synthetic-resource" },
+          toolCallId: "synthetic-no-result",
+          abortSignal: cancellation.signal,
+        });
+        if (terminal === "cancel") {
+          await policyEntered.promise;
+          cancellation.abort();
+          releasePolicy.resolve();
+        }
+        const result = await permission;
+        expect(result.behavior).toBe(terminal === "dispose" ? "allow" : "deny");
+        if (terminal !== "dispose") {
+          expect(
+            consumeSourceForToolCall("synthetic-no-result", context.params.runId),
+          ).toBeUndefined();
+        }
+        yield SUCCESS_RESULT;
+      });
+      expect(consumeSourceForToolCall("synthetic-no-result", context.params.runId)).toBeUndefined();
+    },
+  );
+
+  it.for([true, false])(
+    "redeems strict consent before returning native CLI permission (resolver revoked=%s)",
+    async (revoked, testContext) => {
+      const manager = createTestApprovalManager<PluginApprovalRequestPayload>(testContext, {
+        approvalKind: "plugin",
+      });
+      const record = manager.create(
+        { title: "Synthetic native tool", description: "Synthetic input" },
+        60_000,
+        "synthetic-native-cli-dispatch",
+      );
+      record.authorization = requesterAuthorization();
+      await manager.register(record, 60_000);
+      let resolverCurrent = true;
+      await manager.resolveDetailed(
+        record.id,
+        "allow-once",
+        {
+          kind: "channel",
+          id: "synthetic-requester",
+          actor: {
+            kind: "channel",
+            channel: "test",
+            accountId: "default",
+            senderId: "synthetic-requester",
+            actorKind: "human",
+          },
+        },
+        null,
+        "operator",
+        {
+          assertCurrent: () => {
+            if (!resolverCurrent) {
+              throw new Error("Synthetic resolver revoked");
+            }
+          },
+        },
+      );
+      const gatewayContext = createGatewayRequestContext(
+        makeContextParams({ pluginApprovalManager: manager }),
+      );
+      const { context } = await createExecution({
+        config: { tools: { exec: { security: "allowlist", ask: "on-miss" } } },
+        nativeTools: ["WebFetch"],
+      });
+      mockCallGatewayTool.mockResolvedValue({
+        id: record.id,
+        decision: "allow-once",
+        authorization: record.authorization,
+      });
+      const consuming = createDeferred();
+      const releaseConsumption = createDeferred();
+      const consume = operatorApprovalStore.consumeOperatorApprovalAllowOnce;
+      const consumeSpy = vi
+        .spyOn(operatorApprovalStore, "consumeOperatorApprovalAllowOnce")
+        .mockImplementationOnce(async (params) => {
+          consuming.resolve();
+          await releaseConsumption.promise;
+          return consume(params);
+        });
+      const permissionReturned = createDeferred<CliBackendToolPermissionResult>();
+      let replay: CliBackendToolPermissionResult | undefined;
+      const run = withGatewayToolCallerIdentity(
+        {
+          agentId: "main",
+          sessionKey: "synthetic-session",
+          gatewayContextResolver: () => gatewayContext,
+        },
+        () =>
+          runPlugin(context, async function* (execution) {
+            const decision = await requestNativeTool(execution, "WebFetch", {
+              resource: "synthetic-resource",
+            });
+            permissionReturned.resolve(decision);
+            if (!revoked && decision.behavior === "allow") {
+              replay = await requestNativeTool(execution, "WebFetch", {
+                resource: "synthetic-resource",
+              });
+            }
+            yield SUCCESS_RESULT;
+          }),
+      );
+      try {
+        // A consumer that returns consent without redemption must fail this
+        // assertion immediately instead of waiting on an unused consumption gate.
+        expect(
+          await Promise.race([
+            consuming.promise.then(() => "consume"),
+            permissionReturned.promise.then(() => "permission"),
+            run.then(() => "finished"),
+          ]),
+        ).toBe("consume");
+        resolverCurrent = !revoked;
+      } finally {
+        releaseConsumption.resolve();
+        await run;
+      }
+      await expect(permissionReturned.promise).resolves.toMatchObject({
+        behavior: revoked ? "deny" : "allow",
+      });
+      expect(manager.getLiveSnapshot(record.id)?.consumedDecision).toBe(
+        revoked ? undefined : "allow-once",
+      );
+      if (!revoked) {
+        expect(replay).toMatchObject({ behavior: "deny" });
+      }
+      expect(consumeSpy).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each([
+    { phase: "hook", decision: "allow-always" },
+    { phase: "decision", decision: "allow-always" },
+    { phase: "decision", decision: "allow-once" },
+  ])(
+    "rechecks strict policy after the $phase await before using $decision consent",
+    async ({ phase, decision }) => {
+      let strict = false;
+      await withRequesterApprovalChannel(
+        async () => {
+          const { context } = await createExecution({
+            nativeTools: ["WebFetch"],
+            config: { tools: { exec: { security: "full", ask: "on-miss" } } },
+          });
+          appendAdmittedRunSource(
+            context.params.admittedRunContext!,
+            createHostChannelTurnSource({
+              actor: {
+                channel: "test",
+                accountId: "default",
+                senderId: "synthetic-requester",
+                actorKind: "human",
+              },
+              message: {
+                messageId: "synthetic-message",
+                conversationId: "synthetic-chat",
+                conversationKind: "direct",
+                eventKind: "message",
+              },
+            }),
+          );
+          mockCallGatewayTool.mockImplementation(async () => {
+            if (phase === "decision") {
+              strict = true;
+            }
+            return { id: "synthetic-approval", decision };
+          });
+          await runPlugin(context, async function* (execution) {
+            if (phase === "hook") {
+              await expect(
+                requestNativeTool(execution, "WebFetch", { url: "https://example.com" }),
+              ).resolves.toMatchObject({ behavior: "allow" });
+              installBeforeToolCallHook(async () => {
+                strict = true;
+              });
+            }
+            await expect(
+              requestNativeTool(execution, "WebFetch", { url: "https://example.com" }),
+            ).resolves.toMatchObject({ behavior: "deny" });
+            yield SUCCESS_RESULT;
+          });
+          expect(mockCallGatewayTool).toHaveBeenCalledTimes(phase === "hook" ? 2 : 1);
+        },
+        { strict: () => strict },
+      );
+    },
+  );
+
   it("denies native tools when caller authority expires during policy or before a retained call", async () => {
     const { context } = await createExecution({ nativeTools: ["WebFetch"] });
     let callerCurrent = true;
@@ -79,13 +303,18 @@ describe("plugin-owned CLI native tool policy", () => {
       params: { url: "https://example.com/rewritten" },
     }));
     const completions: unknown[] = [];
+    const completionSources: unknown[] = [];
+    const afterToolCall: PluginHookHandlerMap["after_tool_call"] = (event, ctx) => {
+      completions.push(event);
+      completionSources.push(ctx.source);
+    };
     initializeGlobalHookRunner(
       createMockPluginRegistry([
         { hookName: "before_tool_call", handler: hook },
         {
           hookName: "after_tool_call",
           matcher: ["web_fetch"],
-          handler: (event) => completions.push(event),
+          handler: (...args) => Reflect.apply(afterToolCall, undefined, args),
         },
       ]),
     );
@@ -153,6 +382,7 @@ describe("plugin-owned CLI native tool policy", () => {
       sessionId: "sdk-session",
       runId: context.params.runId,
       channelId: "chat-1",
+      source: { version: 1, runId: context.params.runId, inputs: [{ origin: "system" }] },
       requester: {
         channel: "telegram",
         accountId: "bot-1",
@@ -171,6 +401,13 @@ describe("plugin-owned CLI native tool policy", () => {
         },
       ]),
     );
+    expect(completionSources).toEqual([
+      expect.objectContaining({
+        version: 1,
+        runId: context.params.runId,
+        inputs: [expect.objectContaining({ origin: "system" })],
+      }),
+    ]);
     expect(mockCallGatewayTool).not.toHaveBeenCalled();
   });
 

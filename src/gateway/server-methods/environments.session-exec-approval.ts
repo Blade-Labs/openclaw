@@ -1,10 +1,16 @@
+import {
+  prepareApprovalExecution,
+  type ApprovalExecution,
+} from "../../agents/approval-execution.js";
 import { getGatewayToolCallerIdentity } from "../../agents/tools/gateway-caller-context.js";
 import { lookupCronRunExecSource } from "../../infra/cron-run-exec-source.js";
 import { sanitizeExecApprovalDisplayTextWithStatus } from "../../infra/exec-approval-text-sanitize.js";
 import { DEFAULT_EXEC_APPROVAL_TIMEOUT_MS } from "../../infra/exec-approvals.js";
 import { createAgentRuntimeIdentity } from "../agent-runtime-identity-token.js";
+import { bindApprovalRequestAuthorization } from "../approval-request-authorization.js";
 import type { WorkerEnvironmentAttachment } from "../worker-environments/session-attachment.js";
-import { bindApprovalRequesterMetadata } from "./approval-shared.js";
+import { createInternalApprovalResponse } from "./approval-internal-response.js";
+import { bindApprovalRequesterMetadata, registerPendingApprovalRecord } from "./approval-shared.js";
 import { handlePendingExecApprovalRequest } from "./exec-approval-request-delivery.js";
 import type { GatewayRequestHandlerOptions } from "./types.js";
 
@@ -17,7 +23,7 @@ export async function approveSessionEnvironmentCommand(params: {
   input?: string;
   assertCurrent: () => void;
   signal?: AbortSignal;
-}): Promise<void> {
+}): Promise<ApprovalExecution> {
   const { options, binding, assertCurrent } = params;
   const manager = options.context.execApprovalManager;
   if (!manager) {
@@ -65,6 +71,12 @@ export async function approveSessionEnvironmentCommand(params: {
     },
     DEFAULT_EXEC_APPROVAL_TIMEOUT_MS,
   );
+  bindApprovalRequestAuthorization({
+    record,
+    cfg: options.context.getRuntimeConfig?.() ?? {},
+    approvalKind: "exec",
+    identity: runtime,
+  });
   bindApprovalRequesterMetadata({ record, client: options.client });
   record.approvalAuthority = assertCurrent;
   record.approvalSignals = params.signal ? [params.signal] : [];
@@ -74,9 +86,23 @@ export async function approveSessionEnvironmentCommand(params: {
   if (runtime?.executionIdentity) {
     record.executionIdentityToken = runtime.executionIdentity;
   }
-  const { decision } = await manager.register(record, DEFAULT_EXEC_APPROVAL_TIMEOUT_MS);
+  const response = createInternalApprovalResponse();
+  const registration = await registerPendingApprovalRecord({
+    manager,
+    record,
+    timeoutMs: DEFAULT_EXEC_APPROVAL_TIMEOUT_MS,
+    respond: response.respond,
+    context: options.context,
+    throwStorageErrors: true,
+  });
+  response.throwIfFailed();
+  if (!registration) {
+    throw new Error("Execution approval registration failed");
+  }
+  const { decision } = registration;
   void decision.catch(() => undefined);
   let approved = false;
+  let execution: ApprovalExecution | undefined;
   await handlePendingExecApprovalRequest({
     manager,
     record,
@@ -87,20 +113,29 @@ export async function approveSessionEnvironmentCommand(params: {
       lookupCronRunExecSource(runtime?.operationalRunInstance.runId)?.agentId === binding.agentId,
     forwardRequest: options.context.forwardExecApprovalRequest,
     getIosPushDelivery: () => options.context.execApprovalIosPushDelivery,
-    respond: (ok, _payload, error) => {
-      if (!ok) {
-        throw new Error(error?.message ?? "Execution approval failed");
-      }
-    },
+    respond: response.respond,
     afterDecision: async (resolved) => {
       assertCurrent();
-      approved = resolved === "allow-once" && (await manager.consumeAllowOnce(record.id));
+      if (resolved === "allow-once") {
+        execution = prepareApprovalExecution({
+          id: record.id,
+          kind: "exec",
+          manager,
+          authorization: record.authorization,
+          consumeAllowOnce: true,
+        });
+        await execution.redeem();
+        approved = true;
+      }
       assertCurrent();
     },
     afterDecisionErrorLabel: "environment exec approvals: approval follow-up failed",
   });
+  response.throwIfFailed();
   assertCurrent();
-  if (!approved) {
+  if (!approved || !execution) {
     throw new Error("Environment command was not approved");
   }
+  execution.assertCurrent();
+  return execution;
 }

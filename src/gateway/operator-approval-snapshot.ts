@@ -8,6 +8,8 @@ export function projectOperatorApprovalSnapshot(
 ): ApprovalSnapshot | null {
   const common = {
     id: record.id,
+    ...(record.authorization ? { authorization: record.authorization } : {}),
+    ...(record.resolvedByActor ? { resolvedByActor: record.resolvedByActor } : {}),
     status: record.status,
     presentation: record.presentation,
     urlPath: `${controlUiBasePath}/approve/${encodeURIComponent(record.id)}`,

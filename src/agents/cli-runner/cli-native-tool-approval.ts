@@ -1,6 +1,7 @@
 import { addTimerTimeoutGraceMs } from "@openclaw/normalization-core/number-coercion";
 import { logVerbose } from "../../globals.js";
 import { racePromiseWithAbortSignal } from "../../infra/abort-signal.js";
+import type { ApprovalWaitDecisionResult } from "../../infra/approval-requester-binding.js";
 import {
   exceedsApprovalTextLimit,
   sanitizeExecApprovalWarningTextWithStatus,
@@ -26,10 +27,17 @@ import {
   type SystemRunMutableFileBinding,
 } from "../../infra/system-run-approval-binding.js";
 import { sliceUtf16Safe, truncateUtf16Safe } from "../../utils.js";
+import { prepareApprovalExecution } from "../approval-execution.js";
 import { callGatewayTool } from "../tools/gateway.js";
 
 type CliNativeToolApprovalOutcome =
-  | { kind: "allow"; grantAlways: boolean; updatedInput?: Record<string, unknown> }
+  | {
+      kind: "allow";
+      grantAlways: boolean;
+      updatedInput?: Record<string, unknown>;
+      redeem?: () => Promise<void>;
+      assertCurrent?: () => void;
+    }
   | {
       kind: "deny";
       reason: "operand-binding" | "policy-oversized" | "user" | "unavailable";
@@ -100,6 +108,7 @@ export async function requestCliNativeToolApproval(params: {
   assertActive?: () => void;
   abortSignal?: AbortSignal;
   ask: ExecAsk;
+  requireRequesterMatch?: boolean;
 }): Promise<CliNativeToolApprovalOutcome> {
   try {
     const timeoutMs = DEFAULT_PLUGIN_APPROVAL_TIMEOUT_MS;
@@ -244,13 +253,14 @@ export async function requestCliNativeToolApproval(params: {
     }
     // Standing grants require a complete description and never cover arbitrary Bash.
     const allowedDecisions =
+      params.requireRequesterMatch ||
       params.ask === "always" ||
       params.toolName === CLI_NATIVE_TOOL_ARBITRARY_EXECUTION_TOOL ||
       description.truncated
         ? ["allow-once", "deny"]
         : ["allow-once", "allow-always", "deny"];
     const requestResult = await racePromiseWithAbortSignal(
-      callGatewayTool<{ id?: string; decision?: unknown }>(
+      callGatewayTool<Partial<ApprovalWaitDecisionResult>>(
         "plugin.approval.request",
         { timeoutMs: gatewayTimeoutMs },
         {
@@ -279,12 +289,13 @@ export async function requestCliNativeToolApproval(params: {
       return { kind: "deny", reason: "unavailable" };
     }
     let decision: unknown;
+    let authorization = requestResult.authorization;
     if (Object.hasOwn(requestResult ?? {}, "decision")) {
       decision = requestResult.decision;
     } else {
       // Abort must cancel the RPC so the Gateway removes the pending prompt.
       const waitResult = await racePromiseWithAbortSignal(
-        callGatewayTool<{ id?: string; decision?: unknown }>(
+        callGatewayTool<Partial<ApprovalWaitDecisionResult>>(
           "plugin.approval.waitDecision",
           { timeoutMs: gatewayTimeoutMs },
           { id },
@@ -293,6 +304,7 @@ export async function requestCliNativeToolApproval(params: {
         params.abortSignal,
       );
       decision = waitResult?.id === id ? waitResult.decision : undefined;
+      authorization = waitResult?.authorization ?? authorization;
     }
     if (params.abortSignal?.aborted) {
       return { kind: "deny", reason: "unavailable" };
@@ -312,7 +324,22 @@ export async function requestCliNativeToolApproval(params: {
       decision === "allow-once" ||
       (decision === "allow-always" && allowedDecisions.includes(decision))
     ) {
-      return { kind: "allow", grantAlways: decision === "allow-always" };
+      const execution = prepareApprovalExecution({
+        id,
+        kind: "plugin",
+        authorization,
+        requireRequesterMatch: params.requireRequesterMatch,
+      });
+      params.abortSignal?.throwIfAborted();
+      params.assertActive?.();
+      execution.assertCurrent();
+      return {
+        kind: "allow",
+        grantAlways: decision === "allow-always",
+        ...(execution.requiresMatch()
+          ? { redeem: execution.redeem, assertCurrent: execution.assertCurrent }
+          : {}),
+      };
     }
     return { kind: "deny", reason: decision === "deny" ? "user" : "unavailable" };
   } catch {

@@ -45,6 +45,7 @@ import {
   getPluginRuntimeGatewayRequestScope,
 } from "../../plugins/runtime/gateway-request-scope.js";
 import { progressCardRefreshRunProjection } from "../../sessions/input-provenance.js";
+import { readUserTurnTranscriptTurnSource } from "../../sessions/user-turn-transcript.js";
 import { isInternalMessageChannel } from "../../utils/message-channel.js";
 import { captureCommandOwnerAssertion } from "../command-owner-authority.js";
 import type { ReplyPayload } from "../types.js";
@@ -89,6 +90,7 @@ import {
   markReplyOperationExecutionStarted,
   retainReplyOperationUntilComplete,
 } from "./reply-run-registry.js";
+import { admittedRunByOperation } from "./reply-run-registry.state.js";
 import { isReplyProfilerEnabled } from "./reply-timing-tracker.js";
 
 async function executeAgentTurnInternalLoop(
@@ -525,6 +527,11 @@ async function executeAgentTurnInternal(
     boundary: "auto-reply.agent-runner",
     operatorAuthority: params.followupRun.operatorAuthority,
     evidence: params.followupRun.channelAdmissionEvidence,
+    turnSource: params.followupRun.userTurnTranscriptRecorder
+      ? (readUserTurnTranscriptTurnSource(params.followupRun.userTurnTranscriptRecorder) ??
+        params.followupRun.turnSource)
+      : params.followupRun.turnSource,
+    sessionKey: params.sessionKey ?? params.followupRun.run.sessionKey,
     assertSourceCurrent:
       params.followupRun.run.senderIsOwner === true
         ? captureCommandOwnerAssertion(params.followupRun.run)
@@ -532,6 +539,9 @@ async function executeAgentTurnInternal(
     onAdmitted: (context) => {
       bindGatewayContextResolver(context, gatewayContextResolver);
       admittedRunContext.current = context;
+      if (params.replyOperation) {
+        admittedRunByOperation.set(params.replyOperation, context);
+      }
       params.followupRun.run.skillLibraryAuthoring?.bind(context);
     },
   });
@@ -557,6 +567,12 @@ async function executeAgentTurnInternal(
       compaction,
     );
   } finally {
+    if (
+      params.replyOperation &&
+      admittedRunByOperation.get(params.replyOperation) === admittedRunContext.current
+    ) {
+      admittedRunByOperation.delete(params.replyOperation);
+    }
     try {
       await deferredLifecycle.complete();
     } finally {

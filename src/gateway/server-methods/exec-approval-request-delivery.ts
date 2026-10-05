@@ -44,7 +44,8 @@ export function handlePendingExecApprovalRequest(
           : undefined,
         iosPush: iosPushRequest
           ? [
-              (isTargetVisible) => iosPushRequest(requestEvent, { isTargetVisible }),
+              (isTargetVisible, shouldSuppress) =>
+                iosPushRequest(requestEvent, { isTargetVisible, shouldSuppress }),
               "exec approvals: iOS push request failed",
             ]
           : undefined,

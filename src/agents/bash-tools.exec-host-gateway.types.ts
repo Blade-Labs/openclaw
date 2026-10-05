@@ -65,6 +65,8 @@ export type ProcessGatewayAllowlistParams = {
 
 /** Gateway allowlist outcome before command execution continues. */
 export type ProcessGatewayAllowlistResult = {
+  approvalRequesterOnly?: true;
+  approvalAuthorization?: import("../infra/approval-requester-binding.js").ApprovalRequestAuthorization;
   execCommandOverride?: string;
   allowWithoutEnforcedCommand?: boolean;
   revalidateBeforeExecution?: () => Promise<AgentToolResult<ExecToolDetails> | undefined>;

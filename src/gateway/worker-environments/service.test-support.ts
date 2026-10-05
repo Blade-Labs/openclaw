@@ -230,6 +230,7 @@ export function createService(
       | "logger"
       | "now"
       | "nodeTunnelManager"
+      | "runSessionEnvironmentCommand"
       | "nodeDesktopCarrier"
       | "nodePortalCarrier"
       | "placementStore"

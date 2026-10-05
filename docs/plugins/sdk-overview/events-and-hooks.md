@@ -21,6 +21,37 @@ each hook result. Part of the [Plugin SDK overview](/plugins/sdk-overview).
 See [Plugin hooks](/plugins/hooks) for examples, common hook names, and guard
 semantics.
 
+## Admitted turn source
+
+`PluginHookAgentContext.source` and `PluginHookToolContext.source` expose an
+optional, read-only `TurnSourceProvenance` snapshot. Tool hooks, including
+`before_tool_call` and `after_tool_call`, receive the source of the admitted
+execution, including queued follow-up inputs. Its fields are:
+
+- `version: 1`, `runId`, `sessionKey`, and `revision` identify the snapshot.
+  `runId` and `sessionKey` can be `null` when unavailable.
+- `completeness` is `complete` or `unavailable`.
+- `inputs` records each `inputId` and `origin`: `user`, `system`,
+  `cross-session`, `cron`, `heartbeat`, `subagent`, or `unknown`.
+- A user input includes an actor tuple (`channel`, `accountId`, `senderId`,
+  `actorKind`) and native message facts (`messageId`, `conversationId`,
+  `conversationKind`, `eventKind`, and optional thread/edit/team fields).
+  Non-user inputs may include `parentRunId`.
+
+These are host-derived facts, not an execution or approval capability. The
+snapshot may be absent on a path that cannot prove its source. Even a complete
+snapshot can contain different actors or a mixture of user and non-user inputs;
+it does not imply a unique human requester. Missing actor/message identity,
+unavailable recovery data, mixed actors, and mixed origins cannot authorize a
+requester-only approval. Do not infer the requester from a session-key grammar,
+routing fields, transcript text, a run-start observer, or the last sender.
+
+Core creates approval authorization from the exact live admitted runtime and
+applies the channel's request policy. Hooks cannot supply or replace that binding
+by copying `source` into approval parameters. See
+[Channel approvals](/plugins/sdk-channel-plugins/approvals#requester-policy-and-authenticated-resolution)
+for delivery and resolution contracts.
+
 ## Hook decision semantics
 
 `before_install` is a plugin-runtime lifecycle hook, not the operator install

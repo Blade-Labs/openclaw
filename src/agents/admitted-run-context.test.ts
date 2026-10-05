@@ -9,6 +9,13 @@ import {
   rotateAgentRunRegistryLifecycleGeneration,
   validateAgentRunDelegatedAuthority,
 } from "../infra/agent-run-registry.js";
+import { classifyApprovalRequester } from "../infra/approval-requester-binding.js";
+import {
+  combineHostTurnSources,
+  createHostChannelTurnSource,
+  createHostNonUserTurnSource,
+  projectHostTurnSource,
+} from "../infra/host-turn-source.js";
 import {
   bindGatewayContextResolver,
   clearGatewayContextResolver,
@@ -16,6 +23,9 @@ import {
 } from "../plugins/runtime/gateway-context-binding.js";
 import {
   closeAdmittedRunDelegatedAuthority,
+  captureAdmittedRunSource,
+  lookupAdmittedRunSource,
+  appendAdmittedRunSource,
   createExecutionIdentityRecoveryAdmission,
   createOperationalRunInstanceRef,
   createAdmittedRunOperatorAuthority,
@@ -47,6 +57,119 @@ afterEach(() => {
 });
 
 describe("prepared run admission", () => {
+  it("binds immutable source to the exact admitted instance across fallback and closure", async () => {
+    const source = createHostChannelTurnSource({
+      actor: {
+        channel: "test",
+        accountId: "default",
+        senderId: "synthetic-sender",
+        actorKind: "human",
+      },
+      message: {
+        messageId: "synthetic-message",
+        conversationId: "synthetic-dm",
+        conversationKind: "direct",
+        eventKind: "message",
+      },
+    });
+    const prepared = prepareAgentRunAdmission({
+      cfg: {},
+      facts,
+      operationalRunInstance: createOperationalRunInstanceRef(facts.runId),
+      sessionKey: "synthetic-session",
+      turnSource: source,
+    });
+    try {
+      const context = await prepared.admit("embedded");
+      const authority = getAdmittedRunDelegatedAuthority(context);
+      expect(authority).toBeDefined();
+      if (!authority) {
+        throw new Error("missing fixture authority");
+      }
+      const snapshot = lookupAdmittedRunSource(authority, context.operationalRunInstance);
+      expect(snapshot?.requesterBinding).toMatchObject({
+        state: "bound",
+        senderId: "synthetic-sender",
+      });
+      expect(
+        lookupAdmittedRunSource(authority, { ...context.operationalRunInstance }),
+      ).toBeUndefined();
+      expect(await prepared.admit("plugin-harness")).toBe(context);
+      appendAdmittedRunSource(context, createHostNonUserTurnSource("cross-session"));
+      expect(captureAdmittedRunSource(context)).toMatchObject({
+        source: { revision: 1 },
+        requesterBinding: { state: "mixed", reason: "mixed-origins" },
+      });
+      expect(snapshot?.source.revision).toBe(0);
+      expect(() => snapshot?.assertCurrent()).toThrow("no longer current");
+      prepared.close();
+      expect(lookupAdmittedRunSource(authority, context.operationalRunInstance)).toBeUndefined();
+    } finally {
+      prepared.close();
+    }
+  });
+
+  it("does not admit a forged structural source capability", async () => {
+    const prepared = prepareAgentRunAdmission({
+      cfg: {},
+      facts,
+      operationalRunInstance: createOperationalRunInstanceRef(facts.runId),
+      sessionKey: "synthetic-session",
+      turnSource: { kind: "host-turn-source" },
+    });
+    try {
+      expect(
+        captureAdmittedRunSource(await prepared.admit("embedded")).requesterBinding.state,
+      ).toBe("unavailable");
+    } finally {
+      prepared.close();
+    }
+  });
+
+  it.each(["cron", "heartbeat", "cross-session", "subagent", "system"] as const)(
+    "keeps %s non-user even when delivery has a sender",
+    (origin) => {
+      expect(
+        classifyApprovalRequester(
+          projectHostTurnSource(
+            createHostNonUserTurnSource(origin),
+            "synthetic-run",
+            "synthetic-session",
+          ),
+        ),
+      ).toEqual({ state: "non-user", origins: [origin] });
+    },
+  );
+
+  it("retains separate edit receipts while deduplicating copies of the same admitted input", () => {
+    const actor = {
+      channel: "test",
+      accountId: "default",
+      senderId: "synthetic-sender",
+      actorKind: "human",
+    } as const;
+    const message = {
+      messageId: "synthetic-message",
+      conversationId: "synthetic-dm",
+      conversationKind: "direct",
+      eventKind: "message",
+    } as const;
+    const original = createHostChannelTurnSource({ actor, message });
+    const edit = createHostChannelTurnSource({
+      actor,
+      message: { ...message, eventKind: "edit", edited: true },
+    });
+    const source = projectHostTurnSource(
+      combineHostTurnSources([original, original, edit]),
+      "synthetic-run",
+      "synthetic-session",
+    );
+    expect(source.inputs).toHaveLength(2);
+    expect(classifyApprovalRequester(source)).toMatchObject({
+      state: "bound",
+      sources: [{ eventKind: "message" }, { eventKind: "edit" }],
+    });
+  });
   it.each([false, true])(
     "owns real fixture authority across module resets and runner settlement (reject=%s)",
     async (reject) => {

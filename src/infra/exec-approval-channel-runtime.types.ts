@@ -21,6 +21,8 @@ export type ExecApprovalChannelRuntimeAdapter<
   TRequest extends ApprovalRequestEvent = ExecApprovalRequest,
   TResolved extends ApprovalResolvedEvent = ExecApprovalResolved,
 > = {
+  channel?: string;
+  accountId?: string | null;
   label: string;
   clientDisplayName: string;
   cfg: OpenClawConfig;

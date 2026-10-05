@@ -96,6 +96,33 @@ describe("gateway tool runtime identity", () => {
     }
   });
 
+  it.each([
+    { method: "exec.approval.waitDecision", flag: "consumeAllowOnce" },
+    { method: "exec.approval.waitDecision", flag: "validateConsumed" },
+    { method: "plugin.approval.waitDecision", flag: "consumeAllowOnce" },
+    { method: "plugin.approval.waitDecision", flag: "validateConsumed" },
+  ])("requires signed worker authority for $method $flag", async ({ method, flag }) => {
+    const params = { id: "synthetic-approval", [flag]: true };
+    await expect(callGatewayTool(method, {}, params)).rejects.toThrow(
+      "trusted agent runtime identity required for this gateway call",
+    );
+    expect(mocks.callGateway).not.toHaveBeenCalled();
+
+    mocks.callGateway.mockResolvedValueOnce({ decision: "allow-once", consumed: true });
+    await withGatewayToolCallerIdentity(
+      {
+        agentId: "main",
+        sessionKey: "agent:main:synthetic-worker",
+        signedAgentRuntimeIdentityToken: "synthetic-worker-identity-token",
+      },
+      () => callGatewayTool(method, {}, params),
+    );
+    const call = capturedGatewayCall();
+    expect(call.method).toBe(method);
+    expect(call.params).toEqual(params);
+    expect(call.agentRuntimeIdentityToken).toBe("synthetic-worker-identity-token");
+  });
+
   it("omits runtime identity outside trusted agent context", async () => {
     mocks.callGateway.mockResolvedValueOnce({ id: "job-1" });
 

@@ -55,10 +55,9 @@ export type AppServerApprovalOutcome =
 
 export type PluginApprovalOutcome = AppServerApprovalOutcome | "timed-out";
 
-type ApprovalRequestResult = {
-  id?: string;
-  decision?: ExecApprovalDecision | null;
-};
+type ApprovalRequestResult = NonNullable<
+  Awaited<ReturnType<AgentHarnessHostCapabilities["requestApproval"]>>
+>;
 
 /** Starts a two-phase plugin approval request through the OpenClaw gateway. */
 export async function requestPluginApproval(params: {
@@ -199,11 +198,30 @@ export async function requestPluginApprovalOutcome(params: {
       return "timed-out";
     }
     const decision = approvalResult?.decision;
-    return mapExecDecisionToOutcome(
+    const outcome = mapExecDecisionToOutcome(
       decision === "allow-always" && params.allowedDecisions?.includes("allow-always") === false
         ? "allow-once"
         : decision,
     );
+    if (outcome === "approved-once" || outcome === "approved-session") {
+      const strict =
+        params.hostCapabilities.requiresRequesterMatch?.() === true ||
+        requestResult.authorization?.policy.requireResolverMatch === true ||
+        approvalResult?.authorization?.policy.requireResolverMatch === true;
+      if (strict && !approvalResult?.approvalExecutions?.length) {
+        return "denied";
+      }
+      for (const execution of approvalResult?.approvalExecutions ?? []) {
+        await execution.redeem();
+        await execution.revalidate();
+      }
+      params.signal?.throwIfAborted();
+      params.hostCapabilities.assertActive();
+      for (const execution of approvalResult?.approvalExecutions ?? []) {
+        execution.assertCurrent();
+      }
+    }
+    return outcome;
   } catch {
     return params.signal?.aborted ? "cancelled" : "denied";
   }

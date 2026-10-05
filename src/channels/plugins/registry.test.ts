@@ -135,6 +135,7 @@ describe("listChannelPlugins", () => {
         resolveChannelRuntime,
       });
       expect(getChannelPlugin("fallback")).toBe(scoped);
+      expect(getLoadedChannelPlugin("fallback")).toBe(scoped);
     });
     expect(getChannelPlugin("fallback")).toBe(root);
   });
@@ -147,6 +148,7 @@ describe("listChannelPlugins", () => {
 
     withPluginRuntimeRegistryScope(createEmptyPluginRegistry(), () => {
       expect(getChannelPlugin("root-only")).toBe(root);
+      expect(getLoadedChannelPlugin("root-only")).toBeUndefined();
       expect(resolveChannelPluginRegistration("fallback")?.origin).toBe("bundled");
     });
   });

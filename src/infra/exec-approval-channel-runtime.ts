@@ -323,11 +323,17 @@ export function createExecApprovalChannelRuntime<
           gatewayRuntime = configuredGatewayRuntime;
           // Subscribe before replay so a request created during the list calls is not lost.
           unsubscribeGatewayRuntime = gatewayRuntime.subscribe({
+            channel: adapter.channel,
+            accountId: adapter.accountId,
+            deliverRequester: async (request) => {
+              await handleRequested(request as TRequest, { ignoreIfInactive: true });
+              return pending.has(request.id);
+            },
             eventKinds,
-            // SAFETY: Gateway-owned subscribers publish the canonical normalized request union.
+            // SAFETY: Handled event kinds select the adapter's canonical request union.
             shouldHandle: (request) =>
               shouldKeepRunning() &&
-              adapter.shouldHandle(request as NormalizedApprovalRequest<TRequest>),
+              adapter.shouldHandle(normalizeApprovalRequest(request as TRequest)),
             onRequested: (request) => {
               spawn(
                 "error handling approval request",

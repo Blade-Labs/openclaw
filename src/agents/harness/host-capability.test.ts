@@ -304,18 +304,13 @@ describe("agent harness host capability", () => {
     expect(mockRunBefore).toHaveBeenCalledWith(
       expect.objectContaining({
         approvalMode: "request",
-        ctx: expect.objectContaining({ agentId: "main", runId: "run-1" }),
+        ctx: expect.objectContaining({
+          agentId: "main",
+          runId: "run-1",
+        }),
       }),
     );
 
-    await host.capabilities.runBeforeToolCall({
-      toolName: "exec",
-      params: { command: "true" },
-      approvalMode: "defer",
-    });
-    expect(mockRunBefore).toHaveBeenLastCalledWith(
-      expect.objectContaining({ approvalMode: "defer" }),
-    );
     expect(() => host.capabilities.assertActive()).not.toThrow();
 
     host.close();
@@ -753,7 +748,7 @@ describe("agent harness host capability", () => {
 
     await expect(
       host.capabilities.waitForApproval({ approvalId: "approval-1", timeoutMs: 1_000 }),
-    ).resolves.toEqual({ decision: "deny", terminalReason: "timeout" });
+    ).resolves.toEqual({ id: "approval-1", decision: "deny", terminalReason: "timeout" });
   });
 
   it("carries native-turn closure through policy, approval registration, and decision waits", async () => {

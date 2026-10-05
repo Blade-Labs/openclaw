@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { captureAdmittedRunSource } from "../../agents/admitted-run-context.js";
 import { withTestRunAdmission } from "../../agents/admitted-run-context.test-support.js";
 import { buildPreparedCliRunContext } from "../../agents/cli-runner.test-helpers.js";
 import { buildCliRunResult } from "../../agents/cli-runner/cli-run-settlement.js";
@@ -10,6 +11,11 @@ import { GENERIC_EXTERNAL_RUN_FAILURE_TEXT } from "../../agents/failover/user-co
 import { installSessionPlacementAdmissionProvider } from "../../agents/session-placement-admission.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import { loadSessionEntry, replaceSessionEntry } from "../../config/sessions/session-accessor.js";
+import { createHostNonUserTurnSource } from "../../infra/host-turn-source.js";
+import {
+  bindUserTurnTranscriptTurnSource,
+  createUserTurnTranscriptRecorder,
+} from "../../sessions/user-turn-transcript.js";
 import {
   setupAgentRunnerExecutionTestState,
   getExecuteAgentTurnForTest,
@@ -32,6 +38,7 @@ function rejectUnexpectedCompactionSuccessor(): never {
 describe("executeAgentTurn: CLI admission", () => {
   it.each([
     "ordinary",
+    "source-recovered",
     "heartbeat",
     "preserved",
     "revised",
@@ -58,6 +65,24 @@ describe("executeAgentTurn: CLI admission", () => {
       },
     );
     const followupRun = createFollowupRun();
+    const recorder =
+      kind === "source-recovered"
+        ? createUserTurnTranscriptRecorder({
+            target: { agentId: "main", sessionKey, sessionId: "session", storePath },
+            input: {
+              text: "synthetic pending input",
+              timestamp: 1,
+              idempotencyKey: "synthetic-source:user",
+            },
+          })
+        : undefined;
+    if (recorder) {
+      followupRun.userTurnTranscriptRecorder = recorder;
+      bindUserTurnTranscriptTurnSource(recorder, createHostNonUserTurnSource("cron"));
+      expect(
+        await recorder.stageApproved?.({ runId: "synthetic-source", assertCurrent: () => {} }),
+      ).toBe(true);
+    }
     followupRun.run.provider = "claude-cli";
     followupRun.run.model = "claude-sonnet-4-6";
     if (kind === "preserved") {
@@ -97,20 +122,31 @@ describe("executeAgentTurn: CLI admission", () => {
         agentMeta: { sessionId: settledBinding.sessionId, cliSessionBinding: settledBinding },
       },
     };
-    state.runCliAgentMock.mockResolvedValueOnce(
-      rejected
-        ? buildCliRunResult({
-            context: buildPreparedCliRunContext(),
-            output: { text: GENERIC_EXTERNAL_RUN_FAILURE_TEXT },
-            effectiveCliSessionId: settledBinding.sessionId,
-            bindingFlushOk: kind !== "rejected-clear",
-            usedHistoryPrompt: false,
-            userTurnHandled: true,
-            sessionBindingDisabled: false,
-            preparedContextAgentMeta: {},
-          })
-        : candidateResult,
-    );
+    const cliResult = rejected
+      ? buildCliRunResult({
+          context: buildPreparedCliRunContext(),
+          output: { text: GENERIC_EXTERNAL_RUN_FAILURE_TEXT },
+          effectiveCliSessionId: settledBinding.sessionId,
+          bindingFlushOk: kind !== "rejected-clear",
+          usedHistoryPrompt: false,
+          userTurnHandled: true,
+          sessionBindingDisabled: false,
+          preparedContextAgentMeta: {},
+        })
+      : candidateResult;
+    state.runCliAgentMock.mockImplementationOnce(async (params: RunCliAgentParams) => {
+      if (recorder) {
+        const admitted = await params.preparedRunAdmission?.admit("cli");
+        expect(admitted).toBeDefined();
+        if (!admitted) {
+          throw new Error("missing fixture admission");
+        }
+        expect(captureAdmittedRunSource(admitted).source.inputs).toMatchObject([
+          { origin: "cron" },
+        ]);
+      }
+      return cliResult;
+    });
     state.runEmbeddedAgentMock.mockResolvedValueOnce({
       payloads: [{ text: "fallback done" }],
       meta: {},
@@ -169,6 +205,7 @@ describe("executeAgentTurn: CLI admission", () => {
             : settledBinding,
       );
     } finally {
+      recorder?.finishPendingInput?.("interrupted");
       uninstall();
     }
   });

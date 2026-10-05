@@ -1,11 +1,13 @@
 import type { Server } from "node:http";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import type { TurnSourceProvenance } from "../../infra/turn-source-provenance.js";
 import type { PluginHookToolRequesterContext } from "../../plugins/hook-types.js";
 import type {
   BeforeToolCallFailureDisposition,
   DeferredPluginToolApproval,
   HookContext,
 } from "../agent-tools.before-tool-call.js";
+import type { ApprovalExecution } from "../approval-execution.js";
 import type { CodexMcpServersConfig } from "../codex-mcp-config.types.js";
 import type { AgentHarnessHostCapabilities } from "./host-capability-types.js";
 import type { retainBeforeToolCallForNativeHookRelay } from "./host-private-capabilities.js";
@@ -89,7 +91,10 @@ export type NativeHookRelayRegistration = {
   /** Exact host policy capability for authority-bearing native callbacks. */
   runBeforeToolCall?: AgentHarnessHostCapabilities["runBeforeToolCall"];
   /** Foreground-only approval authority supplied by the admitted bundled host. */
-  approvalHost?: Pick<AgentHarnessHostCapabilities, "requestApproval" | "waitForApproval">;
+  approvalHost?: Pick<
+    AgentHarnessHostCapabilities,
+    "requestApproval" | "waitForApproval" | "readSource" | "requiresRequesterMatch"
+  >;
   /** Revalidates the exact admitted owner after authority-bearing awaits. */
   assertActive?: AgentHarnessHostCapabilities["assertActive"];
   onPreToolUseFailure?: (failure: {
@@ -203,7 +208,8 @@ export type NativeHookRelayPermissionApprovalResult =
   | NativeHookRelayPermissionDecision
   | "allow-always"
   | "timed-out"
-  | "defer";
+  | "defer"
+  | { decision: "allow"; execution: ApprovalExecution };
 
 export type ActiveNativeHookRelayRegistration = NativeHookRelayRegistration & {
   generation: string;
@@ -255,12 +261,14 @@ export type NativeHookRelayPreToolUseApproval = {
   deferredApproval: DeferredPluginToolApproval;
   originalParamsFingerprint: string;
   resolutionPromise?: Promise<NativeHookRelayDeferredApprovalOutcome>;
+  executionClaimed?: boolean;
 };
 
 export type NativeHookRelayDeferredApprovalOutcome =
   | {
       handled: true;
       outcome: "approved-once";
+      approvalExecutions?: ApprovalExecution[];
     }
   | {
       handled: true;
@@ -322,6 +330,8 @@ export type RelayLifetime = {
   foregroundOpen: boolean;
   foregroundToken: symbol;
   policyReady: Promise<void>;
+  /** Pending/completion facts survive foreground detach only with this retained owner. */
+  toolSources: Map<string, TurnSourceProvenance>;
   retained?: ReturnType<typeof retainBeforeToolCallForNativeHookRelay>;
   retention?: NativeHookRelayRetention;
   executionAdmission?: NativeHookRelayExecutionAdmission;

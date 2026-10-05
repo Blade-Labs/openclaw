@@ -6,6 +6,7 @@ import {
   runOpenClawStateWriteTransaction,
   type OpenClawStateDatabaseOptions,
 } from "../state/openclaw-state-db.js";
+import { assertApprovalRequesterPolicy } from "./approval-requester-policy.js";
 import { mintCronStandingGrantLocked } from "./operator-approval-standing-grants.js";
 import {
   OPERATOR_APPROVAL_TERMINAL_RETENTION_MS,
@@ -59,6 +60,12 @@ export function resolveOperatorApprovalInDatabase(
       denyCorruptPendingRow({ database, id, nowMs, createdAtMs: row.created_at_ms });
       return { outcome: "corrupt" };
     }
+    assertApprovalRequesterPolicy(
+      record.authorization,
+      params.resolver.actor,
+      params.decision,
+      params.requireResolverMatch,
+    );
     if (record.status !== "pending") {
       return {
         outcome: "already-resolved",
@@ -89,6 +96,7 @@ export function resolveOperatorApprovalInDatabase(
         resolved_at_ms: auditTimestampMs,
         resolver_kind: params.resolver.kind,
         resolver_id: resolverId,
+        resolver_actor_json: params.resolver.actor ? JSON.stringify(params.resolver.actor) : null,
         updated_at_ms: auditTimestampMs,
       })
       .where("approval_id", "=", id)
@@ -163,6 +171,15 @@ export function forceDenyOperatorApprovalInDatabase(
     if (!matchesExpectedApprovalOwner({ row, expectedKind: params.expectedKind, runtimeEpoch })) {
       return { outcome: "not-found" };
     }
+    const authorizationRecord = decodeOperatorApprovalRow(row);
+    if (params.reason === "malformed-verdict" || params.reason === "user") {
+      assertApprovalRequesterPolicy(
+        authorizationRecord?.authorization,
+        params.resolver.actor,
+        "deny",
+        params.requireResolverMatch,
+      );
+    }
     if (row.status === "pending" && row.expires_at_ms <= nowMs) {
       const expiredRow = expirePendingRow({
         database,
@@ -194,10 +211,16 @@ export function forceDenyOperatorApprovalInDatabase(
       .set({
         status: params.status ?? "denied",
         decision: "deny",
-        terminal_reason: params.reason,
+        terminal_reason: params.reason === "requester-unavailable" ? "no-route" : params.reason,
         resolved_at_ms: auditTimestampMs,
         resolver_kind: params.resolver.kind,
         resolver_id: normalizeNullableString(params.resolver.id),
+        resolver_actor_json:
+          params.reason === "requester-unavailable"
+            ? JSON.stringify({ kind: "system", reason: "requester-unavailable" })
+            : params.resolver.actor
+              ? JSON.stringify(params.resolver.actor)
+              : null,
         updated_at_ms: auditTimestampMs,
       })
       .where("approval_id", "=", id)
@@ -377,6 +400,12 @@ export function consumeOperatorApprovalAllowOnceInDatabase(
     if (record.status !== "allowed" || record.decision !== "allow-once") {
       return { outcome: "not-allow-once", record };
     }
+    assertApprovalRequesterPolicy(
+      record.authorization,
+      record.resolvedByActor,
+      "allow-once",
+      params.requireResolverMatch,
+    );
     if (record.consumedAtMs !== null) {
       return { outcome: "already-consumed", record };
     }

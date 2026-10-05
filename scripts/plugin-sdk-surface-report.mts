@@ -400,7 +400,8 @@ export function readPluginSdkSurfaceBudgets(env: NodeJS.ProcessEnv = process.env
       // +35: shared Code Mode executor/guest protocol and source/output implementation helpers.
       // +3: approved shared preview lifecycle factory and delivery/lifecycle types.
       // +1: approved canonical resolveConfigPath export for pre-config native browser admission.
-      4569,
+      // +6: approval requester provenance contract (source provenance, binding, resolving actor) for tool hooks and approvals.
+      4575,
       env,
     ),
     publicFunctionExports: readPluginSdkSurfaceBudgetEnv(

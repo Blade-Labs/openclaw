@@ -13,6 +13,7 @@ import {
   openOpenClawStateDatabase,
   type OpenClawStateDatabaseOptions,
 } from "../state/openclaw-state-db.js";
+import { requesterAuthorization } from "./approval-requester.test-support.js";
 import { ExecApprovalManager, type ExecApprovalRecord } from "./exec-approval-manager.js";
 import { installTestApprovalClock } from "./exec-approval-manager.test-support.js";
 import { createOperatorApprovalSessionEventRuntime } from "./operator-approval-session-events.js";
@@ -199,6 +200,77 @@ describe("operator approval session events", () => {
       fs.rmSync(dir, { force: true, recursive: true });
     }
   });
+
+  it("suppresses replay when the private account policy strengthens without serialized inputs", async () => {
+    const databaseOptions = createDatabaseOptions();
+    const pending = await insertPendingApproval({
+      databaseOptions,
+      id: "synthetic-replay",
+      audienceSessionKeys: [SOURCE_SESSION_KEY],
+      createdAtMs: 1_000,
+      expiresAtMs: 10_000,
+    });
+    const client = createClient({ connId: "synthetic-reviewer", scopes: ["operator.admin"] });
+    const { runtime } = createRuntime({
+      clients: [client],
+      databaseOptions,
+      now: () => 2_000,
+      getLiveManager: () => ({
+        runtimeEpoch: pending.runtimeEpoch,
+        getLiveSnapshot: () => ({
+          id: pending.id,
+          request: {},
+          createdAtMs: pending.createdAtMs,
+          expiresAtMs: pending.expiresAtMs,
+          requiresRequesterMatch: () => true,
+        }),
+      }),
+    });
+    expect((await runtime.replay(SOURCE_SESSION_KEY, client)).replay.approvals).toEqual([]);
+  });
+
+  it("suppresses a requester-unavailable terminal event without local runtime custody", () => {
+    const client = createClient({ connId: "synthetic-reviewer", scopes: ["operator.admin"] });
+    const { runtime, subscribers, broadcastToConnIds } = createRuntime({ clients: [client] });
+    subscribers.subscribe(client.connId!, SOURCE_SESSION_KEY, { includeApprovals: true });
+    const terminal = {
+      ...createTerminalRecord(createPendingRecord()),
+      terminalReason: "requester-unavailable" as const,
+    };
+    runtime.publish({ phase: "terminal", record: terminal });
+    expect(broadcastToConnIds).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])(
+    "suppresses strict pending and terminal session and global attention notifications (frozen=%s)",
+    (frozen) => {
+      const client = createClient({ connId: "synthetic-admin", scopes: ["operator.admin"] });
+      const pending = { ...createPendingRecord(), authorization: requesterAuthorization(frozen) };
+      const { runtime, subscribers, broadcastToConnIds } = createRuntime({
+        clients: [client],
+        getLiveManager: () =>
+          frozen
+            ? undefined
+            : {
+                runtimeEpoch: pending.runtimeEpoch,
+                getLiveSnapshot: () => ({
+                  id: pending.id,
+                  request: {},
+                  createdAtMs: pending.createdAtMs,
+                  expiresAtMs: pending.expiresAtMs,
+                  requiresRequesterMatch: () => true,
+                }),
+              },
+      });
+      subscribers.subscribe(client.connId!, SOURCE_SESSION_KEY, { includeApprovals: true });
+      const attention = vi.fn();
+      subscriptions.push(onAgentEvent(attention));
+      runtime.publish({ phase: "pending", record: pending });
+      runtime.publish({ phase: "terminal", record: createTerminalRecord(pending) });
+      expect(broadcastToConnIds).not.toHaveBeenCalled();
+      expect(attention).not.toHaveBeenCalled();
+    },
+  );
 
   it("targets exact opted-in source and ancestor audiences with reviewer authorization", () => {
     const clients = [

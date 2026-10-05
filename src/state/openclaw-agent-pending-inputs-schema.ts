@@ -51,6 +51,7 @@ export function ensureSessionPendingInputsSchema(db: DatabaseSync): void {
       ),
     );
     ensureColumn(db, SESSION_PENDING_INPUTS_TABLE, "consumed_event_id TEXT");
+    ensureColumn(db, SESSION_PENDING_INPUTS_TABLE, "source_provenance_json TEXT");
   });
   absentDatabases = new WeakSet();
   if (!nested) {
@@ -97,7 +98,11 @@ export function hasPendingInputConsumptionColumn(db: DatabaseSync): boolean {
     return true;
   }
   const present = tableHasColumn(db, SESSION_PENDING_INPUTS_TABLE, "consumed_event_id");
-  if (present && !db.isTransaction) {
+  if (
+    present &&
+    !db.isTransaction &&
+    tableHasColumn(db, SESSION_PENDING_INPUTS_TABLE, "source_provenance_json")
+  ) {
     completeDatabases.add(db);
   }
   return present;

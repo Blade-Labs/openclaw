@@ -4,6 +4,7 @@ import type { AgentEvent } from "openclaw/plugin-sdk/agent-core";
 import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
+import { requesterAuthorization } from "../gateway/approval-requester.test-support.js";
 import {
   onAgentEvent as registerAgentEventListener,
   resetAgentEventsForTest,
@@ -2927,6 +2928,66 @@ describe("handleToolExecutionEnd timeout metadata", () => {
 });
 
 describe("handleToolExecutionEnd exec approval prompts", () => {
+  it.each([
+    { strict: false, latched: false },
+    { strict: true, latched: false },
+    { strict: false, latched: true },
+  ])(
+    "restricts approval result publication (strict=$strict, latched=$latched)",
+    async ({ strict, latched }) => {
+      const { ctx, onAgentEvent } = createTestContext();
+      const onToolResult = vi.fn();
+      ctx.params.onToolResult = onToolResult;
+      const events: Array<{ stream: string; data: Record<string, unknown> }> = [];
+      const unsubscribe = registerAgentEventListener((event) => events.push(event));
+      try {
+        await endTool(ctx, {
+          toolName: "exec",
+          toolCallId: "synthetic-private-approval",
+          isError: false,
+          result: {
+            content: [{ type: "text", text: "Approval required: synthetic command" }],
+            details: {
+              status: "approval-pending",
+              approvalId: "synthetic-approval-id",
+              approvalSlug: "synthetic",
+              expiresAtMs: 1_800_000_000_000,
+              host: "gateway",
+              command: "echo synthetic",
+              approvalAuthorization: requesterAuthorization(strict),
+              ...(latched ? { approvalRequesterOnly: true } : {}),
+            },
+          },
+        });
+      } finally {
+        unsubscribe();
+      }
+      if (strict || latched) {
+        expect(
+          events.filter((event) =>
+            ["tool", "item", "approval", "command_output"].includes(event.stream),
+          ),
+        ).toEqual([]);
+        expect(
+          onAgentEvent.mock.calls.filter(([event]) =>
+            ["tool", "item", "approval", "command_output"].includes(event.stream),
+          ),
+        ).toEqual([]);
+        expect(onToolResult).not.toHaveBeenCalled();
+      } else {
+        expect(events).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              stream: "approval",
+              data: expect.objectContaining({ approvalId: "synthetic-approval-id" }),
+            }),
+          ]),
+        );
+        expect(onToolResult).toHaveBeenCalledOnce();
+      }
+    },
+  );
+
   it("emits a deterministic approval payload and marks assistant output suppressed", async () => {
     const { ctx } = createTestContext();
     const onToolResult = vi.fn();

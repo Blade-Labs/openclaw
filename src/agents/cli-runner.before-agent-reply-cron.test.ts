@@ -206,6 +206,26 @@ afterEach(() => {
 });
 
 describe("runCliAgent before_agent_reply seam", () => {
+  it.each(["internal_system", "inter_session"] as const)(
+    "preserves %s input provenance at the CLI run hook boundary",
+    async (kind) => {
+      hasHooksMock.mockImplementation((hookName) => hookName === "before_agent_run");
+      runBeforeAgentRunMock.mockResolvedValueOnce({
+        decision: { outcome: "block", reason: "synthetic hook stop" },
+      });
+      const inputProvenance = { kind, sourceTool: "synthetic-handoff" };
+
+      await runCliAgent({ ...baseRunParams, trigger: "user", inputProvenance });
+
+      expect(runBeforeAgentRunMock).toHaveBeenCalledOnce();
+      expect(runBeforeAgentRunMock.mock.calls[0]?.[1]).toMatchObject({
+        inputProvenance,
+        source: { completeness: "unavailable", inputs: [] },
+      });
+      expect(executePreparedCliRunMock).not.toHaveBeenCalled();
+    },
+  );
+
   it("waits for execution-start work and rechecks cancellation before preparing the runtime", async () => {
     const entered = createDeferred();
     const release = createDeferred();

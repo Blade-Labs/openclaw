@@ -17,7 +17,10 @@ export const listChannelPlugins = (): ChannelPlugin[] => listLoadedChannelPlugin
  * Returns a loaded channel plugin without falling back to bundled metadata.
  */
 export function getLoadedChannelPlugin(id: ChannelId): ChannelPlugin | undefined {
-  return getLoadedChannelPluginById(id);
+  const registry = getPluginRuntimeGatewayRequestScope()?.pluginRegistry;
+  return registry
+    ? getLoadedChannelPluginEntryById(id, registry)?.plugin
+    : getLoadedChannelPluginById(id);
 }
 
 /**

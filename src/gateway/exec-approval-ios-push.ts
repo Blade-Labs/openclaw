@@ -86,6 +86,7 @@ type ApprovalPushDriver<TRequest extends ApprovalRequestLike> = {
     target: DeliveryTarget;
     plan: DeliveryPlan;
     gatewayDeviceId: string;
+    assertCurrent?: () => void;
   }) => Promise<ApprovalPushSendResult>;
   sendResolved: (params: {
     approvalId: string;
@@ -262,6 +263,7 @@ async function sendRequestedPushes<TRequest extends ApprovalRequestLike>(params:
   plan: DeliveryPlan;
   log: GatewayLikeLogger;
   driver: ApprovalPushDriver<TRequest>;
+  shouldSuppress?: () => boolean;
 }): Promise<{ attempted: number; delivered: number }> {
   const gatewayDeviceId = loadOrCreateProcessDeviceIdentity().deviceId;
   return await sendApprovalPushes({
@@ -271,12 +273,22 @@ async function sendRequestedPushes<TRequest extends ApprovalRequestLike>(params:
     approvalKind: params.driver.approvalKind,
     label: "request",
     logThrown: true,
+    shouldSuppress: params.shouldSuppress,
     send: async ({ target, plan }) =>
       await params.driver.sendRequested({
         request: params.request,
         target,
         plan,
         gatewayDeviceId,
+        ...(params.shouldSuppress
+          ? {
+              assertCurrent: () => {
+                if (params.shouldSuppress?.()) {
+                  throw new Error("Approval push suppressed by requester-only policy");
+                }
+              },
+            }
+          : {}),
       }),
   });
 }
@@ -289,11 +301,15 @@ async function sendApprovalPushes(params: {
   label: "request" | "cleanup";
   logThrown: boolean;
   send: ApprovalPushSender;
+  shouldSuppress?: () => boolean;
 }): Promise<{ attempted: number; delivered: number }> {
   // Stale registrations are cleared on both direct and relay failures so future
   // approval prompts do not keep targeting dead APNs device tokens.
   const results = await Promise.allSettled(
     params.plan.targets.map(async (target) => {
+      if (params.shouldSuppress?.()) {
+        return { nodeId: target.nodeId, ok: false, skipped: true };
+      }
       const result = await params.send({
         target,
         approvalId: params.approvalId,
@@ -309,7 +325,7 @@ async function sendApprovalPushes(params: {
           `${params.approvalKind} approvals: iOS ${params.label} push failed node=${target.nodeId} status=${result.status} reason=${result.reason ?? "unknown"}`,
         );
       }
-      return { nodeId: target.nodeId, ok: result.ok };
+      return { nodeId: target.nodeId, ok: result.ok, skipped: false };
     }),
   );
   for (const result of results) {
@@ -321,7 +337,8 @@ async function sendApprovalPushes(params: {
     }
   }
   return {
-    attempted: params.plan.targets.length,
+    attempted: results.filter((result) => result.status === "rejected" || !result.value.skipped)
+      .length,
     delivered: results.filter((result) => result.status === "fulfilled" && result.value.ok).length,
   };
 }
@@ -392,7 +409,10 @@ function createApprovalIosPushDelivery<TRequest extends ApprovalRequestLike>(par
     /** Sends the initial approval notification to visible iOS operator devices. */
     async handleRequested(
       request: TRequest,
-      opts?: { isTargetVisible?: (target: ApprovalPushTarget) => boolean },
+      opts?: {
+        isTargetVisible?: (target: ApprovalPushTarget) => boolean;
+        shouldSuppress?: () => boolean;
+      },
     ): Promise<boolean> {
       const deliveryStatePromise = (async (): Promise<ApprovalDeliveryState | null> => {
         const plan = await resolveDeliveryPlan({
@@ -401,7 +421,7 @@ function createApprovalIosPushDelivery<TRequest extends ApprovalRequestLike>(par
           isTargetVisible: opts?.isTargetVisible,
           log: params.log,
         });
-        if (plan.targets.length === 0) {
+        if (opts?.shouldSuppress?.() || plan.targets.length === 0) {
           approvalDeliveriesById.delete(request.id);
           return null;
         }
@@ -413,6 +433,7 @@ function createApprovalIosPushDelivery<TRequest extends ApprovalRequestLike>(par
             plan,
             log: params.log,
             driver: params.driver,
+            shouldSuppress: opts?.shouldSuppress,
           }).catch((err: unknown) => {
             const message = formatErrorMessage(err);
             params.log.error?.(
@@ -435,6 +456,10 @@ function createApprovalIosPushDelivery<TRequest extends ApprovalRequestLike>(par
       }
 
       const { attempted, delivered } = await deliveryState.requestPushPromise;
+      if (attempted === 0) {
+        approvalDeliveriesById.delete(request.id);
+        return false;
+      }
       if (attempted > 0 && delivered === 0) {
         params.log.warn?.(
           `${params.driver.approvalKind} approvals: iOS request push reached no devices approvalId=${request.id} attempted=${attempted}`,
@@ -468,7 +493,7 @@ export function createExecApprovalIosPushDelivery(params: { log: GatewayLikeLogg
     log: params.log,
     driver: {
       approvalKind: "exec",
-      sendRequested: async ({ request, target, plan, gatewayDeviceId }) =>
+      sendRequested: async ({ request, target, plan, gatewayDeviceId, assertCurrent }) =>
         target.registration.transport === "direct"
           ? await sendApnsExecApprovalAlert({
               registration: target.registration,
@@ -476,6 +501,7 @@ export function createExecApprovalIosPushDelivery(params: { log: GatewayLikeLogg
               approvalId: request.id,
               gatewayDeviceId,
               auth: plan.directAuth!,
+              ...(assertCurrent ? { assertCurrent } : {}),
             })
           : await sendApnsExecApprovalAlert({
               registration: target.registration,
@@ -483,6 +509,7 @@ export function createExecApprovalIosPushDelivery(params: { log: GatewayLikeLogg
               approvalId: request.id,
               gatewayDeviceId,
               relayConfig: plan.relayConfig!,
+              ...(assertCurrent ? { assertCurrent } : {}),
             }),
       sendResolved: async ({ approvalId, target, plan, gatewayDeviceId }) =>
         target.registration.transport === "direct"
@@ -510,7 +537,7 @@ export function createPluginApprovalIosPushDelivery(params: { log: GatewayLikeLo
     log: params.log,
     driver: {
       approvalKind: "plugin",
-      sendRequested: async ({ request, target, plan, gatewayDeviceId }) =>
+      sendRequested: async ({ request, target, plan, gatewayDeviceId, assertCurrent }) =>
         // Keep reviewer-only detail out of size-constrained lock-screen push payloads.
         target.registration.transport === "direct"
           ? await sendApnsPluginApprovalAlert({
@@ -521,6 +548,7 @@ export function createPluginApprovalIosPushDelivery(params: { log: GatewayLikeLo
               title: request.request.title,
               description: request.request.description,
               auth: plan.directAuth!,
+              ...(assertCurrent ? { assertCurrent } : {}),
             })
           : await sendApnsPluginApprovalAlert({
               registration: target.registration,
@@ -530,6 +558,7 @@ export function createPluginApprovalIosPushDelivery(params: { log: GatewayLikeLo
               title: request.request.title,
               description: request.request.description,
               relayConfig: plan.relayConfig!,
+              ...(assertCurrent ? { assertCurrent } : {}),
             }),
       sendResolved: async ({ approvalId, target, plan, gatewayDeviceId }) =>
         target.registration.transport === "direct"

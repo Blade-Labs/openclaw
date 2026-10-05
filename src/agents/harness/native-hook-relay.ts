@@ -7,6 +7,7 @@ import {
 import { racePromiseWithAbortSignal } from "../../infra/abort-signal.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
+import { consumeSourceForToolCall } from "../agent-tools.before-tool-call.state.js";
 import { retainBeforeToolCallForNativeHookRelay } from "./host-private-capabilities.js";
 import { formatPermissionApprovalDescription as formatPermissionApprovalDescriptionForTestsImpl } from "./native-hook-relay-approval-presentation.js";
 import {
@@ -235,6 +236,7 @@ function registerNativeHookRelayInternal(
       foregroundOpen: true,
       foregroundToken: Symbol("native-hook-relay-foreground"),
       policyReady,
+      toolSources: new Map(),
       ...(retained ? { retained } : {}),
       ...(retention ? { retention } : {}),
       ...(executionAdmission ? { executionAdmission } : {}),
@@ -363,6 +365,10 @@ function unregisterNativeHookRelay(
   }
   lifetime?.removeAbortListener?.();
   lifetime?.retained?.release();
+  for (const toolCallId of lifetime?.toolSources.keys() ?? []) {
+    consumeSourceForToolCall(toolCallId, registration.runId);
+  }
+  lifetime?.toolSources.clear();
   // SAFETY: this deletes the same private expando installed by setRelayLifetime.
   delete (registration as RelayLifetimeRegistration)[RELAY_LIFETIME];
   void unregisterNativeHookRelayBridge(relayId, {
@@ -505,6 +511,7 @@ export async function invokeNativeHookRelay(
       invocation: normalized,
       adapter: getNativeHookRelayProviderAdapter(provider),
       executionAdmission: readRelayLifetime(registration)?.executionAdmission,
+      toolSources: readRelayLifetime(registration)?.toolSources,
       assertExecutionAdmissionCurrent,
     }),
     signal,

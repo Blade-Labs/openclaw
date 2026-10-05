@@ -3,13 +3,24 @@ import os from "node:os";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  createOperationalRunInstanceRef,
+  getAdmittedRunDelegatedAuthority,
+  prepareAgentRunAdmission,
+} from "../agents/admitted-run-context.js";
 import type { ExecApprovalRequestPayload } from "../infra/exec-approvals.js";
+import { createHostChannelTurnSource } from "../infra/host-turn-source.js";
 import {
   getActiveGatewayRootWorkCount,
   tryBeginGatewayRootWorkAdmission,
 } from "../process/gateway-work-admission.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { closeOpenClawStateDatabaseByPathAsync } from "../state/openclaw-state-db-cache.js";
+import { bindApprovalRequestAuthorization } from "./approval-request-authorization.js";
+import {
+  requesterAuthorization,
+  withRequesterApprovalChannel,
+} from "./approval-requester.test-support.js";
 import { ApprovalObserverClosedError } from "./exec-approval-lifecycle.js";
 import { ExecApprovalManager } from "./exec-approval-manager.js";
 import {
@@ -59,6 +70,254 @@ function createPersistentManager() {
 }
 
 describe("ExecApprovalManager lifetime", () => {
+  it.for([false, true])(
+    "redeems the real successful lifecycle tuple once and retains resolver authority (strict=%s)",
+    async (strict, testContext) => {
+      const manager = createTestApprovalManager(testContext);
+      const record = manager.create({ command: "echo synthetic" }, 60_000);
+      record.authorization = requesterAuthorization(strict);
+      const registration = await manager.register(record, 60_000);
+      let active = true;
+      await manager.resolveDetailed(
+        record.id,
+        "allow-once",
+        {
+          kind: "channel",
+          id: "test:default",
+          actor: {
+            kind: "channel",
+            channel: "test",
+            accountId: "default",
+            senderId: "synthetic-requester",
+            actorKind: "human",
+          },
+        },
+        null,
+        "operator",
+        {
+          assertCurrent: () => {
+            if (!active) {
+              throw new Error("Synthetic resolver revoked");
+            }
+          },
+        },
+      );
+      await expect(registration.decision).resolves.toBe("allow-once");
+      expect(record).toMatchObject({
+        status: "allowed",
+        decision: "allow-once",
+        terminalReason: "user",
+      });
+      const execution = manager.prepareAllowOnceExecution(record.id);
+      await execution.redeem();
+      expect(() => execution.assertCurrent()).not.toThrow();
+      await expect(manager.prepareAllowOnceExecution(record.id).redeem()).rejects.toThrow();
+      await expect(execution.redeem()).rejects.toThrow();
+      active = false;
+      expect(() => execution.assertCurrent()).toThrow();
+      expect(record.consumedDecision).toBe("allow-once");
+    },
+  );
+  it("retains a trusted unavailable source account when policy strengthens", async (testContext) => {
+    let strict = false;
+    await withRequesterApprovalChannel(
+      async () => {
+        const instance = createOperationalRunInstanceRef("synthetic-unavailable-run");
+        const admission = prepareAgentRunAdmission({
+          cfg: {},
+          facts: {
+            runId: instance.runId,
+            agentId: "main",
+            ingress: { kind: "system", boundary: "synthetic-test", state: "present" },
+          },
+          operationalRunInstance: instance,
+          turnSource: createHostChannelTurnSource({
+            actor: {
+              channel: "test",
+              accountId: "default",
+              senderId: "synthetic-requester",
+              actorKind: "human",
+            },
+          }),
+        });
+        try {
+          const admitted = await admission.admit("plugin-harness");
+          const authority = expectDefined(
+            getAdmittedRunDelegatedAuthority(admitted),
+            "admitted authority",
+          );
+          const manager = createTestApprovalManager(testContext);
+          const record = manager.create(
+            { command: "echo synthetic" },
+            60_000,
+            "synthetic-unavailable-account",
+          );
+          bindApprovalRequestAuthorization({
+            record,
+            cfg: {},
+            approvalKind: "exec",
+            identity: {
+              kind: "agentRuntime",
+              agentId: "main",
+              sessionKey: "agent:main:synthetic",
+              operationalRunInstance: instance,
+              delegatedAuthority: { ...authority, kind: "local" },
+            },
+          });
+          expect(record.authorization?.source.inputs).toEqual([]);
+          await manager.register(record, 60_000);
+          strict = true;
+          await expect(
+            manager.resolveDetailed(record.id, "deny", {
+              kind: "device",
+              id: "synthetic-operator",
+            }),
+          ).rejects.toMatchObject({ code: "APPROVAL_REQUESTER_UNAVAILABLE", reason: "missing" });
+          expect(manager.consumeAskFallback(record.id)).toBe(false);
+        } finally {
+          admission.close();
+        }
+      },
+      { strict: () => strict },
+    );
+  });
+
+  it("rechecks strengthened source-account policy inside the resolution commit guard", async (testContext) => {
+    let strict = false;
+    await withRequesterApprovalChannel(
+      async () => {
+        const manager = createTestApprovalManager(testContext);
+        const record = manager.create(
+          { command: "echo synthetic" },
+          60_000,
+          "synthetic-policy-race",
+        );
+        record.authorization = requesterAuthorization(false);
+        await manager.register(record, 60_000);
+        const originalResolve = operatorApprovalStore.resolveOperatorApproval;
+        const entered = createDeferredCore();
+        const release = createDeferredCore();
+        vi.spyOn(operatorApprovalStore, "resolveOperatorApproval").mockImplementation(
+          async (input) => {
+            entered.resolve();
+            await release.promise;
+            return originalResolve(input);
+          },
+        );
+        const resolution = manager.resolveDetailed(record.id, "deny", {
+          kind: "device",
+          id: "synthetic-operator",
+        });
+        const rejected = expect(resolution).rejects.toMatchObject({
+          code: "APPROVAL_REQUESTER_UNAVAILABLE",
+        });
+        await entered.promise;
+        strict = true;
+        release.resolve();
+        await rejected;
+        expect((await manager.getSnapshot(record.id))?.decision).toBeUndefined();
+        expect(manager.consumeAskFallback(record.id)).toBe(false);
+      },
+      { strict: () => strict },
+    );
+  });
+
+  it.for([false, true])(
+    "refuses consumption and allowed projection after the winning actor closes with requester matching=%s",
+    async (strict, testContext) => {
+      const manager = createTestApprovalManager(testContext);
+      const record = manager.create(
+        { command: "echo synthetic" },
+        60_000,
+        "synthetic-actor-lifetime",
+      );
+      record.authorization = requesterAuthorization(strict);
+      await manager.register(record, 60_000);
+      let current = true;
+      await manager.resolveDetailed(
+        record.id,
+        "allow-once",
+        {
+          kind: "channel",
+          id: "synthetic-requester",
+          actor: {
+            kind: "channel",
+            channel: "test",
+            accountId: "default",
+            senderId: "synthetic-requester",
+            actorKind: "human",
+          },
+        },
+        null,
+        "operator",
+        {
+          assertCurrent: () => {
+            if (!current) {
+              throw new Error("synthetic account closed");
+            }
+          },
+        },
+      );
+      current = false;
+      expect(manager.projectDecisionIfActive(record.id, "allow-once")).toBe("deny");
+      if (strict) {
+        await expect(manager.consumeAllowOnce(record.id)).rejects.toMatchObject({
+          code: "APPROVAL_REQUESTER_UNAVAILABLE",
+          reason: "stale",
+        });
+      } else {
+        await expect(manager.consumeAllowOnce(record.id)).rejects.toThrow(
+          "approval resolver authority is no longer active",
+        );
+      }
+      expect((await manager.getSnapshot(record.id))?.consumedAtMs).toBeFalsy();
+    },
+  );
+  it("guards strict manager resolution, malformed denial and askFallback", async (testContext) => {
+    const manager = createTestApprovalManager(testContext);
+    const record = manager.create(
+      { command: "echo synthetic" },
+      60_000,
+      "synthetic-strict-manager",
+    );
+    record.authorization = requesterAuthorization();
+    await manager.register(record, 60_000);
+    for (const decision of ["allow-once", "deny"] as const) {
+      await expect(
+        manager.resolveDetailed(record.id, decision, { kind: "device", id: "synthetic-admin" }),
+      ).rejects.toMatchObject({ code: "APPROVAL_REQUESTER_UNAVAILABLE" });
+    }
+    await expect(
+      manager.forceDenyDetailed(record.id, "malformed-verdict", {
+        kind: "device",
+        id: "synthetic-admin",
+      }),
+    ).rejects.toMatchObject({ code: "APPROVAL_REQUESTER_UNAVAILABLE" });
+    expect(manager.getLiveSnapshot(record.id)?.resolvedAtMs).toBeUndefined();
+    const actor = {
+      kind: "channel" as const,
+      channel: "test",
+      accountId: "default",
+      senderId: "synthetic-requester",
+      actorKind: "human" as const,
+    };
+    await expect(
+      manager.resolveDetailed(record.id, "allow-once", {
+        kind: "channel",
+        id: "synthetic-label",
+        actor,
+      }),
+    ).resolves.toMatchObject({ outcome: "resolved" });
+    expect(manager.getLiveSnapshot(record.id)?.resolvedByActor).toEqual(actor);
+
+    const timed = manager.create({ command: "echo synthetic" }, 100, "synthetic-strict-timeout");
+    timed.authorization = requesterAuthorization();
+    await manager.register(timed, 100);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(manager.projectDecisionIfActive(timed.id, null)).toBe("deny");
+    expect(manager.consumeAskFallback(timed.id)).toBe(false);
+  });
+
   it.for(["authority", "signal", "retirement"] as const)(
     "refuses insertion when %s closes during audience preparation",
     async (closed, testContext) => {

@@ -1,9 +1,11 @@
 import type { ExecApprovalDecision, ExecApprovalRequestPayload } from "../infra/exec-approvals.js";
 import { getAsyncWorkSignal } from "../shared/async-work-scope.js";
+import { isApprovalRequesterPolicyError } from "./approval-requester-policy.js";
 import {
-  EXEC_APPROVAL_RESOLVED_ENTRY_GRACE_MS,
-  ExecApprovalLifecycle,
-} from "./exec-approval-lifecycle.js";
+  consumeExecApprovalOnce,
+  prepareExecApprovalOnceExecution,
+} from "./exec-approval-consumption.js";
+import { ExecApprovalLifecycle } from "./exec-approval-lifecycle.js";
 import type {
   ExecApprovalDurableLookup,
   ExecApprovalForceDenyResult,
@@ -17,9 +19,16 @@ import {
   createExecApprovalRecord,
   prepareExecApprovalPresentation,
   prepareExecApprovalRegistration,
+  persistRequesterApprovalDenial,
 } from "./exec-approval-registration.js";
 import {
-  prepareExecApprovalRedemptionWindow,
+  isExecApprovalRuntimeAuthorityActive,
+  prepareExecApprovalRequesterGuard,
+  projectExecApprovalRequesterDecision,
+  ApprovalMutationRefusedError,
+} from "./exec-approval-requester-guard.js";
+import {
+  reportExecApprovalError,
   prepareExecApprovalSettlement,
   prepareExecApprovalStandingGrant,
   prepareExecApprovalStorageFailure,
@@ -27,7 +36,6 @@ import {
   projectRepairedApprovalResolution,
 } from "./exec-approval-results.js";
 import {
-  consumeOperatorApprovalAllowOnce,
   forceDenyOperatorApproval,
   getOperatorApprovalDetailed,
   insertOperatorApproval,
@@ -47,8 +55,6 @@ export type {
   OperatorApprovalLifecycleEvent,
   OperatorStandingGrantMintSpec,
 } from "./exec-approval-manager.types.js";
-
-class ApprovalMutationRefusedError extends Error {}
 
 /** Approval creation and persistence precede every local wait or delivery handoff. */
 export class ExecApprovalManager<
@@ -82,16 +88,20 @@ export class ExecApprovalManager<
       const assertCurrent = () => {
         requestSignal?.throwIfAborted();
         this.assertNotRetired();
+        record.assertRequesterCurrent?.();
         if (!this.isRuntimeAuthorityActive(record)) {
           throw new Error("approval authority is no longer active");
         }
       };
       assertCurrent();
       const persistence = this.options.persistence;
+      record.assertRequesterCurrent?.();
       const presentation = prepareExecApprovalPresentation(
         this.approvalKind,
         record.request,
-        this.options.resolveAllowedDecisions?.(record.request),
+        record.authorization?.policy.requireResolverMatch
+          ? ["allow-once", "deny"]
+          : this.options.resolveAllowedDecisions?.(record.request),
       );
       const existing = this.pending.get(record.id);
       if (existing) {
@@ -162,18 +172,10 @@ export class ExecApprovalManager<
   }
 
   private isRuntimeAuthorityActive(record: ExecApprovalRecord<TPayload>): boolean {
-    const delegated = record.agentRuntimeDelegatedAuthority;
-    if (
-      (delegated && this.options.validateAgentRuntimeDelegatedAuthority?.(delegated) !== true) ||
-      record.approvalSignals?.some((signal) => signal.aborted)
-    ) {
-      return false;
-    }
-    try {
-      return record.approvalAuthority?.() !== false;
-    } catch {
-      return false;
-    }
+    return isExecApprovalRuntimeAuthorityActive(
+      record,
+      this.options.validateAgentRuntimeDelegatedAuthority,
+    );
   }
 
   private emitLifecycle(event: OperatorApprovalLifecycleEvent): void {
@@ -184,6 +186,22 @@ export class ExecApprovalManager<
       // Stream fanout is observational. It must never change approval truth or
       // prevent the durable first-answer transition from releasing its waiter.
     }
+  }
+
+  /** Rejected requester authority can record denial without reopening executable authority. */
+  async recordRequesterDenial(record: ExecApprovalRecord<TPayload>): Promise<void> {
+    await this.trackMutation(async () => {
+      const denied = await persistRequesterApprovalDenial({
+        record,
+        kind: this.approvalKind,
+        persistence: this.options.persistence,
+        assertCurrent: () => this.assertNotRetired(),
+      });
+      if (!this.pending.has(record.id)) {
+        void this.registerEntry(record);
+      }
+      this.settleLocalFromStore(denied);
+    });
   }
 
   /** Persist the first verdict, then release the process-local waiter. */
@@ -203,6 +221,13 @@ export class ExecApprovalManager<
       return { outcome: "not-found" };
     }
     const capturedEntry = this.pending.get(recordId);
+    const requester = prepareExecApprovalRequesterGuard(
+      capturedEntry?.record,
+      this.approvalKind,
+      resolver.actor,
+      decision,
+    );
+    requester.assertPolicy();
     if (
       decision !== "deny" &&
       capturedEntry &&
@@ -240,20 +265,14 @@ export class ExecApprovalManager<
           id: recordId,
           nowMs,
           decision,
+          requireResolverMatch: requester.requireResolverMatch,
           resolver,
           expectedKind: this.approvalKind,
           runtimeEpoch: persistence.runtimeEpoch,
           databaseOptions: persistence.databaseOptions,
           assertCurrent: () => {
             this.assertNotRetired();
-            try {
-              options.assertCurrent?.();
-            } catch (error) {
-              throw new ApprovalMutationRefusedError(
-                "approval resolver authority is no longer active",
-                { cause: error },
-              );
-            }
+            requester.assertCurrent(options.assertCurrent);
             if (
               this.pending.get(recordId) !== localEntry ||
               (localEntry &&
@@ -284,6 +303,7 @@ export class ExecApprovalManager<
       } catch (error) {
         if (
           !(error instanceof ApprovalMutationRefusedError) &&
+          !isApprovalRequesterPolicyError(error) &&
           !this.retired &&
           this.pending.get(recordId) === localEntry &&
           (!localEntry ||
@@ -315,6 +335,9 @@ export class ExecApprovalManager<
         result.outcome === "expired" ||
         result.outcome === "already-resolved"
       ) {
+        if (result.outcome === "resolved" && localEntry) {
+          localEntry.record.assertResolverCurrent = options.assertCurrent;
+        }
         // The caller's source only applies when its own CAS won; a lost race or
         // expiry settles with the durable winner, which is an operator decision.
         this.settleLocalFromStore(
@@ -347,6 +370,16 @@ export class ExecApprovalManager<
       return { outcome: "not-found" };
     }
     const capturedRecord = this.pending.get(recordId)?.record;
+    const humanResolution = reason === "malformed-verdict" || reason === "user";
+    const requester = prepareExecApprovalRequesterGuard(
+      humanResolution ? capturedRecord : undefined,
+      this.approvalKind,
+      resolver.actor,
+      "deny",
+    );
+    if (humanResolution) {
+      requester.assertPolicy();
+    }
     // Cancellation closes executable authority before its durable CAS can yield.
     if (!this.retired && status === "cancelled" && capturedRecord) {
       capturedRecord.approvalAuthority = () => false;
@@ -368,20 +401,14 @@ export class ExecApprovalManager<
           status,
           requireDue,
           reason,
+          requireResolverMatch: humanResolution && requester.requireResolverMatch,
           resolver,
           expectedKind: this.approvalKind,
           runtimeEpoch: persistence.runtimeEpoch,
           databaseOptions: persistence.databaseOptions,
           assertCurrent: () => {
             this.assertNotRetired();
-            try {
-              assertResolverCurrent?.();
-            } catch (error) {
-              throw new ApprovalMutationRefusedError(
-                "approval resolver authority is no longer active",
-                { cause: error },
-              );
-            }
+            requester.assertCurrent(assertResolverCurrent);
             if (this.pending.get(recordId)?.record !== localRecord) {
               throw new Error("approval binding changed before cancellation");
             }
@@ -390,6 +417,7 @@ export class ExecApprovalManager<
       } catch (error) {
         if (
           !(error instanceof ApprovalMutationRefusedError) &&
+          !isApprovalRequesterPolicyError(error) &&
           !this.retired &&
           this.pending.get(recordId)?.record === localRecord
         ) {
@@ -426,6 +454,9 @@ export class ExecApprovalManager<
       record.resolvedAtMs === null
     ) {
       return false;
+    }
+    if (liveRecord) {
+      liveRecord.resolvedByActor = record.resolvedByActor;
     }
     const settled = this.settleLocalEntry(
       prepareExecApprovalSettlement({
@@ -546,18 +577,7 @@ export class ExecApprovalManager<
     error: unknown,
     context: { approvalId: string; operation: "expire" },
   ): void {
-    const onError = this.options.onError;
-    if (!onError) {
-      return;
-    }
-    try {
-      onError(error instanceof Error ? error : new Error(String(error)), {
-        ...context,
-        approvalKind: this.approvalKind,
-      });
-    } catch {
-      // Error reporting must not turn a fail-closed timeout into an uncaught timer exception.
-    }
+    reportExecApprovalError(error, context, this.approvalKind, this.options.onError);
   }
 
   protected override async expireDue(recordId: string): Promise<boolean> {
@@ -635,67 +655,49 @@ export class ExecApprovalManager<
     return result.outcome === "denied";
   }
 
-  async consumeAllowOnce(recordId: string, consumerId = recordId): Promise<boolean> {
+  override consumeAskFallback(recordId: string): boolean {
+    const record = this.getLiveSnapshot(recordId);
+    if (
+      prepareExecApprovalRequesterGuard(record ?? undefined, this.approvalKind, undefined, "deny")
+        .requireResolverMatch
+    ) {
+      return false;
+    }
+    return super.consumeAskFallback(recordId);
+  }
+
+  async consumeAllowOnce(
+    recordId: string,
+    consumerId = recordId,
+    options: { assertCurrent?: () => void } = {},
+  ): Promise<boolean> {
     // Retirement preserves consumption only inside an already-owned genuine handoff.
     const entry = this.pending.get(recordId);
-    if (!this.canUseRetainedBinding() || !entry) {
+    if (!this.canUseRetainedBinding() || !entry || entry.record.decision !== "allow-once") {
       return false;
     }
-    if (!this.isRuntimeAuthorityActive(entry.record)) {
-      await this.forceDenyIfRuntimeAuthorityClosed(recordId);
-      return false;
-    }
-    return this.trackMutation(async () => {
-      const nowMs = Date.now();
-      const graceAnchorMs = this.resolvedGraceAnchorMs(entry, nowMs);
-      // Durable records are audit/control-plane truth, not executable capability
-      // material. Redemption requires the live waiter entry and its requester binding.
-      const redemptionWindowMs = prepareExecApprovalRedemptionWindow(
-        entry.record,
-        graceAnchorMs,
-        nowMs,
-      );
-      if (redemptionWindowMs === null) {
-        return false;
-      }
-      const persistence = this.options.persistence;
-      const result = await consumeOperatorApprovalAllowOnce({
-        id: recordId,
-        nowMs,
-        consumerId,
-        expectedKind: this.approvalKind,
-        runtimeEpoch: persistence.runtimeEpoch,
-        redemptionWindowMs,
-        databaseOptions: persistence.databaseOptions,
-        assertCurrent: () => {
-          const currentNowMs = Date.now();
-          const currentGraceAnchorMs = this.resolvedGraceAnchorMs(entry, currentNowMs);
-          if (
-            !this.canUseRetainedBinding() ||
-            this.pending.get(recordId) !== entry ||
-            !this.isRuntimeAuthorityActive(entry.record) ||
-            currentGraceAnchorMs === null ||
-            currentNowMs - currentGraceAnchorMs >= EXEC_APPROVAL_RESOLVED_ENTRY_GRACE_MS
-          ) {
-            throw new ApprovalMutationRefusedError("approval authority is no longer active");
-          }
-        },
-      }).catch((error: unknown) => {
-        if (error instanceof ApprovalMutationRefusedError) {
-          return null;
-        }
-        throw error;
-      });
-      if (!result || result.outcome !== "consumed" || this.pending.get(recordId) !== entry) {
-        return false;
-      }
-      // Keep the winning decision for audit/retry reporting; consumedDecision
-      // is the process-local replay guard during the resolved grace window.
-      entry.record.consumedDecision = "allow-once";
-      entry.record.consumedAtMs = result.record.consumedAtMs;
-      entry.record.consumedBy = result.record.consumedBy;
-      return this.isRuntimeAuthorityActive(entry.record);
-    }, recordId);
+    return this.trackMutation(
+      () =>
+        consumeExecApprovalOnce({
+          record: entry.record,
+          consumerId,
+          kind: this.approvalKind,
+          persistence: this.options.persistence,
+          isCurrent: () => {
+            options.assertCurrent?.();
+            return this.canUseRetainedBinding() && this.pending.get(recordId) === entry;
+          },
+          runtimeActive: () => this.isRuntimeAuthorityActive(entry.record),
+          graceAnchorMs: () => this.resolvedGraceAnchorMs(entry, Date.now()),
+          closeAuthority: () => this.forceDenyIfRuntimeAuthorityClosed(recordId),
+        }),
+      recordId,
+    );
+  }
+
+  /** One-use dispatch capability retaining the exact requester and winning resolver. */
+  prepareAllowOnceExecution(recordId: string, consumerId = recordId) {
+    return prepareExecApprovalOnceExecution(this, recordId, consumerId);
   }
 
   /** Observes a registered decision; Gateway closure rejects the wait, not the approval. */
@@ -720,22 +722,15 @@ export class ExecApprovalManager<
     recordId: string,
     decision: ExecApprovalDecision | null,
   ): ExecApprovalDecision | null {
-    if (decision !== "allow-once" && decision !== "allow-always") {
-      return decision;
-    }
     const record = this.pending.get(recordId)?.record;
-    if (!this.canUseRetainedBinding() || !record) {
-      // Durable approval truth is not executable authority. Once the local
-      // binding is gone, stale handoffs must fail closed even if they kept its verdict.
-      return null;
-    }
-    if (this.isRuntimeAuthorityActive(record)) {
-      return decision;
-    }
-    // Durable first-answer truth remains auditable even when closure races an
-    // already-allowed row. Executable projection fails closed at this handoff.
-    this.scheduleAuthorityClosure(recordId);
-    return null;
+    return projectExecApprovalRequesterDecision({
+      record,
+      kind: this.approvalKind,
+      decision,
+      retained: this.canUseRetainedBinding(),
+      runtimeActive: () => Boolean(record && this.isRuntimeAuthorityActive(record)),
+      closeAuthority: () => this.scheduleAuthorityClosure(recordId),
+    });
   }
 
   /** Atomically closes a live approval whose exact runtime owner is gone. */

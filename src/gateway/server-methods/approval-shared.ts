@@ -1,21 +1,24 @@
 // Approval shared helpers normalize pending exec/plugin approval lookups,
 // decision payloads, turn-source routing, and gateway error responses.
-import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { ErrorCodes, errorShape } from "../../../packages/gateway-protocol/src/index.js";
 import type {
   ApprovalChannelReviewer,
   ValidationError,
 } from "../../../packages/gateway-protocol/src/index.js";
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { hasApprovalTurnSourceRoute } from "../../infra/approval-turn-source.js";
+import type { ApprovalResolvingActor } from "../../infra/approval-requester-binding.js";
 import type { ChannelApprovalKind } from "../../infra/approval-types.js";
 import type {
   ExecApprovalDecision,
   ExecApprovalRequestPayload,
 } from "../../infra/exec-approvals.js";
 import type { PluginApprovalRequestPayload } from "../../infra/plugin-approvals.js";
-import { createDeferredCore } from "../../shared/deferred.js";
 import { prepareApprovalChannelCustody } from "../approval-channel-custody.js";
+import { requiresApprovalRequesterMatch } from "../approval-request-policy.js";
+import { isApprovalRequesterPolicyError } from "../approval-requester-policy.js";
+import {
+  prepareApprovalResolvingActor,
+  readApprovalChannelReviewer,
+} from "../approval-resolving-actor.js";
 import type { ExecApprovalManager, ExecApprovalRecord } from "../exec-approval-manager.js";
 import {
   type ApprovalRecordLookupResult,
@@ -26,7 +29,7 @@ import {
   respondPendingApprovalLookupError,
   respondUnknownOrExpiredApproval,
 } from "./approval-record-lookup.js";
-import { buildWaitResponse, type WaitReasonResolver } from "./approval-wait-response.js";
+import { reportBlockedApprovalRequest } from "./approval-requester-blocked.js";
 import type { GatewayClient, GatewayRequestContext, RespondFn } from "./types.js";
 import { assertValidParams } from "./validation.js";
 
@@ -47,12 +50,12 @@ function resolveRecordedApprovalDecision<TPayload>(
   return record.decision ?? record.consumedDecision;
 }
 
-type ApprovalTurnSourceFields = {
+export type ApprovalTurnSourceFields = {
   turnSourceChannel?: string | null;
   turnSourceAccountId?: string | null;
 };
 
-type RequestedApprovalEvent<
+export type RequestedApprovalEvent<
   TPayload extends ApprovalTurnSourceFields,
   TKind extends ChannelApprovalKind = ChannelApprovalKind,
 > = {
@@ -67,11 +70,10 @@ type ResolvedApprovalEvent<TPayload> = {
   id: string;
   decision: ExecApprovalDecision;
   resolvedBy: string | null;
+  resolvedByActor?: ApprovalResolvingActor | null;
   ts: number;
   request: TPayload;
 };
-
-type ApprovalRequestDeliveryRoute = "approval-client" | "forwarder" | "turn-source" | "none";
 
 type ApprovalResolveParams = {
   id: string;
@@ -116,6 +118,16 @@ export function respondApprovalStorageUnavailable(params: {
   operation: "request" | "resolve" | "history" | "lookup";
   error: unknown;
 }): void {
+  if (isApprovalRequesterPolicyError(params.error)) {
+    params.respond(
+      false,
+      undefined,
+      errorShape(ErrorCodes.INVALID_REQUEST, params.error.message, {
+        details: { code: params.error.code, reason: params.error.reason },
+      }),
+    );
+    return;
+  }
   params.context.logGateway?.error?.(
     `approval ${params.operation} storage failure: ${String(params.error)}`,
   );
@@ -133,10 +145,77 @@ export async function registerPendingApprovalRecord<TPayload>(params: {
   timeoutMs: number;
   respond: RespondFn;
   context: GatewayRequestContext;
+  throwStorageErrors?: boolean;
 }): Promise<{ decision: Promise<ExecApprovalDecision | null> } | undefined> {
   try {
-    return await params.manager.register(params.record, params.timeoutMs);
+    const registered = await params.manager.register(params.record, params.timeoutMs);
+    if (
+      params.record.authorization?.policy.requireResolverMatch &&
+      params.record.authorization.requesterBinding.state !== "bound"
+    ) {
+      await params.manager.forceDenyDetailed(
+        params.record.id,
+        "requester-unavailable",
+        { kind: "system", id: null },
+        "denied",
+      );
+      await reportBlockedApprovalRequest({
+        context: params.context,
+        approvalKind: params.manager.approvalKind,
+        event: buildRequestedApprovalEvent(
+          params.record as ExecApprovalRecord<ApprovalTurnSourceFields>,
+        ),
+      });
+      params.respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          "Approval requester unavailable. No action was approved.",
+          {
+            details: {
+              code: "APPROVAL_REQUESTER_UNAVAILABLE",
+              approvalId: params.record.id,
+              reason: params.record.authorization.requesterBinding.state,
+              terminalReason: "requester-unavailable",
+            },
+          },
+        ),
+      );
+      return undefined;
+    }
+    return registered;
   } catch (err) {
+    if (isApprovalRequesterPolicyError(err)) {
+      await params.manager.recordRequesterDenial(params.record);
+      await reportBlockedApprovalRequest({
+        context: params.context,
+        approvalKind: params.manager.approvalKind,
+        event: buildRequestedApprovalEvent(
+          params.record as ExecApprovalRecord<ApprovalTurnSourceFields>,
+        ),
+      });
+      params.respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          "Approval requester unavailable. No action was approved.",
+          {
+            details: {
+              code: "APPROVAL_REQUESTER_UNAVAILABLE",
+              approvalId: params.record.id,
+              reason: err.reason,
+              terminalReason: "requester-unavailable",
+            },
+          },
+        ),
+      );
+      return undefined;
+    }
+    if (params.throwStorageErrors) {
+      throw err;
+    }
     respondApprovalStorageUnavailable({ ...params, operation: "request", error: err });
     return undefined;
   }
@@ -186,7 +265,7 @@ export function resolveApprovalDecisionParams<TParams extends ApprovalResolvePar
 }
 
 /** Resolves the approval clients that should receive request or resolution events. */
-function resolveApprovalRequestRecipientConnIds<TPayload>(params: {
+export function resolveApprovalRequestRecipientConnIds<TPayload>(params: {
   approvalKind: "exec" | "plugin" | "system-agent";
   context: GatewayRequestContext;
   record: ExecApprovalRecord<TPayload>;
@@ -213,6 +292,16 @@ export function broadcastApprovalResolvedEvent<TPayload>(params: {
   record: ExecApprovalRecord<TPayload>;
   event: ResolvedApprovalEvent<TPayload>;
 }): void {
+  if (
+    params.record.requiresRequesterMatch?.() === true ||
+    requiresApprovalRequesterMatch(
+      params.record.authorization,
+      params.context.getRuntimeConfig?.() ?? {},
+      params.approvalKind,
+    )
+  ) {
+    return;
+  }
   const eventName =
     params.approvalKind === "system-agent"
       ? "openclaw.approval.resolved"
@@ -229,227 +318,6 @@ export function broadcastApprovalResolvedEvent<TPayload>(params: {
     return;
   }
   params.context.broadcast(eventName, params.event, { dropIfSlow: true });
-}
-
-export async function handleApprovalWaitDecision<TPayload>(params: {
-  manager: ExecApprovalManager<TPayload>;
-  inputId: unknown;
-  client?: GatewayClient | null;
-  cfg?: OpenClawConfig;
-  getCfg?: () => OpenClawConfig;
-  respond: RespondFn;
-  resolveTerminalReason?: WaitReasonResolver<TPayload>;
-}): Promise<void> {
-  const id = normalizeOptionalString(params.inputId) ?? "";
-  if (!id) {
-    params.respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "id is required"));
-    return;
-  }
-  const snapshot = await params.manager.getSnapshot(id);
-  const visible = (record: ExecApprovalRecord<TPayload>) => {
-    const cfg = params.getCfg?.() ?? params.cfg;
-    return (
-      !params.client?.invalidated &&
-      isApprovalRecordVisibleToClient({
-        record,
-        client: params.client ?? null,
-        ...(cfg ? { cfg } : {}),
-      })
-    );
-  };
-  if (!snapshot || !visible(snapshot)) {
-    params.respond(
-      false,
-      undefined,
-      errorShape(ErrorCodes.INVALID_REQUEST, "approval expired or not found"),
-    );
-    return;
-  }
-  const decisionPromise = params.manager.awaitDecision(id);
-  if (!decisionPromise) {
-    params.respond(
-      false,
-      undefined,
-      errorShape(ErrorCodes.INVALID_REQUEST, "approval expired or not found"),
-    );
-    return;
-  }
-  const recordedDecision = await decisionPromise;
-  const terminalSnapshot = (await params.manager.getSnapshot(id)) ?? snapshot;
-  if (!visible(terminalSnapshot)) {
-    respondUnknownOrExpiredApproval(params.respond);
-    return;
-  }
-  const decision = params.manager.projectDecisionIfActive(id, recordedDecision);
-  const terminalReason = params.resolveTerminalReason?.(terminalSnapshot);
-  params.respond(
-    true,
-    buildWaitResponse(id, decision, terminalSnapshot, terminalReason),
-    undefined,
-  );
-}
-
-/** Broadcasts or routes a pending approval request, then responds after acceptance/decision. */
-export async function handlePendingApprovalRequest<
-  TPayload extends ApprovalTurnSourceFields,
->(params: {
-  manager: ExecApprovalManager<TPayload>;
-  record: ExecApprovalRecord<TPayload>;
-  respond: RespondFn;
-  context: GatewayRequestContext;
-  clientConnId?: string;
-  requestEventName: string;
-  requestEvent: RequestedApprovalEvent<TPayload>;
-  twoPhase: boolean;
-  approvalKind?: ChannelApprovalKind;
-  deliverRequest: () => boolean | Promise<boolean>;
-  afterDecision?: (
-    decision: ExecApprovalDecision | null,
-    requestEvent: RequestedApprovalEvent<TPayload>,
-  ) => Promise<void> | void;
-  afterDecisionErrorLabel?: string;
-  keepPendingWithoutRoute?: boolean;
-  requireDeliveryRoute?: boolean;
-  suppressDelivery?: boolean;
-  deliverToApprovalClientsOnly?: boolean;
-}): Promise<void> {
-  const deliveryReady = createDeferredCore<boolean>();
-  let noRouteWon = false;
-  const handoff = params.manager.registerDecisionHandoff(params.record.id, async (decision) => {
-    if (!(await deliveryReady.promise)) {
-      return;
-    }
-    let projectedDecision = params.manager.projectDecisionIfActive(params.record.id, decision);
-    if (!noRouteWon && params.afterDecision) {
-      try {
-        await params.afterDecision(projectedDecision, params.requestEvent);
-      } catch (err) {
-        params.context.logGateway?.error?.(
-          `${params.afterDecisionErrorLabel ?? "approval follow-up failed"}: ${String(err)}`,
-        );
-      }
-    }
-    projectedDecision = params.manager.projectDecisionIfActive(params.record.id, projectedDecision);
-    params.respond(
-      true,
-      {
-        id: params.record.id,
-        decision: projectedDecision,
-        createdAtMs: params.record.createdAtMs,
-        expiresAtMs: params.record.expiresAtMs,
-      },
-      undefined,
-    );
-  });
-  // Observation can close while delivery is preparing; the registered genuine
-  // handoff remains manager-owned and is joined independently of this observer.
-  void handoff.observation.catch(() => {});
-  try {
-    const suppressDelivery = params.suppressDelivery === true;
-    // Cron/automation cards go only to connected approval surfaces (Control
-    // UI, TUI): chat runtimes and turn-source routes would recreate the
-    // per-occurrence spam #128031 removed, while an approval client can end
-    // the recurrence with one allow-always (standing grant).
-    const approvalClientsOnly = !suppressDelivery && params.deliverToApprovalClientsOnly === true;
-    const approvalClientConnIds = suppressDelivery
-      ? null
-      : resolveApprovalRequestRecipientConnIds({
-          approvalKind: params.approvalKind ?? "exec",
-          context: params.context,
-          record: params.record,
-          excludeConnId: params.clientConnId,
-        });
-    if (!suppressDelivery) {
-      if (approvalClientConnIds) {
-        params.context.broadcastToConnIds(
-          params.requestEventName,
-          params.requestEvent,
-          approvalClientConnIds,
-          {
-            dropIfSlow: true,
-          },
-        );
-      } else {
-        params.context.broadcast(params.requestEventName, params.requestEvent, {
-          dropIfSlow: true,
-        });
-      }
-    }
-    const internalApprovalSubscriberCount =
-      suppressDelivery || approvalClientsOnly
-        ? 0
-        : (params.context.approvalEvents?.publishRequested(
-            params.approvalKind ?? "exec",
-            params.requestEvent,
-          ) ?? 0);
-
-    const hasApprovalClients = suppressDelivery
-      ? false
-      : approvalClientConnIds !== null
-        ? approvalClientConnIds.size > 0 || internalApprovalSubscriberCount > 0
-        : (params.context.hasExecApprovalClients?.(params.clientConnId) ?? false) ||
-          internalApprovalSubscriberCount > 0;
-    const delivered =
-      suppressDelivery || approvalClientsOnly
-        ? false
-        : await params.manager.trackActiveWork(params.deliverRequest);
-    // A turn-source route can approve without an active approval client, so keep
-    // the record alive when the originating channel/account can still receive it.
-    const hasTurnSourceRoute =
-      !suppressDelivery &&
-      !approvalClientsOnly &&
-      !hasApprovalClients &&
-      !delivered &&
-      hasApprovalTurnSourceRoute({
-        turnSourceChannel: params.record.request.turnSourceChannel,
-        turnSourceAccountId: params.record.request.turnSourceAccountId,
-        approvalKind: params.approvalKind ?? "exec",
-      });
-    const deliveryRoute: ApprovalRequestDeliveryRoute = delivered
-      ? "forwarder"
-      : hasApprovalClients
-        ? "approval-client"
-        : hasTurnSourceRoute
-          ? "turn-source"
-          : "none";
-
-    if (
-      params.requireDeliveryRoute !== false &&
-      !params.keepPendingWithoutRoute &&
-      !hasApprovalClients &&
-      !hasTurnSourceRoute &&
-      !delivered
-    ) {
-      try {
-        noRouteWon = await params.manager.expire(params.record.id, "no-approval-route");
-      } catch (err) {
-        deliveryReady.resolve(false);
-        handoff.abandon();
-        respondApprovalStorageUnavailable({ ...params, operation: "request", error: err });
-        return;
-      }
-    } else if (params.twoPhase) {
-      params.respond(
-        true,
-        {
-          status: "accepted",
-          id: params.record.id,
-          // Agent-side timeouts use this to distinguish delivered prompts from
-          // requests kept pending only because manual /approve routing may work.
-          deliveryRoute,
-          createdAtMs: params.record.createdAtMs,
-          expiresAtMs: params.record.expiresAtMs,
-        },
-        undefined,
-      );
-    }
-  } catch (error) {
-    deliveryReady.resolve(false);
-    handoff.abandon();
-    throw error;
-  }
-  deliveryReady.resolve(true);
-  await handoff.observation;
 }
 
 function respondRepeatedApprovalResolution<TPayload>(
@@ -497,7 +365,7 @@ export async function handleApprovalResolve<
     decision: ExecApprovalDecision;
     resolvedBy: string | null;
     snapshot: ExecApprovalRecord<TPayload>;
-    resolver?: { kind: "channel"; id: string };
+    resolver?: { kind: "channel" | "runtime"; id: string | null; actor?: ApprovalResolvingActor };
     assertCurrent: () => void;
   }) => Promise<boolean>;
   forwardResolved?: (event: ResolvedApprovalEvent<TPayload>) => Promise<void> | void;
@@ -507,14 +375,21 @@ export async function handleApprovalResolve<
     errorLabel: string;
   }>;
 }): Promise<void> {
-  const custody = params.reviewer
+  let reviewer: ApprovalChannelReviewer | undefined;
+  try {
+    reviewer = readApprovalChannelReviewer(params.client, params.reviewer);
+  } catch (error) {
+    respondApprovalStorageUnavailable({ ...params, operation: "resolve", error });
+    return;
+  }
+  const custody = reviewer
     ? prepareApprovalChannelCustody({
         cfg: params.context.getRuntimeConfig(),
         approvalKind: params.approvalKind,
-        reviewer: params.reviewer,
+        reviewer,
       })
     : null;
-  if (params.reviewer && !custody) {
+  if (reviewer && !custody) {
     respondUnknownOrExpiredApproval(params.respond);
     return;
   }
@@ -549,6 +424,18 @@ export async function handleApprovalResolve<
       return;
     }
     if (resolvedRepeat.ok) {
+      try {
+        prepareApprovalResolvingActor({
+          client: params.client,
+          context: params.context,
+          approvalKind: params.approvalKind,
+          authorization: resolvedRepeat.snapshot.authorization,
+          decision: params.decision,
+        });
+      } catch (error) {
+        respondApprovalStorageUnavailable({ ...params, operation: "resolve", error });
+        return;
+      }
       respondRepeatedApprovalResolution(resolvedRepeat.snapshot, params.decision, params.respond);
       return;
     }
@@ -556,6 +443,19 @@ export async function handleApprovalResolve<
     return;
   }
 
+  let preparedActor: ReturnType<typeof prepareApprovalResolvingActor>;
+  try {
+    preparedActor = prepareApprovalResolvingActor({
+      client: params.client,
+      context: params.context,
+      approvalKind: params.approvalKind,
+      authorization: resolved.snapshot.authorization,
+      decision: params.decision,
+    });
+  } catch (error) {
+    respondApprovalStorageUnavailable({ ...params, operation: "resolve", error });
+    return;
+  }
   const validationError = params.validateDecision?.(resolved.snapshot);
   if (validationError) {
     params.respond(
@@ -572,13 +472,16 @@ export async function handleApprovalResolve<
 
   const resolvedBy =
     params.client?.connect?.client?.displayName ?? params.client?.connect?.client?.id ?? null;
-  const resolver = custody ? ({ kind: "channel", id: custody.resolverId } as const) : undefined;
+  const resolver = custody
+    ? ({ kind: "channel", id: custody.resolverId, actor: preparedActor.actor } as const)
+    : ({ kind: "runtime", id: resolvedBy, actor: preparedActor.actor } as const);
   const assertCurrent = () => {
-    const currentCustody = params.reviewer
+    preparedActor.assertCurrent();
+    const currentCustody = reviewer
       ? prepareApprovalChannelCustody({
           cfg: params.context.getRuntimeConfig(),
           approvalKind: params.approvalKind,
-          reviewer: params.reviewer,
+          reviewer,
         })
       : null;
     if (
@@ -588,7 +491,7 @@ export async function handleApprovalResolve<
         client: params.client,
         cfg: params.context.getRuntimeConfig(),
       }) ||
-      (params.reviewer && !currentCustody?.authorizes(resolved.snapshot))
+      (reviewer && !currentCustody?.authorizes(resolved.snapshot))
     ) {
       throw new Error("approval resolver authority is no longer active");
     }
@@ -627,6 +530,12 @@ export async function handleApprovalResolve<
     // resolve; report the recorded conflict, not a missing approval.
     const raced = await params.manager.getSnapshot(resolved.approvalId);
     if (raced && raced.resolvedAtMs !== undefined) {
+      try {
+        preparedActor.assertCurrent();
+      } catch (error) {
+        respondApprovalStorageUnavailable({ ...params, operation: "resolve", error });
+        return;
+      }
       respondRepeatedApprovalResolution(raced, params.decision, params.respond);
       return;
     }
@@ -638,6 +547,7 @@ export async function handleApprovalResolve<
     id: resolved.approvalId,
     decision: params.decision,
     resolvedBy,
+    resolvedByActor: (await params.manager.getSnapshot(resolved.approvalId))?.resolvedByActor,
     ts: Date.now(),
     request: resolved.snapshot.request,
   };
@@ -647,10 +557,25 @@ export async function handleApprovalResolve<
     record: resolved.snapshot,
     event: resolvedEvent,
   });
-  if (params.approvalKind !== "system-agent") {
+  if (
+    params.approvalKind !== "system-agent" &&
+    (resolved.snapshot.requiresRequesterMatch?.() !== true ||
+      resolved.snapshot.authorization?.policy.requireResolverMatch)
+  ) {
     params.context.approvalEvents?.publishResolved(params.approvalKind, resolvedEvent as never);
   }
 
+  if (
+    resolved.snapshot.requiresRequesterMatch?.() === true ||
+    requiresApprovalRequesterMatch(
+      resolved.snapshot.authorization,
+      params.context.getRuntimeConfig(),
+      params.approvalKind,
+    )
+  ) {
+    params.respond(true, { ok: true }, undefined);
+    return;
+  }
   const followUps = [
     params.forwardResolved
       ? {
@@ -686,3 +611,7 @@ export async function handleApprovalResolve<
 
   params.respond(true, { ok: true }, undefined);
 }
+
+export { handlePendingApprovalRequest } from "./approval-request-pending.js";
+
+export { handleApprovalWaitDecision } from "./approval-wait.js";

@@ -66,6 +66,7 @@ import {
   GatewayDrainingError,
   runWithGatewayIndependentRootWorkAdmission,
 } from "../process/gateway-work-admission.js";
+import { prepareApprovalExecution } from "./approval-execution.js";
 import { markBackgrounded, tail } from "./bash-process-registry.js";
 import {
   buildExecAutoReviewDeniedToolResult,
@@ -377,6 +378,8 @@ function buildGatewayExecApprovalFollowupSummary(params: {
 }
 
 function buildGatewayExecApprovalDeniedToolResult(params: {
+  approvalRequesterOnly?: true;
+  authorization?: import("../infra/approval-requester-binding.js").ApprovalRequestAuthorization;
   approvalId?: string;
   deniedReason: string;
   command: string;
@@ -389,6 +392,8 @@ function buildGatewayExecApprovalDeniedToolResult(params: {
   return {
     content: [{ type: "text", text }],
     details: {
+      ...(params.approvalRequesterOnly ? { approvalRequesterOnly: true } : {}),
+      ...(params.authorization ? { approvalAuthorization: params.authorization } : {}),
       status: "failed",
       exitCode: null,
       durationMs: 0,
@@ -610,11 +615,13 @@ export async function processGatewayAllowlist(
     return { ...state, approvedByAsk: true, deniedReason: null };
   };
   let assertCommittedAuthorization: (() => void) | undefined;
+  let assertApprovalCurrent: (() => void) | undefined;
   const assertCurrent = () => {
     if (!assertCommittedAuthorization) {
       throw new Error("Exec authorization has not been committed");
     }
     assertCommittedAuthorization();
+    assertApprovalCurrent?.();
   };
   const commitExecutionAuthorization = async (options: {
     source: ExecApprovalUsageAuthorization["source"];
@@ -1199,6 +1206,31 @@ export async function processGatewayAllowlist(
       sentApproverDms,
       unavailableReason,
     } = approvalRoute;
+    let usingFallback = false;
+    const approvalExecution = prepareApprovalExecution({
+      id: approvalId,
+      kind: "exec",
+      authorization: approvalRoute.authorization,
+      isFallback: () => usingFallback,
+    });
+    let approvalRedeemed = false;
+    const redeemForDispatch = async () => {
+      if (approvalExecution.requiresMatch() && !approvalRedeemed) {
+        await approvalExecution.redeem();
+        approvalRedeemed = true;
+      } else if (approvalRedeemed) {
+        await approvalExecution.revalidate();
+      }
+      approvalExecution.assertCurrent();
+    };
+    const revalidateApprovedExecution = async () => {
+      const denied = await revalidateBeforeExecution?.();
+      if (denied) {
+        return denied;
+      }
+      await redeemForDispatch();
+      return undefined;
+    };
     emitGatewayExecApprovalSecurityEvent({
       action: "exec.approval.requested",
       outcome: "success",
@@ -1248,6 +1280,8 @@ export async function processGatewayAllowlist(
         return {
           deniedResult: buildGatewayExecApprovalDeniedToolResult({
             approvalId,
+            authorization: approvalRoute.authorization,
+            ...(approvalExecution.requiresMatch() ? { approvalRequesterOnly: true } : {}),
             deniedReason,
             command: params.command,
             cwd: params.workdir,
@@ -1291,6 +1325,8 @@ export async function processGatewayAllowlist(
       const approvalOutcome = await resolveExecApprovalWaitOutcome({
         approvalId,
         preResolvedDecision,
+        authorization: approvalRoute.authorization,
+        onAuthorization: approvalExecution.latchRequesterMatch,
         signal: params.signal,
         askFallback,
         resolveTimedOut: (state) => {
@@ -1338,11 +1374,20 @@ export async function processGatewayAllowlist(
       }
 
       const { decision, state: resolvedDecision } = approvalOutcome;
+      usingFallback = decision === null;
       if (decision !== null && params.sessionKey) {
         consecutiveAutoReviewDenials.delete(params.sessionKey);
       }
       const { approvedByAsk } = resolvedDecision;
       let { deniedReason } = resolvedDecision;
+      if (!deniedReason && approvedByAsk) {
+        try {
+          approvalExecution.assertCurrent();
+          assertApprovalCurrent = approvalExecution.assertCurrent;
+        } catch {
+          deniedReason = "approval-authority-unavailable";
+        }
+      }
 
       if (
         !approvedByAsk &&
@@ -1401,7 +1446,7 @@ export async function processGatewayAllowlist(
     // Keep the original run and its delivery callback until approval resolves.
     // Only callers with an explicit follow-up owner may detach this work.
     if (unavailableReason === null && params.approvalFollowupMode === undefined) {
-      if (params.runId) {
+      if (params.runId && !approvalExecution.requiresMatch()) {
         emitAgentEvent({
           runId: params.runId,
           sessionKey: params.sessionKey,
@@ -1414,7 +1459,7 @@ export async function processGatewayAllowlist(
       try {
         approvalDecision = await resolveApprovalForExecution(() => undefined);
       } finally {
-        if (params.runId) {
+        if (params.runId && !approvalExecution.requiresMatch()) {
           emitAgentEvent({
             runId: params.runId,
             sessionKey: params.sessionKey,
@@ -1435,6 +1480,8 @@ export async function processGatewayAllowlist(
         return {
           deniedResult: buildGatewayExecApprovalDeniedToolResult({
             approvalId,
+            authorization: approvalRoute.authorization,
+            ...(approvalExecution.requiresMatch() ? { approvalRequesterOnly: true } : {}),
             deniedReason: approvalDecision.deniedReason,
             command: params.command,
             cwd: params.workdir,
@@ -1455,9 +1502,13 @@ export async function processGatewayAllowlist(
       params.signal?.throwIfAborted();
       return {
         execCommandOverride: approvalDecision.execCommandOverride,
+        approvalAuthorization: approvalRoute.authorization,
+        get approvalRequesterOnly() {
+          return approvalExecution.requiresMatch() ? true : undefined;
+        },
         allowWithoutEnforcedCommand: approvalDecision.execCommandOverride === undefined,
         assertCurrent,
-        ...(revalidateBeforeExecution ? { revalidateBeforeExecution } : {}),
+        revalidateBeforeExecution: revalidateApprovedExecution,
       };
     }
 
@@ -1599,6 +1650,7 @@ export async function processGatewayAllowlist(
                 if (finalBindingDenied) {
                   throw finalBindingDeniedError;
                 }
+                await redeemForDispatch();
                 return undefined;
               },
             });
@@ -1699,6 +1751,8 @@ export async function processGatewayAllowlist(
         unavailableReason,
         allowedDecisions: approvalAllowedDecisions,
         processContinuationAvailable: params.processContinuationAvailable,
+        authorization: approvalRoute.authorization,
+        ...(approvalExecution.requiresMatch() ? { approvalRequesterOnly: true } : {}),
       }),
     };
   }

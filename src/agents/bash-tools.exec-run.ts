@@ -28,6 +28,7 @@ import { normalizeDeliveryContext } from "../utils/delivery-context.shared.js";
 import { captureAgentToolSourceExecutionGuard } from "./agent-tool-source-execution-guard.js";
 import { markBackgrounded } from "./bash-process-registry.js";
 import { describeExecTool } from "./bash-tools.descriptions.js";
+import { attachExecApprovalAuthorization } from "./bash-tools.exec-approval-result.js";
 import { processGatewayAllowlist } from "./bash-tools.exec-host-gateway.js";
 import { executeNodeHostCommand } from "./bash-tools.exec-host-node.js";
 import {
@@ -74,6 +75,7 @@ import {
   createExecToolExecutionTimeoutResolver,
   resolveExecDefaultTimeoutSec,
 } from "./exec-tool-timeout.js";
+import type { AgentToolResult } from "./runtime/index.js";
 import { resolveStoredSubagentCapabilities } from "./subagents/spawn/subagent-capabilities.js";
 import { EXEC_TOOL_DISPLAY_SUMMARY } from "./tool-description-presets.js";
 import type { AgentToolWithMeta } from "./tools/common.js";
@@ -229,6 +231,8 @@ export function createExecTool(
       const startedAt = Date.now();
       let execCommandOverride: string | undefined;
       let gatewayApproval: GatewayApprovalResult | undefined;
+      const withApprovalAuthorization = (result: AgentToolResult<ExecToolDetails>) =>
+        attachExecApprovalAuthorization(result, gatewayApproval);
       let approvalReview: ExecToolApprovalReview | undefined;
       const foregroundFallbackWarning =
         !allowBackground && (params.background === true || typeof params.yieldMs === "number")
@@ -605,7 +609,9 @@ export function createExecTool(
         discardPreparedSandboxWorkdir = null;
       } catch (error) {
         discardPreparedSandboxWorkdir?.();
-        return attachExecApprovalReview(ExecProcessPreflightError.unwrap(error), approvalReview);
+        return withApprovalAuthorization(
+          attachExecApprovalReview(ExecProcessPreflightError.unwrap(error), approvalReview),
+        );
       }
 
       let yielded = false;
@@ -695,36 +701,38 @@ export function createExecTool(
         if (toolAborted) {
           throw createAbortError("Tool execution was aborted", { cause: signal?.reason });
         }
-        return attachExecApprovalReview(
-          completed.status === "settled"
-            ? buildExecForegroundResult({
-                outcome: completed.outcome,
-                cwd: run.session.cwd,
-                warningText: getWarningText(),
-                aggregateOutputDropped:
-                  run.session.totalOutputChars > run.session.aggregated.length,
-              })
-            : {
-                content: [
-                  {
-                    type: "text",
-                    text: `${getWarningText()}Command still running (session ${run.session.id}, pid ${
-                      run.session.pid ?? "n/a"
-                    }). ${BACKGROUND_EXEC_FOLLOW_UP}`,
-                  },
-                ],
-                details: {
-                  status: "running",
-                  sessionId: run.session.id,
-                  pid: run.session.pid ?? undefined,
-                  startedAt: run.startedAt,
+        return withApprovalAuthorization(
+          attachExecApprovalReview(
+            completed.status === "settled"
+              ? buildExecForegroundResult({
+                  outcome: completed.outcome,
                   cwd: run.session.cwd,
-                  tail: run.session.tail,
-                  // Structured callers receive details without the visible content.
-                  followUp: BACKGROUND_EXEC_FOLLOW_UP,
+                  warningText: getWarningText(),
+                  aggregateOutputDropped:
+                    run.session.totalOutputChars > run.session.aggregated.length,
+                })
+              : {
+                  content: [
+                    {
+                      type: "text",
+                      text: `${getWarningText()}Command still running (session ${run.session.id}, pid ${
+                        run.session.pid ?? "n/a"
+                      }). ${BACKGROUND_EXEC_FOLLOW_UP}`,
+                    },
+                  ],
+                  details: {
+                    status: "running",
+                    sessionId: run.session.id,
+                    pid: run.session.pid ?? undefined,
+                    startedAt: run.startedAt,
+                    cwd: run.session.cwd,
+                    tail: run.session.tail,
+                    // Structured callers receive details without the visible content.
+                    followUp: BACKGROUND_EXEC_FOLLOW_UP,
+                  },
                 },
-              },
-          approvalReview,
+            approvalReview,
+          ),
         );
       } catch (error) {
         if (toolAborted) {

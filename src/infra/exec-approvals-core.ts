@@ -1,6 +1,10 @@
 // Shared exec approval types and mode normalization.
 import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import type { ApprovalScope } from "../../packages/gateway-protocol/src/schema/approvals.js";
+import type {
+  ApprovalRequestAuthorization,
+  ApprovalResolvingActor,
+} from "./approval-requester-binding.js";
 import type { CommandExplanationSummary } from "./command-analysis/explain.js";
 import type { ExecApprovalPolicySnapshot } from "./exec-approval-policy-snapshot.js";
 import type { ExecAllowlistEntry, McpToolGrant } from "./exec-approvals.types.js";
@@ -195,6 +199,7 @@ type ExecApprovalCronExecutionSource = {
 };
 
 export type ExecApprovalRequestPayload = {
+  authorization?: ApprovalRequestAuthorization;
   command: string;
   commandPreview?: string | null;
   commandArgv?: string[];
@@ -240,6 +245,7 @@ export type ExecApprovalRequest = {
 };
 
 export type ExecApprovalResolved = {
+  resolvedByActor?: ApprovalResolvingActor | null;
   id: string;
   decision: ExecApprovalDecision;
   resolvedBy?: string | null;

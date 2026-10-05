@@ -175,6 +175,7 @@ export async function runActiveReplySteer(
       return await fallback("terminal source-reply delivery is closed");
     }
     const injectionAttempt = beginReplyMessageInjectionTarget(injectionTarget, followupRun.prompt, {
+      turnSource: followupRun.turnSource,
       assertCurrent: followupRun.operatorAuthority?.assertCurrent,
       steeringMode: "all",
       isInboundUserMessage:

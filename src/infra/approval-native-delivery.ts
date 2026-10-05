@@ -45,6 +45,19 @@ export async function resolveChannelNativeApprovalDeliveryPlan(params: {
     };
   }
 
+  if (params.request.request.authorization?.policy.requireResolverMatch) {
+    const binding = params.request.request.authorization.requesterBinding;
+    const target =
+      binding.state === "bound" && binding.accountId === params.accountId
+        ? await adapter.resolveRequesterTarget?.(params)
+        : null;
+    return {
+      targets: target ? [{ surface: "origin", target, reason: "preferred" }] : [],
+      originTarget: target ?? null,
+      notifyOriginWhenDmOnly: false,
+    };
+  }
+
   const capabilities = adapter.describeDeliveryCapabilities({
     cfg: params.cfg,
     accountId: params.accountId,

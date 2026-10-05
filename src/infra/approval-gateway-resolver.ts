@@ -7,6 +7,7 @@ import type {
 } from "../../packages/gateway-protocol/src/index.js";
 import { isWellFormedApprovalId } from "../../packages/gateway-protocol/src/schema/approvals.js";
 import { findChatChannelLabel } from "../channels/ids.js";
+import type { AdmittedChannelActor } from "../channels/message-access/approval-actor.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { withOperatorApprovalsGatewayClient } from "../gateway/operator-approvals-client.js";
 import { isApprovalNotFoundError } from "./approval-errors.js";
@@ -15,6 +16,7 @@ import type { GatewayNativeApprovalMethod } from "./approval-gateway-runtime-met
 import type { ChannelApprovalKind } from "./approval-types.js";
 
 type ResolveApprovalOverGatewayBaseParams = {
+  admittedActor?: AdmittedChannelActor;
   cfg: OpenClawConfig;
   approvalId: string;
   decision: ApprovalDecision;
@@ -29,7 +31,7 @@ type ApprovalGatewayRuntime = {
   request: (
     method: "approval.resolve",
     params: ApprovalResolveParams,
-    options?: { clientDisplayName?: string },
+    options?: { clientDisplayName?: string; approvalActor?: AdmittedChannelActor },
   ) => Promise<ApprovalResolveResult>;
 };
 
@@ -138,9 +140,12 @@ export async function resolveApprovalOverGateway(
         id: approvalId,
         kind: canonicalKind,
         decision: params.decision,
-        ...(reviewer ? { reviewer } : {}),
+        ...(reviewer && !params.admittedActor ? { reviewer } : {}),
       },
-      { clientDisplayName },
+      {
+        clientDisplayName,
+        ...(params.admittedActor ? { approvalActor: params.admittedActor } : {}),
+      },
     );
   }
 
@@ -155,7 +160,7 @@ export async function resolveApprovalOverGateway(
         id: approvalId,
         kind: canonicalKind,
         decision: params.decision,
-        ...(reviewer ? { reviewer } : {}),
+        ...(reviewer && !params.admittedActor ? { reviewer } : {}),
       };
       return await gatewayClient.request<ApprovalResolveResult>("approval.resolve", resolveParams);
     }
@@ -166,7 +171,7 @@ export async function resolveApprovalOverGateway(
       await gatewayClient.request(method, {
         id: approvalId,
         decision: params.decision,
-        ...(reviewer ? { reviewer } : {}),
+        ...(reviewer && !params.admittedActor ? { reviewer } : {}),
       });
     };
     if (legacyMethod === "plugin" || (!legacyMethod && approvalId.startsWith("plugin:"))) {
@@ -185,12 +190,29 @@ export async function resolveApprovalOverGateway(
   };
 
   const scopedGatewayRuntime = getGatewayNativeApprovalRuntime();
+  if (params.admittedActor && canonicalKind) {
+    if (!scopedGatewayRuntime) {
+      throw new Error("Authenticated approval runtime unavailable");
+    }
+    return await scopedGatewayRuntime.request<ApprovalResolveResult>(
+      "approval.resolve",
+      { id: approvalId, kind: canonicalKind, decision: params.decision },
+      { clientDisplayName, approvalActor: params.admittedActor },
+    );
+  }
+  if (params.admittedActor && !scopedGatewayRuntime) {
+    throw new Error("Authenticated approval runtime unavailable");
+  }
   const result = scopedGatewayRuntime
     ? await requestWithClient({
         request: async <T>(
           method: GatewayNativeApprovalMethod,
           requestParams: Record<string, unknown>,
-        ) => await scopedGatewayRuntime.request<T>(method, requestParams, { clientDisplayName }),
+        ) =>
+          await scopedGatewayRuntime.request<T>(method, requestParams, {
+            clientDisplayName,
+            ...(params.admittedActor ? { approvalActor: params.admittedActor } : {}),
+          }),
       })
     : await withOperatorApprovalsGatewayClient(
         {

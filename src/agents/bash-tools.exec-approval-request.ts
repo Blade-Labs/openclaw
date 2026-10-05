@@ -9,6 +9,7 @@ import {
 } from "@openclaw/normalization-core/number-coercion";
 import { normalizeOptionalString as parseString } from "@openclaw/normalization-core/string-coerce";
 import { isApprovalNotFoundError } from "../infra/approval-errors.js";
+import type { ApprovalRequestAuthorization } from "../infra/approval-requester-binding.js";
 import type {
   ExecApprovalCommandSpan,
   ExecApprovalUnavailableDecision,
@@ -139,6 +140,7 @@ export type ExecApprovalRegistration = {
   id: string;
   expiresAtMs: number;
   finalDecision?: string | null;
+  authorization?: ApprovalRequestAuthorization;
 };
 
 class ExecApprovalRunAbortedError extends Error {
@@ -158,33 +160,55 @@ async function registerExecApprovalRequest(
 ): Promise<ExecApprovalRegistration> {
   // Two-phase registration is critical: the ID must be registered server-side
   // before exec returns `approval-pending`, otherwise `/approve` can race and orphan.
-  const registrationResult = await callGatewayTool(
+  const registrationResult = await callGatewayTool<{
+    id?: string;
+    expiresAtMs?: number;
+    decision?: string | null;
+    authorization?: ApprovalRequestAuthorization;
+  }>(
     "exec.approval.request",
     { timeoutMs: DEFAULT_APPROVAL_REQUEST_TIMEOUT_MS },
     buildExecApprovalRequestToolParams(params),
     { expectFinal: false },
   );
   markToolDecisionRecorded();
+  const authorization = registrationResult?.authorization;
   const decision = parseDecision(registrationResult);
   const id = parseString(registrationResult?.id) ?? params.id;
   const expiresAtMs =
     parseExpiresAtMs(registrationResult?.expiresAtMs) ?? resolveDefaultExecApprovalExpiresAtMs();
   if (decision.present) {
-    return { id, expiresAtMs, finalDecision: decision.value };
+    return {
+      id,
+      expiresAtMs,
+      authorization,
+      finalDecision:
+        authorization?.policy.requireResolverMatch && decision.value !== "allow-once"
+          ? "deny"
+          : decision.value,
+    };
   }
-  return { id, expiresAtMs };
+  return { id, expiresAtMs, authorization };
 }
 
 /** Uses a pre-resolved decision or waits for the registered approval id. */
 export async function resolveRegisteredExecApprovalDecision(params: {
   approvalId: string;
   preResolvedDecision: string | null | undefined;
+  authorization?: ApprovalRequestAuthorization;
+  onAuthorization?: (authorization: ApprovalRequestAuthorization) => void;
 }): Promise<string | null> {
   if (params.preResolvedDecision !== undefined) {
-    return params.preResolvedDecision ?? null;
+    return params.authorization?.policy.requireResolverMatch &&
+      params.preResolvedDecision !== "allow-once"
+      ? "deny"
+      : (params.preResolvedDecision ?? null);
   }
   try {
-    const decisionResult = await callGatewayTool<{ decision: string }>(
+    const decisionResult = await callGatewayTool<{
+      decision: string;
+      authorization?: ApprovalRequestAuthorization;
+    }>(
       "exec.approval.waitDecision",
       { timeoutMs: DEFAULT_APPROVAL_REQUEST_TIMEOUT_MS },
       { id: params.approvalId },
@@ -196,11 +220,19 @@ export async function resolveRegisteredExecApprovalDecision(params: {
     ) {
       throw new ExecApprovalRunAbortedError();
     }
-    return parseDecision(decisionResult).value;
+    const decision = parseDecision(decisionResult).value;
+    if (decisionResult?.authorization) {
+      params.onAuthorization?.(decisionResult.authorization);
+    }
+    return (params.authorization?.policy.requireResolverMatch ||
+      decisionResult?.authorization?.policy.requireResolverMatch) &&
+      decision !== "allow-once"
+      ? "deny"
+      : decision;
   } catch (err) {
     // Timeout/cleanup path: treat missing/expired as no decision so askFallback applies.
     if (isApprovalNotFoundError(err)) {
-      return null;
+      return params.authorization?.policy.requireResolverMatch ? "deny" : null;
     }
     throw err;
   }

@@ -667,10 +667,26 @@ CLI: `openclaw approvals` supports gateway or node editing - see
 
 ## Approval flow
 
-When a prompt is required, the gateway broadcasts
+For approvals using the default delivery policy, the gateway broadcasts
 `exec.approval.requested` to operator clients. The Control UI and macOS
 app resolve it via `exec.approval.resolve`, then the gateway forwards the
 approved request to the node host.
+
+Channels can require requester-only approval. Core binds such requests to the
+authenticated user inputs of the admitted run and sends approval details only
+to that requester's verified destination. Native controls and `/approve` use the
+same requester check; Control UI, CLI, administrators, and operator RPC cannot
+override it. Missing, mixed, or non-user bindings fail closed without permissive
+fallback. Core sends a blocked-request notice only when the admitted source
+identifies one verified personal chat, and records failed or unavailable notice
+delivery. Pending strict requests retain their policy if the channel option is
+later disabled. See [Teams requester-only
+approvals](/channels/msteams/cards-and-actions#requester-only-approvals).
+
+Approval results can include `resolvedByActor`, the identity core recorded from
+the authenticated resolving transport. The existing `resolvedBy` text is a
+display label. Neither client-supplied identity fields nor display labels prove
+who approved; missing or legacy actor data cannot satisfy requester matching.
 
 The macOS approval panel keeps ordinary commands compact, with the supplied agent
 and host in one summary. It shows the working directory beneath the full,

@@ -59,6 +59,7 @@ export type ApnsRelayRequestSender = (params: {
   payload: object;
   signal?: AbortSignal;
   isCurrent?: () => Promise<boolean>;
+  assertCurrent?: () => void;
 }) => Promise<ApnsRelayPushResponse>;
 
 /** Hosted APNs relay origin used only when registrations prove they were minted there. */
@@ -301,10 +302,12 @@ async function sendApnsRelayRequest(params: {
   payload: object;
   signal?: AbortSignal;
   isCurrent?: () => Promise<boolean>;
+  assertCurrent?: () => void;
 }): Promise<ApnsRelayPushResponse> {
   await requireCurrentApnsRelaySend(params);
   const timeoutSignal = AbortSignal.timeout(params.relayConfig.timeoutMs);
   const signal = params.signal ? AbortSignal.any([params.signal, timeoutSignal]) : timeoutSignal;
+  params.assertCurrent?.();
   const response = await fetch(`${params.relayConfig.baseUrl}/v1/push/send`, {
     method: "POST",
     redirect: "manual",
@@ -380,6 +383,7 @@ export async function sendApnsRelayPush(params: {
   requestSender?: ApnsRelayRequestSender;
   signal?: AbortSignal;
   isCurrent?: () => Promise<boolean>;
+  assertCurrent?: () => void;
 }): Promise<ApnsRelayPushResponse> {
   await requireCurrentApnsRelaySend(params);
   const sender = params.requestSender ?? sendApnsRelayRequest;
@@ -399,6 +403,7 @@ export async function sendApnsRelayPush(params: {
       bodyJson,
     }),
   );
+  params.assertCurrent?.();
   return await sender({
     relayConfig: params.relayConfig,
     sendGrant: params.sendGrant,
@@ -412,5 +417,6 @@ export async function sendApnsRelayPush(params: {
     payload: params.payload,
     ...(params.signal ? { signal: params.signal } : {}),
     ...(params.isCurrent ? { isCurrent: params.isCurrent } : {}),
+    ...(params.assertCurrent ? { assertCurrent: params.assertCurrent } : {}),
   });
 }

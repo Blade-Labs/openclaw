@@ -1,5 +1,6 @@
 import { DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS } from "../../packages/gateway-client/src/timeouts.js";
 import type { AgentWaitParams } from "../../packages/gateway-protocol/src/index.js";
+import type { AdmittedChannelActor } from "../channels/message-access/approval-actor.js";
 import { createOutboundSendDeps } from "../cli/outbound-send-deps.js";
 import {
   GATEWAY_NATIVE_APPROVAL_METHODS,
@@ -13,10 +14,11 @@ import type {
 import { createApprovalNativeRouteCoordinator } from "../infra/approval-native-route-coordinator.js";
 import type { ChannelApprovalKind } from "../infra/approval-types.js";
 import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
+import { createInternalAgentTurnFacade } from "./agent-turn/internal-facade.js";
 // HTTP agent ingress can finish before the lazy agent.wait handler loads its recorder.
 import "./agent-turn/agent-job.js";
-import { createInternalAgentTurnFacade } from "./agent-turn/internal-facade.js";
 import type { InternalAgentTurnPrincipalOptions } from "./agent-turn/internal-facade.types.js";
+import { requiresApprovalRequesterMatch } from "./approval-request-policy.js";
 import {
   resolveLeastPrivilegeOperatorScopesForMethod,
   APPROVALS_SCOPE,
@@ -299,31 +301,93 @@ export function createGatewayInstanceRuntime(
     createAgentTurnFacade,
     approvalEvents: {
       publishRequested: (kind, request) =>
+        requiresApprovalRequesterMatch(
+          (request as GatewayApprovalRequest).request.authorization,
+          options.getContext().getRuntimeConfig(),
+          kind,
+        )
+          ? 0
+          : publish(
+              kind,
+              (subscriber) => subscriber.onRequested(request as GatewayApprovalRequest),
+              (subscriber) => subscriber.shouldHandle(request as GatewayApprovalRequest),
+            ),
+      deliverRequester: async (kind, input) => {
+        assertDispatchAvailable("approval requester delivery");
+        const request = input as GatewayApprovalRequest;
+        const binding = request.request.authorization?.requesterBinding;
+        if (binding?.state !== "bound") {
+          return false;
+        }
+        const matches = [...approvalSubscribers].filter(
+          (subscriber) =>
+            subscriber.eventKinds.has(kind) &&
+            subscriber.channel === binding.channel &&
+            subscriber.accountId === binding.accountId &&
+            subscriber.deliverRequester,
+        );
+        const subscriber = matches.length === 1 ? matches[0] : undefined;
+        const deliverRequester = subscriber?.deliverRequester;
+        if (!subscriber || !deliverRequester) {
+          return false;
+        }
+        try {
+          if (!subscriber.shouldHandle(request)) {
+            return false;
+          }
+          const delivered = await deliverRequester(request);
+          assertDispatchAvailable("approval requester delivery");
+          return delivered;
+        } catch (error) {
+          options.logError?.(`requester approval delivery failed: ${String(error)}`);
+          return false;
+        }
+      },
+      reportBlockedRequest: (kind, request) =>
+        routeCoordinator.reportBlockedRequest(kind, request as GatewayApprovalRequest),
+      publishResolved: (kind, input) => {
+        const resolved = input as GatewayApprovalResolved;
+        const authorization = resolved.request?.authorization;
+        const binding = authorization?.requesterBinding;
         publish(
           kind,
-          (subscriber) => subscriber.onRequested(request as GatewayApprovalRequest),
-          (subscriber) => subscriber.shouldHandle(request as GatewayApprovalRequest),
-        ),
-      publishResolved: (kind, resolved) => {
-        publish(kind, (subscriber) => subscriber.onResolved(resolved as GatewayApprovalResolved));
+          (subscriber) => subscriber.onResolved(resolved),
+          (subscriber) =>
+            !requiresApprovalRequesterMatch(
+              authorization,
+              options.getContext().getRuntimeConfig(),
+              kind,
+            ) ||
+            (binding?.state === "bound" &&
+              subscriber.channel === binding.channel &&
+              subscriber.accountId === binding.accountId),
+        );
       },
     },
     nativeApprovals: {
       request: async <T>(
         method: GatewayNativeApprovalMethod,
         payload: Record<string, unknown>,
-        requestOptions?: { clientDisplayName?: string },
+        requestOptions?: { clientDisplayName?: string; approvalActor?: AdmittedChannelActor },
       ) =>
         await dispatch<T>({
           allowedMethods: approvalMethods,
-          client: requestOptions?.clientDisplayName
+          client: requestOptions
             ? {
                 ...approvalClient,
+                internal: {
+                  ...approvalClient.internal,
+                  ...(requestOptions.approvalActor
+                    ? { approvalActor: requestOptions.approvalActor }
+                    : {}),
+                },
                 connect: {
                   ...approvalClient.connect,
                   client: {
                     ...approvalClient.connect.client,
-                    displayName: requestOptions.clientDisplayName,
+                    ...(requestOptions.clientDisplayName
+                      ? { displayName: requestOptions.clientDisplayName }
+                      : {}),
                   },
                 },
               }

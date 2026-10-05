@@ -1,8 +1,10 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { ErrorCodes, errorShape } from "../../../packages/gateway-protocol/src/index.js";
+import { getRuntimeConfig } from "../../config/config.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { ChannelApprovalKind } from "../../infra/approval-types.js";
+import { requiresApprovalRequesterMatch } from "../approval-request-policy.js";
 import type {
   ExecApprovalIdLookupResult,
   ExecApprovalManager,
@@ -140,6 +142,12 @@ export async function listVisiblePendingApprovalRequests<TPayload>(params: {
     .filter(
       (record) =>
         !params.client?.invalidated &&
+        record.requiresRequesterMatch?.() !== true &&
+        !requiresApprovalRequesterMatch(
+          record.authorization,
+          cfg ?? getRuntimeConfig(),
+          params.approvalKind ?? params.manager.approvalKind,
+        ) &&
         isApprovalRecordVisibleToClient({
           record,
           client: params.client ?? null,

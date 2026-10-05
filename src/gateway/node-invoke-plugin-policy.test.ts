@@ -17,6 +17,7 @@ import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
 import type { OpenClawPluginNodeInvokePolicyContext } from "../plugins/types.js";
 import { closeOpenClawStateDatabaseByPathAsync } from "../state/openclaw-state-db-cache.js";
+import { withRequesterApprovalChannel } from "./approval-requester.test-support.js";
 import { ExecApprovalManager } from "./exec-approval-manager.js";
 import {
   createTestApprovalFixture,
@@ -763,6 +764,65 @@ describe("applyPluginNodeInvokePolicy", () => {
     });
   });
 
+  it("returns a typed terminal denial for strict node policy with unavailable admitted source", async (testContext) => {
+    const fixture = createTestApprovalFixture<PluginApprovalRequestPayload>(testContext, {
+      approvalKind: "plugin",
+      validateAgentRuntimeDelegatedAuthority: () => true,
+    });
+    await fixture.run(async () => {
+      setDangerousDemoCommandRegistry([
+        createApprovalRequestPolicy({ allowedDecisions: ["allow-once", "allow-always", "deny"] }),
+      ]);
+      await withRequesterApprovalChannel(async () => {
+        const { context, invoke } = createContext({
+          pluginApprovalManager: fixture.manager,
+          validateAgentRuntimeApprovalAuthority: () => true,
+          hasExecApprovalClients: () => true,
+        });
+        vi.mocked(context.broadcast).mockImplementation((_event, request) => {
+          void fixture.manager.resolve((request as { id: string }).id, "allow-once");
+        });
+        const operationalRunInstance = createOperationalRunInstanceRef("synthetic-node-run");
+        const client = {
+          ...createOperatorClient(),
+          internal: {
+            agentRuntimeIdentity: {
+              kind: "agentRuntime" as const,
+              agentId: "main",
+              sessionKey: "agent:main:synthetic-node",
+              operationalRunInstance,
+              delegatedAuthority: {
+                kind: "local" as const,
+                operationalRunInstance,
+                lifecycleGeneration: "synthetic-generation",
+                claimId: "synthetic-claim",
+              },
+              turnSourceChannel: "test",
+              turnSourceAccountId: "default",
+            },
+          },
+        };
+        await expect(
+          applyPluginNodeInvokePolicy({
+            context,
+            client,
+            nodeSession: createNodeSession(),
+            command: DEMO_COMMAND,
+            params: DEMO_PARAMS,
+          }),
+        ).rejects.toMatchObject({
+          details: {
+            code: "APPROVAL_REQUESTER_UNAVAILABLE",
+            terminalReason: "requester-unavailable",
+          },
+        });
+        expect(context.broadcast).not.toHaveBeenCalled();
+        expect(invoke).not.toHaveBeenCalled();
+        expect(await fixture.manager.listPendingRecords()).toEqual([]);
+      });
+    });
+  });
+
   it("limits explicitly one-shot node-policy approvals to allow-once or deny", async (testContext) => {
     const fixture = createTestApprovalFixture<PluginApprovalRequestPayload>(testContext, {
       approvalKind: "plugin",
@@ -785,6 +845,10 @@ describe("applyPluginNodeInvokePolicy", () => {
         () => fixture.track(invokeDemoPolicy(context, createOperatorClient())),
       );
       expect(record.request.allowedDecisions).toEqual(["allow-once", "deny"]);
+      expect(record.authorization).toMatchObject({
+        requesterBinding: { state: "unavailable" },
+        policy: { requireResolverMatch: false },
+      });
       expect(await manager.resolve(record.id, "allow-always")).toBe(false);
       expect(await manager.listPendingRecords()).toHaveLength(1);
 

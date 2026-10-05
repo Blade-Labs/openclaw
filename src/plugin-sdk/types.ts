@@ -20,3 +20,4 @@ export type {
   PluginHookToolResultPersistEvent,
   PluginHookToolResultPersistResult,
 } from "../plugins/hook-types.js";
+export type { TurnSourceProvenance } from "../infra/turn-source-provenance.js";

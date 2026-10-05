@@ -346,6 +346,7 @@ export async function prepareEmbeddedAttemptToolBase(params: {
           const allTools = createOpenClawCodingToolsInternal(
             codingToolOptions,
             params.skillReadResources,
+            attempt.admittedRunContext,
           );
           // The built-in harness retains its existing authoritative wrappers.
           // Only plugin harnesses receive and require the projected host capability.

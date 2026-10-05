@@ -8,12 +8,14 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { ToolLoopDetectionConfig } from "../config/types.tools.js";
 import type { DiagnosticToolTerminalReason } from "../infra/diagnostic-events.js";
 import type { DiagnosticTraceContext } from "../infra/diagnostic-trace-context.js";
+import type { TurnSourceProvenance } from "../infra/turn-source-provenance.js";
 import type {
   PluginApprovalResolution,
   PluginHookBeforeToolCallResult,
   PluginHookToolRequesterContext,
 } from "../plugins/types.js";
 import type { SkillSnapshot, SkillTelemetrySource, SkillUsagePath } from "../skills/types.js";
+import type { ApprovalExecution } from "./approval-execution.js";
 import type { AgentTool } from "./runtime/index.js";
 import type { SandboxFsBridge } from "./sandbox/fs-bridge.js";
 
@@ -31,6 +33,9 @@ export type ToolOutcomeObservation = {
 export type ToolOutcomeObserver = (observation: ToolOutcomeObservation) => void;
 
 export type HookContext = {
+  source?: TurnSourceProvenance;
+  /** Host accessor captures the current admitted source once per tool invocation. */
+  readSource?: () => TurnSourceProvenance;
   agentId?: string;
   config?: OpenClawConfig;
   /** Tool execution cwd for host-derived path facts. */
@@ -119,6 +124,7 @@ export type HookOutcome =
       params: unknown;
       ownerDecision?: true;
       approvalResolution?: PluginApprovalResolution;
+      approvalExecutions?: ApprovalExecution[];
       deferredApproval?: DeferredPluginToolApproval;
       loopWarning?: ToolLoopWarning;
     };

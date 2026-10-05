@@ -2,9 +2,19 @@ import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coerci
 // Tests active reply run registry add, lookup, and cleanup behavior.
 import { afterEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
+import {
+  captureAdmittedRunSource,
+  createOperationalRunInstanceRef,
+  prepareAgentRunAdmission,
+} from "../../agents/admitted-run-context.js";
 import { QuestionAnswerUnconfirmedError } from "../../agents/harness/gateway-question-dispatch.js";
 import { createAgentRunRestartAbortError } from "../../agents/run-termination.js";
 import { SessionPendingInputCustodyError } from "../../config/sessions/session-pending-input-custody-error.js";
+import {
+  combineHostTurnSources,
+  createHostChannelTurnSource,
+  MAX_TURN_SOURCE_INPUTS,
+} from "../../infra/host-turn-source.js";
 import {
   getDiagnosticSessionActivitySnapshot,
   markDiagnosticEmbeddedRunStarted,
@@ -48,7 +58,10 @@ import {
   waitForReplyRunEndBySessionId,
   waitForReplyRunSuccessorAdmission,
 } from "./reply-run-registry.js";
-import { lifecycleAdmissionByOperation } from "./reply-run-registry.state.js";
+import {
+  admittedRunByOperation,
+  lifecycleAdmissionByOperation,
+} from "./reply-run-registry.state.js";
 import {
   createTestReplyOperation,
   queueCurrentReplyRunMessage,
@@ -70,11 +83,183 @@ async function withFakeReplyTimers<T>(run: () => Promise<T>): Promise<T> {
 }
 
 describe("reply run registry", () => {
+  it.each(["off", "off-closed", "target-strict", "incoming-strict"] as const)(
+    "keeps source steering policy at the backend boundary (%s)",
+    async (mode) => {
+      const makeSource = (senderId: string, strict: boolean) =>
+        createHostChannelTurnSource({
+          actor: { channel: "test", accountId: "default", senderId, actorKind: "human" },
+          message: {
+            messageId: `${senderId}-message`,
+            conversationId: "synthetic-dm",
+            conversationKind: "direct",
+            eventKind: "message",
+          },
+          ...(strict
+            ? {
+                policy: {
+                  requireResolverMatch: true as const,
+                  delivery: "requester" as const,
+                  allowedDecisions: ["allow-once", "deny"] as const,
+                },
+              }
+            : {}),
+        });
+      const prepared = prepareAgentRunAdmission({
+        cfg: {},
+        facts: {
+          runId: "synthetic-run",
+          agentId: "main",
+          ingress: { kind: "channel", boundary: "test", state: "present" },
+        },
+        operationalRunInstance: createOperationalRunInstanceRef("synthetic-run"),
+        sessionKey: "synthetic-session",
+        turnSource: makeSource("synthetic-sender-a", mode === "target-strict"),
+      });
+      const operation = createTestReplyOperation({ sessionId: "synthetic-session" });
+      const queueMessage = vi.fn(
+        async (_text: string, _options?: ReplyBackendQueueMessageOptions) => {
+          if (mode === "off-closed") {
+            prepared.close();
+          }
+        },
+      );
+      try {
+        const context = await prepared.admit("embedded");
+        admittedRunByOperation.set(operation, context);
+        operation.attachBackend({
+          kind: "embedded",
+          runId: "synthetic-run",
+          cancel: vi.fn(),
+          queueMessage,
+        });
+        operation.setPhase("running");
+        const target = replyRunRegistry.resolveCurrentMessageInjectionTarget(operation.key);
+        expect(target).toBeDefined();
+        if (!target) {
+          throw new Error("missing fixture target");
+        }
+        const attempt = beginReplyMessageInjectionTarget(target, "second input", {
+          turnSource: makeSource("synthetic-sender-b", mode === "incoming-strict"),
+        });
+        if (mode === "off" || mode === "off-closed") {
+          await expect(attempt.outcome).resolves.toMatchObject({ status: "accepted" });
+          expect(queueMessage).toHaveBeenCalledOnce();
+          expect(queueMessage.mock.calls[0]?.[1]).not.toHaveProperty("turnSource");
+          expect(captureAdmittedRunSource(context)).toMatchObject({
+            source: { revision: 1 },
+            requesterBinding: { state: "mixed" },
+          });
+        } else {
+          await expect(attempt.outcome).resolves.toEqual({
+            status: "rejected",
+            reason: "source_requires_followup",
+          });
+          await expect(attempt.acceptance).resolves.toBe(false);
+          expect(queueMessage).not.toHaveBeenCalled();
+          expect(captureAdmittedRunSource(context).source.revision).toBe(0);
+        }
+      } finally {
+        admittedRunByOperation.delete(operation);
+        operation.complete();
+        prepared.close();
+      }
+    },
+  );
   afterEach(() => {
     testing.resetReplyRunRegistry();
     resetCommandQueueStateForTest();
     resetDiagnosticRunActivityForTest();
     vi.restoreAllMocks();
+  });
+
+  it("settles concurrently accepted steering when descriptive source exceeds its bound", async () => {
+    const makeSource = (index: number) =>
+      createHostChannelTurnSource({
+        actor: {
+          channel: "test",
+          accountId: "default",
+          senderId: "synthetic-sender",
+          actorKind: "human",
+        },
+        message: {
+          messageId: `synthetic-message-${index}`,
+          conversationId: "synthetic-dm",
+          conversationKind: "direct",
+          eventKind: "message",
+        },
+      });
+    const prepared = prepareAgentRunAdmission({
+      cfg: {},
+      facts: {
+        runId: "synthetic-concurrent-run",
+        agentId: "main",
+        ingress: { kind: "channel", boundary: "test", state: "present" },
+      },
+      operationalRunInstance: createOperationalRunInstanceRef("synthetic-concurrent-run"),
+      sessionKey: "synthetic-concurrent-session",
+      turnSource: combineHostTurnSources(
+        Array.from({ length: MAX_TURN_SOURCE_INPUTS - 1 }, (_, index) => makeSource(index)),
+      ),
+    });
+    const operation = createTestReplyOperation({ sessionId: "synthetic-concurrent-session" });
+    const pending = [createDeferred(), createDeferred()];
+    const queueMessage = vi.fn((_text: string, _options?: ReplyBackendQueueMessageOptions) => {
+      const queued = pending[queueMessage.mock.calls.length - 1];
+      if (!queued) {
+        throw new Error("Unexpected fixture queue call");
+      }
+      return queued.promise;
+    });
+    try {
+      const context = await prepared.admit("embedded");
+      admittedRunByOperation.set(operation, context);
+      operation.attachBackend({
+        kind: "embedded",
+        runId: "synthetic-concurrent-run",
+        cancel: vi.fn(),
+        queueMessage,
+      });
+      operation.setPhase("running");
+      const target = replyRunRegistry.resolveCurrentMessageInjectionTarget(operation.key);
+      if (!target) {
+        throw new Error("missing fixture target");
+      }
+      const original = captureAdmittedRunSource(context);
+      const onQueueAccepted = vi.fn();
+      const attempts = pending.map((_, index) =>
+        beginReplyMessageInjectionTarget(target, `synthetic input ${index}`, {
+          turnSource: makeSource(MAX_TURN_SOURCE_INPUTS + index),
+          onQueueAccepted,
+        }),
+      );
+      expect(queueMessage).toHaveBeenCalledTimes(2);
+      for (const [, options] of queueMessage.mock.calls) {
+        options?.onQueueAccepted?.(true);
+      }
+      pending.forEach((queued) => queued.resolve());
+      for (const attempt of attempts) {
+        await expect(attempt.acceptance).resolves.toBe(true);
+        await expect(attempt.outcome).resolves.toEqual({ status: "accepted" });
+      }
+      expect(onQueueAccepted.mock.calls).toEqual([[true], [true]]);
+      expect(captureAdmittedRunSource(context)).toMatchObject({
+        source: { completeness: "unavailable", revision: 2 },
+        requesterBinding: { state: "unavailable" },
+      });
+      expect(captureAdmittedRunSource(context).source.inputs.length).toBeLessThanOrEqual(
+        MAX_TURN_SOURCE_INPUTS,
+      );
+      expect(original).toMatchObject({
+        source: { completeness: "complete", revision: 0 },
+        requesterBinding: { state: "bound" },
+      });
+    } finally {
+      pending.forEach((queued) => queued.resolve());
+      admittedRunByOperation.delete(operation);
+      operation.complete();
+      prepared.close();
+    }
   });
 
   it("keeps ownership stable by sessionKey while sessionId rotates", async () => {

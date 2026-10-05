@@ -502,6 +502,7 @@ export abstract class ExecApprovalLifecycle<TPayload> {
     }
     const record = entry.record;
     if (
+      record.authorization?.policy.requireResolverMatch === true ||
       record.resolvedAtMs === undefined ||
       record.decision !== undefined ||
       record.consumedDecision !== undefined ||

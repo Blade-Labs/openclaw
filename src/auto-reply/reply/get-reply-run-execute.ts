@@ -18,17 +18,23 @@ import {
   attachToolAllowlistIntersection,
   readToolAllowlistIntersection,
 } from "../../agents/tool-policy.js";
-import { readChannelContextAdmissionEvidence } from "../../channels/message-access/admission-evidence.js";
+import {
+  readChannelContextAdmissionEvidence,
+  readChannelContextTurnSource,
+} from "../../channels/message-access/admission-evidence.js";
 import { getRuntimeConfig } from "../../config/config.js";
 import { conversationIdentityFromMsgContext } from "../../config/sessions/conversation-identity.js";
 import { resolveGroupSessionKey } from "../../config/sessions/group.js";
 import { sessionPersonalProfileId } from "../../config/sessions/session-entry-provenance.js";
+import { createHostNonUserTurnSource } from "../../infra/host-turn-source.js";
 import { normalizeMediaFacts } from "../../media/media-facts.js";
 import { normalizeAccountId } from "../../routing/account-id.js";
 import { isSessionPersonalBootstrapTurn } from "../../sessions/session-participant-input.js";
 import { MEDIA_ONLY_USER_TEXT } from "../../sessions/user-turn-media.js";
 import {
   createUserTurnTranscriptRecorder,
+  bindUserTurnTranscriptTurnSource,
+  readUserTurnTranscriptTurnSource,
   resolvePersistedUserTurnText,
 } from "../../sessions/user-turn-transcript.js";
 import { buildChannelUserTurnSender } from "../../sessions/user-turn-transcript.metadata.js";
@@ -384,7 +390,42 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
     InternalTurnSource: ctx.InternalTurnSource ?? sessionCtx.InternalTurnSource,
     InputProvenance: inputProvenance,
   });
+  const turnSource = (() => {
+    const internalSource = ctx.InternalTurnSource ?? sessionCtx.InternalTurnSource;
+    if (internalSource) {
+      return createHostNonUserTurnSource(
+        internalSource === "cron" || internalSource === "heartbeat" ? internalSource : "system",
+      );
+    }
+    if (
+      inputProvenance?.sourceRole === "subagent" ||
+      inputProvenance?.sourceTool === "subagent_announce" ||
+      inputProvenance?.sourceTool === "subagent_settle"
+    ) {
+      return createHostNonUserTurnSource("subagent", inputProvenance.runId);
+    }
+    if (inputProvenance?.kind === "inter_session") {
+      return createHostNonUserTurnSource("cross-session", inputProvenance.runId);
+    }
+    if (inputProvenance?.kind === "internal_system") {
+      return createHostNonUserTurnSource("system", inputProvenance.runId);
+    }
+    if (isHeartbeat) {
+      return createHostNonUserTurnSource("heartbeat");
+    }
+    return (
+      readChannelContextTurnSource(ctx) ??
+      readChannelContextTurnSource(sessionCtx) ??
+      createHostNonUserTurnSource("unknown")
+    );
+  })();
+  if (userTurnTranscriptRecorder) {
+    bindUserTurnTranscriptTurnSource(userTurnTranscriptRecorder, turnSource);
+  }
   const followupRun = {
+    turnSource: userTurnTranscriptRecorder
+      ? (readUserTurnTranscriptTurnSource(userTurnTranscriptRecorder) ?? turnSource)
+      : turnSource,
     prompt: queuedBody,
     personalBootstrapEligible,
     operatorAuthority: opts?.operatorAuthority,

@@ -94,6 +94,37 @@ function requireSendRequest(send: ReturnType<typeof vi.fn>) {
 
 describe("APNs dispatch", () => {
   it.each([
+    ["direct", "exec"],
+    ["direct", "plugin"],
+    ["relay", "exec"],
+    ["relay", "plugin"],
+  ] as const)("retains the final %s %s approval dispatch guard", async (transport, kind) => {
+    const { send, params } = createApnsTransportFixture(transport);
+    let suppressed = false;
+    const assertCurrent = () => {
+      if (suppressed) {
+        throw new Error("synthetic requester-only suppression");
+      }
+    };
+    const approval = {
+      ...params,
+      nodeId: "synthetic-ios-dispatch",
+      approvalId: "synthetic-approval-dispatch",
+      gatewayDeviceId: "synthetic-gateway-dispatch",
+      description: "Review this request.",
+      assertCurrent,
+    };
+    const sendApproval = kind === "exec" ? sendApnsExecApprovalAlert : sendApnsPluginApprovalAlert;
+    await sendApproval(approval);
+    expect(requireSendRequest(send).assertCurrent).toBe(assertCurrent);
+    send.mockClear();
+    const blocked = sendApproval(approval);
+    suppressed = true;
+    await expect(blocked).rejects.toThrow("synthetic requester-only suppression");
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it.each([
     ["direct", "alert"],
     ["direct", "background"],
     ["relay", "alert"],

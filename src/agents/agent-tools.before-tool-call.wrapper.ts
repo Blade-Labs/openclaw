@@ -48,7 +48,7 @@ import {
   adjustedParamsByToolCallId,
   buildAdjustedParamsKey,
   clearTrackedToolExecution,
-  preExecutionBlockedToolCallIds,
+  recordPreExecutionBlockedToolCall,
   recordStructuredReplaySafeToolCall,
   recordToolExecutionStarted,
   recordToolExecutionTracked,
@@ -68,6 +68,7 @@ import {
   readInternalToolExecutionValidation,
   validateToolExecutionParams,
 } from "./agent-tools.execution-validation.js";
+import { redeemApprovalExecutions } from "./approval-execution.js";
 import {
   bindBeforeToolCallMetadata,
   clearBeforeToolCallWrappedMarker,
@@ -535,8 +536,12 @@ export function wrapToolWithBeforeToolCallHook(
       }
       // Host capabilities can close while hooks, approval, validation, or
       // steering awaits. Recheck at the final synchronous source boundary.
+      const assertApprovalsCurrent = outcome.approvalExecutions?.length
+        ? await redeemApprovalExecutions(outcome.approvalExecutions)
+        : () => {};
       signal?.throwIfAborted();
       assertAgentPluginRuntimeCurrent();
+      assertApprovalsCurrent();
       runAgentToolSourceExecutionGuard(tool);
       admitExecution?.();
       onImplementationStart?.();
@@ -549,7 +554,10 @@ export function wrapToolWithBeforeToolCallHook(
         let result: Awaited<ReturnType<ForwardedToolExecution>>;
         try {
           const args = [toolCallId, executeParams, signal, forwardedOnUpdate, ...executionArgs];
-          const invoke = () => liveness.run(() => (execute as ForwardedToolExecution)(...args));
+          const invoke = () => {
+            assertApprovalsCurrent();
+            return liveness.run(() => (execute as ForwardedToolExecution)(...args));
+          };
           result = outcome.ownerDecision
             ? await invoke()
             : await runWithGenericToolActionDecision(tool, toolCallId, invoke);
@@ -726,18 +734,4 @@ export function rewrapToolWithBeforeToolCallHook(
   copyBeforeToolCallWrapperMetadata(tool, rewrapSource);
   copyAgentToolSourceExecutionGuard(tool, rewrapSource);
   return wrapToolWithBeforeToolCallHook(rewrapSource, ctx ?? preservedContext, wrapperOptions);
-}
-
-function recordPreExecutionBlockedToolCall(toolCallId?: string, runId?: string): void {
-  if (!toolCallId) {
-    return;
-  }
-  preExecutionBlockedToolCallIds.add(buildAdjustedParamsKey({ runId, toolCallId }));
-  while (preExecutionBlockedToolCallIds.size > MAX_TRACKED_ADJUSTED_PARAMS) {
-    const oldest = preExecutionBlockedToolCallIds.values().next().value;
-    if (!oldest) {
-      break;
-    }
-    preExecutionBlockedToolCallIds.delete(oldest);
-  }
 }

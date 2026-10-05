@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  createOperationalRunInstanceRef,
+  prepareAgentRunAdmission,
+  getAdmittedRunDelegatedAuthority,
+} from "../../agents/admitted-run-context.js";
+import { validateAgentRunDelegatedAuthority } from "../../infra/agent-run-registry.js";
+import { createHostChannelTurnSource } from "../../infra/host-turn-source.js";
 import type { PluginApprovalRequestPayload } from "../../infra/plugin-approvals.js";
+import { createDeferredCore } from "../../shared/deferred.js";
 import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
 import type { AgentRuntimeIdentity } from "../agent-runtime-identity-token.js";
 import type { ExecApprovalManager } from "../exec-approval-manager.js";
@@ -77,6 +85,106 @@ afterEach(() => {
 });
 
 describe("plugin approval signed agent runtime", () => {
+  it("freezes approval authorization from the admitted run rather than request routing", async (testContext) => {
+    const admission = prepareAgentRunAdmission({
+      cfg: {},
+      facts: {
+        runId: "synthetic-approval-run",
+        agentId: "main",
+        ingress: { kind: "system", boundary: "approval-test", state: "present" },
+      },
+      operationalRunInstance: createOperationalRunInstanceRef("synthetic-approval-run"),
+      sessionKey: "agent:main:synthetic-source",
+      turnSource: createHostChannelTurnSource({
+        actor: {
+          channel: "test",
+          accountId: "default",
+          senderId: "synthetic-requester",
+          actorKind: "human",
+        },
+        message: {
+          messageId: "synthetic-message",
+          conversationId: "synthetic-personal-chat",
+          conversationKind: "direct",
+          eventKind: "message",
+        },
+        policy: {
+          requireResolverMatch: true,
+          delivery: "requester",
+          allowedDecisions: ["allow-once", "deny"],
+        },
+      }),
+    });
+    const admitted = await admission.admit("plugin-harness", "synthetic-plugin");
+    const authority = getAdmittedRunDelegatedAuthority(admitted);
+    if (!authority) {
+      throw new Error("Missing admitted test authority");
+    }
+    const fixture = createTestApprovalFixture<PluginApprovalRequestPayload>(testContext, {
+      approvalKind: "plugin",
+      validateAgentRuntimeDelegatedAuthority: validateAgentRunDelegatedAuthority,
+    });
+    try {
+      await fixture.run(async () => {
+        const opts = requestOptions({
+          request: {
+            title: "Synthetic action",
+            description: "Synthetic approval",
+            twoPhase: true,
+            turnSourceChannel: "synthetic-forged-channel",
+            turnSourceTo: "synthetic-forged-chat",
+            turnSourceAccountId: "synthetic-forged-account",
+          },
+          identity: {
+            kind: "agentRuntime",
+            agentId: "main",
+            sessionKey: "agent:main:synthetic-source",
+            operationalRunInstance: { ...admitted.operationalRunInstance },
+            delegatedAuthority: { ...authority, kind: "local" },
+            approvalOwnerPluginId: "synthetic-plugin",
+          },
+        });
+        const delivered = createDeferredCore();
+        opts.context.approvalEvents = {
+          publishRequested: vi.fn(() => 1),
+          publishResolved: vi.fn(),
+          deliverRequester: vi.fn(async () => {
+            delivered.resolve();
+            return true;
+          }),
+        };
+        const pending = fixture.track(Promise.resolve(requestHandler(fixture.manager)(opts)));
+        await delivered.promise;
+        const record = (await fixture.manager.listPendingRecords())[0];
+        expect(record?.authorization).toMatchObject({
+          requesterBinding: {
+            state: "bound",
+            channel: "test",
+            accountId: "default",
+            senderId: "synthetic-requester",
+          },
+          policy: { requireResolverMatch: true },
+        });
+        expect(Object.isFrozen(record?.authorization)).toBe(true);
+        expect(opts.context.broadcast).not.toHaveBeenCalled();
+        if (!record) {
+          throw new Error("Expected pending approval");
+        }
+        await fixture.manager.forceDenyDetailed(record.id, "requester-unavailable", {
+          kind: "system",
+          id: null,
+        });
+        await pending;
+        expect(await fixture.manager.getSnapshot(record.id)).toMatchObject({
+          authorization: record.authorization,
+          terminalReason: "requester-unavailable",
+        });
+      });
+    } finally {
+      admission.close();
+    }
+  });
+
   it("rejects closed authority before creating a plugin approval", async (testContext) => {
     const fixture = createTestApprovalFixture<PluginApprovalRequestPayload>(testContext, {
       approvalKind: "plugin",

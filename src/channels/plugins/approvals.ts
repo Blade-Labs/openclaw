@@ -3,8 +3,30 @@
  *
  * Projects plugin approval metadata into runtime approval delivery adapters.
  */
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { readHostTurnSource, type HostTurnSource } from "../../infra/host-turn-source.js";
+import { getLoadedChannelPlugin } from "./registry.js";
 import type { ChannelApprovalAdapter, ChannelApprovalCapability } from "./types.adapters.js";
 import type { ChannelPlugin } from "./types.plugin.js";
+
+/** A retained restriction can strengthen with current account policy, never disappear. */
+export function requiresTurnSourceRequesterMatch(
+  cfg: OpenClawConfig,
+  source?: HostTurnSource,
+): boolean {
+  const facts = readHostTurnSource(source);
+  return (
+    facts.requireResolverMatch ||
+    facts.accounts.some(({ channel, accountId }) => {
+      const capability = resolveChannelApprovalCapability(getLoadedChannelPlugin(channel));
+      return (["exec", "plugin", "system-agent"] as const).some(
+        (approvalKind) =>
+          capability?.resolveRequestPolicy?.({ cfg, accountId, approvalKind })
+            ?.requireResolverMatch === true,
+      );
+    })
+  );
+}
 
 /**
  * Returns the approval capability exposed by a channel plugin.

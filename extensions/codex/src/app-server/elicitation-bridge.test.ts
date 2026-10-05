@@ -320,6 +320,51 @@ describe("Codex app-server elicitation bridge", () => {
     expect(mockCallGatewayTool).toHaveBeenCalledTimes(2);
   });
 
+  it.each([false, true])(
+    "retains approval custody through the elicitation roundtrip (revoked=%s)",
+    async (revoked) => {
+      const params = createParams();
+      let consumed = false;
+      let current = true;
+      const assertCurrent = () => {
+        if (!current) {
+          throw new Error("Synthetic resolver revoked");
+        }
+      };
+      params.hostCapabilities = {
+        ...params.hostCapabilities,
+        requestApproval: async () => ({ id: "synthetic-elicitation-consent" }),
+        waitForApproval: async () => ({
+          decision: "allow-once",
+          terminalReason: "user",
+          approvalExecutions: [
+            {
+              requiresMatch: () => true,
+              latchRequesterMatch: () => {},
+              assertCurrent,
+              redeem: async () => {
+                assertCurrent();
+                consumed = true;
+              },
+              revalidate: async () => {
+                current = !revoked;
+                assertCurrent();
+              },
+            },
+          ],
+        }),
+      };
+      await expect(
+        handleCodexAppServerElicitationRequest({
+          requestParams: buildApprovalElicitation(),
+          paramsForRun: params,
+          ...codexTestTurnIds(),
+        }),
+      ).resolves.toMatchObject({ action: revoked ? "decline" : "accept" });
+      expect(consumed).toBe(true);
+    },
+  );
+
   it("routes MCP tool approval elicitations through plugin approvals", async () => {
     mockCallGatewayTool
       .mockResolvedValueOnce({ id: "plugin:approval-1", status: "accepted" })

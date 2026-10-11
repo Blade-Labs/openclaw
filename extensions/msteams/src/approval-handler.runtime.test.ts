@@ -1,3 +1,4 @@
+import { createChannelApprovalHandlerFromCapability } from "openclaw/plugin-sdk/approval-handler-runtime";
 import type {
   ExecApprovalPendingView,
   ExpiredApprovalView,
@@ -12,6 +13,33 @@ import type {
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { msTeamsApprovalControls } from "./approval-card-actions.js";
+import { msTeamsApprovalCapability } from "./approval-native.js";
+
+const routeGateway = vi.hoisted(() => vi.fn(async (_params: unknown) => ({ ok: true })));
+const blockedLog = vi.hoisted(() => vi.fn());
+// Exercise core routing through the public SDK with a secretless Gateway transport.
+vi.mock("../../../src/gateway/call.js", () => ({ callGatewayLeastPrivilege: routeGateway }));
+vi.mock("../../../src/gateway/operator-approvals-client.js", () => ({
+  createOperatorApprovalsGatewayClient: async (params: {
+    onHelloOk?: (hello: unknown) => void;
+  }) => {
+    queueMicrotask(() => params.onHelloOk?.({ type: "hello-ok" }));
+    return { request: vi.fn(async () => []), stop: vi.fn() };
+  },
+}));
+vi.mock("../../../packages/gateway-client/src/readiness.js", () => ({
+  startGatewayClientWhenEventLoopReady: async () => ({ ready: true, aborted: false }),
+}));
+vi.mock("../../../src/logging/subsystem.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../../src/logging/subsystem.js")>();
+  return {
+    ...actual,
+    createSubsystemLogger: (subsystem: string) => ({
+      ...actual.createSubsystemLogger(subsystem),
+      error: blockedLog,
+    }),
+  };
+});
 
 const sendAdaptiveCardMSTeams = vi.hoisted(() => vi.fn());
 const editAdaptiveCardMSTeams = vi.hoisted(() => vi.fn());
@@ -38,6 +66,7 @@ vi.mock("./conversation-store-state.js", () => ({
 const { msTeamsApprovalNativeRuntime } = await import("./approval-handler.runtime.js");
 
 const cfg: OpenClawConfig = {
+  approvals: { exec: { enabled: true }, plugin: { enabled: true } },
   channels: {
     msteams: {
       enabled: true,
@@ -107,10 +136,45 @@ function createPluginPendingView(): PluginApprovalPendingView {
 }
 
 function createRequest(view: PendingApprovalView): ExecApprovalRequest | PluginApprovalRequest {
+  const message = {
+    messageId: "source-message",
+    conversationId: "19:channel@thread.tacv2",
+    conversationKind: "channel" as const,
+    threadId: "thread-root",
+    eventKind: "message" as const,
+  };
+  const actor = {
+    channel: "msteams",
+    accountId: "default",
+    senderId: "00000000-0000-4000-8000-000000000001",
+    actorKind: "human" as const,
+  };
+  const authorization: NonNullable<ExecApprovalRequest["request"]["authorization"]> = {
+    version: 1,
+    source: {
+      version: 1,
+      runId: "run",
+      sessionKey: "agent:main:main",
+      revision: 1,
+      completeness: "complete",
+      inputs: [{ inputId: "input", origin: "user", actor, message }],
+    },
+    requesterBinding: {
+      state: "bound",
+      inputOrigin: "user",
+      ...actor,
+      runId: "run",
+      sessionKey: "agent:main:main",
+      sourceRevision: 1,
+      sources: [message],
+    },
+    policy: { requireResolverMatch: false, delivery: "default" },
+  };
   return view.approvalKind === "plugin"
     ? {
         id: view.approvalId,
         request: {
+          authorization,
           title: view.title,
           description: view.description ?? "",
           severity: view.severity,
@@ -122,7 +186,7 @@ function createRequest(view: PendingApprovalView): ExecApprovalRequest | PluginA
       }
     : {
         id: view.approvalId,
-        request: { command: view.commandText },
+        request: { command: view.commandText, authorization },
         createdAtMs: Date.now(),
         expiresAtMs: view.expiresAtMs,
       };
@@ -161,6 +225,10 @@ async function createPendingScenario(view: PendingApprovalView = createExecPendi
 describe("msTeamsApprovalNativeRuntime", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    storedConversations.clear();
+    storedConversations.set("19:channel@thread.tacv2", {
+      conversation: { id: "19:channel@thread.tacv2", conversationType: "channel" },
+    });
     sendAdaptiveCardMSTeams.mockResolvedValue({
       messageId: "approval-activity-1",
       conversationId: "19:channel@thread.tacv2",
@@ -237,7 +305,7 @@ describe("msTeamsApprovalNativeRuntime", () => {
     }
   });
 
-  it("sends a visible text fallback when card delivery fails", async () => {
+  it("leaves delivery-error notices to the core coordinator", async () => {
     const { view, request, pendingPayload, plannedTarget } = await createPendingScenario();
     sendMessageMSTeams.mockResolvedValue({
       messageId: "fallback-1",
@@ -255,10 +323,7 @@ describe("msTeamsApprovalNativeRuntime", () => {
       pendingPayload,
     });
 
-    await vi.waitFor(() => expect(sendMessageMSTeams).toHaveBeenCalledTimes(1));
-    const fallback = sendMessageMSTeams.mock.calls[0]?.[0];
-    expect(fallback?.to).toBe("msteams:conversation:19:channel@thread.tacv2");
-    expect(fallback?.text).toContain("/approve exec-approval-1 <allow-once|deny>");
+    expect(sendMessageMSTeams).not.toHaveBeenCalled();
   });
 
   it("delivers and binds pending cards, then replaces resolved cards without actions", async () => {
@@ -343,7 +408,7 @@ describe("msTeamsApprovalNativeRuntime", () => {
     });
     expect(editAdaptiveCardMSTeams).toHaveBeenCalledWith({
       cfg,
-      to: "19:channel@thread.tacv2",
+      to: "conversation:19:channel@thread.tacv2",
       activityId: "approval-activity-1",
       card: final.payload,
     });
@@ -463,6 +528,142 @@ describe("msTeamsApprovalNativeRuntime", () => {
   });
 });
 
+describe("Teams native approval delivery and forwarding suppression", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    storedConversations.clear();
+    sendAdaptiveCardMSTeams.mockResolvedValue({
+      messageId: "origin-card",
+      conversationId: "19:channel@thread.tacv2",
+    });
+  });
+
+  it.each([
+    "origin-drift",
+    "missing-origin",
+    "mixed-private-source",
+    "missing-provenance",
+  ] as const)(
+    "completes the registered %s delivery flow without forwarding to misleading targets",
+    async (scenario) => {
+      vi.useFakeTimers();
+      const request = createRequest(createExecPendingView());
+      request.id = `flow-${scenario}`;
+      request.request.turnSourceChannel = "msteams";
+      request.request.turnSourceAccountId = "default";
+      request.request.turnSourceTo = "user:00000000-0000-4000-8000-000000000002";
+      request.request.turnSourceThreadId = "wrong-thread";
+      const authorization = request.request.authorization;
+      if (!authorization) {
+        throw new Error("Expected admitted source");
+      }
+      if (scenario === "origin-drift") {
+        storedConversations.set("19:channel@thread.tacv2", {
+          conversation: { id: "19:channel@thread.tacv2", conversationType: "channel" },
+        });
+      } else if (scenario === "missing-provenance") {
+        request.request.authorization = undefined;
+      } else if (scenario === "mixed-private-source") {
+        const privateId = "a:source-private";
+        const senderId = "00000000-0000-4000-8000-000000000001";
+        storedConversations.set(privateId, {
+          aadObjectId: senderId,
+          conversation: { id: privateId, conversationType: "personal" },
+        });
+        request.request.authorization = {
+          ...authorization,
+          requesterBinding: { state: "mixed", reason: "mixed-origins" },
+          source: {
+            ...authorization.source,
+            inputs: [
+              {
+                inputId: "user",
+                origin: "user",
+                actor: { channel: "msteams", accountId: "default", senderId, actorKind: "human" },
+                message: {
+                  messageId: "private-input",
+                  conversationId: privateId,
+                  conversationKind: "direct",
+                  eventKind: "message",
+                },
+              },
+              { inputId: "system", origin: "system" },
+            ],
+          },
+        };
+      }
+      expect(
+        msTeamsApprovalCapability.delivery?.shouldSuppressForwardingFallback?.({
+          cfg,
+          approvalKind: "exec",
+          request,
+          target: { channel: "msteams", to: request.request.turnSourceTo },
+        }),
+      ).toBe(true);
+      const handler = await createChannelApprovalHandlerFromCapability({
+        label: "msteams/test-flow",
+        clientDisplayName: "Test",
+        channel: "msteams",
+        channelLabel: "Microsoft Teams",
+        accountId: "default",
+        cfg,
+        capability: {
+          native: msTeamsApprovalCapability.native,
+          nativeRuntime: msTeamsApprovalCapability.nativeRuntime,
+        },
+      });
+      if (!handler) {
+        throw new Error("Expected registered approval handler");
+      }
+      try {
+        const blockedNotice = Promise.withResolvers<void>();
+        if (scenario !== "origin-drift") {
+          blockedLog.mockImplementationOnce(() => blockedNotice.resolve());
+        }
+        await handler.start();
+        await handler.handleRequested(request);
+        if (scenario === "origin-drift") {
+          expect(sendAdaptiveCardMSTeams).toHaveBeenCalledWith(
+            expect.objectContaining({
+              to: "conversation:19:channel@thread.tacv2;messageid=thread-root",
+            }),
+          );
+          expect(routeGateway).not.toHaveBeenCalled();
+        } else {
+          // Skipped requests report their private notice asynchronously; join its outcome.
+          await blockedNotice.promise;
+          expect(sendAdaptiveCardMSTeams).not.toHaveBeenCalled();
+          expect(blockedLog).toHaveBeenCalledWith(
+            `approval ${request.id}: native delivery blocked; notice outcome=${scenario === "mixed-private-source" ? "sent" : "no-unique-chat"}`,
+          );
+          if (scenario === "mixed-private-source") {
+            expect(routeGateway).toHaveBeenCalledWith(
+              expect.objectContaining({
+                method: "send",
+                params: expect.objectContaining({
+                  to: "conversation:a:source-private",
+                  idempotencyKey: `approval-route-notice:delivery-failed:${request.id}`,
+                  message:
+                    "The native approval card could not be delivered. Check the request's status in Control UI or terminal UI.",
+                }),
+              }),
+            );
+          } else {
+            expect(routeGateway).not.toHaveBeenCalled();
+          }
+        }
+        expect(sendMessageMSTeams).not.toHaveBeenCalled();
+        expect(JSON.stringify(routeGateway.mock.calls)).not.toMatch(
+          /wrong-thread|00000000-0000-4000-8000-000000000002|deploy --production/,
+        );
+      } finally {
+        await handler.stop();
+        vi.useRealTimers();
+      }
+    },
+  );
+});
+
 describe("msTeamsApprovalNativeRuntime with requester-only approvals", () => {
   const REQUESTER_ID = "00000000-0000-4000-8000-000000000001";
   const COLLEAGUE_ID = "00000000-0000-4000-8000-000000000002";
@@ -477,81 +678,70 @@ describe("msTeamsApprovalNativeRuntime with requester-only approvals", () => {
     },
   };
 
-  async function createRequesterScenario(to = `conversation:${REQUESTER_CHAT}`) {
-    const view = createExecPendingView();
-    const base = createRequest(view) as ExecApprovalRequest;
-    const request: ExecApprovalRequest = {
-      ...base,
-      request: {
-        ...base.request,
+  async function createRequesterScenario(
+    to = `conversation:${REQUESTER_CHAT}`,
+    source?: { conversationId: string; conversationKind: "group" | "channel"; threadId?: string },
+    view: PendingApprovalView = createExecPendingView(),
+  ) {
+    const request = createRequest(view);
+    const message = {
+      messageId: "follow-up-message",
+      conversationId: REQUESTER_CHAT,
+      conversationKind: "direct" as const,
+      eventKind: "message" as const,
+      ...source,
+    };
+    const authorization: NonNullable<ExecApprovalRequest["request"]["authorization"]> = {
+      version: 1,
+      source: {
+        version: 1,
         runId: "queued-follow-up",
         sessionKey: "agent:main:main",
-        turnSourceChannel: "msteams",
-        turnSourceTo: `conversation:${REQUESTER_CHAT}`,
-        authorization: {
-          version: 1,
-          source: {
-            version: 1,
-            runId: "queued-follow-up",
-            sessionKey: "agent:main:main",
-            revision: 1,
-            completeness: "complete",
-            inputs: [
-              {
-                inputId: "queued-input",
-                origin: "user",
-                actor: {
-                  channel: "msteams",
-                  accountId: "default",
-                  senderId: REQUESTER_ID,
-                  actorKind: "human",
-                },
-                message: {
-                  messageId: "follow-up-message",
-                  conversationId: REQUESTER_CHAT,
-                  conversationKind: "direct",
-                  eventKind: "message",
-                },
-              },
-            ],
+        revision: 1,
+        completeness: "complete",
+        inputs: [
+          {
+            inputId: "queued-input",
+            origin: "user",
+            actor: {
+              channel: "msteams",
+              accountId: "default",
+              senderId: REQUESTER_ID,
+              actorKind: "human",
+            },
+            message,
           },
-          requesterBinding: {
-            state: "bound",
-            inputOrigin: "user",
-            channel: "msteams",
-            accountId: "default",
-            senderId: REQUESTER_ID,
-            runId: "queued-follow-up",
-            sessionKey: "agent:main:main",
-            sourceRevision: 1,
-            sources: [
-              {
-                messageId: "follow-up-message",
-                conversationId: REQUESTER_CHAT,
-                conversationKind: "direct",
-                eventKind: "message",
-              },
-            ],
-          },
-          policy: {
-            requireResolverMatch: true,
-            delivery: "requester",
-            allowedDecisions: ["allow-once", "deny"],
-          },
-        },
+        ],
+      },
+      requesterBinding: {
+        state: "bound",
+        inputOrigin: "user",
+        channel: "msteams",
+        accountId: "default",
+        senderId: REQUESTER_ID,
+        runId: "queued-follow-up",
+        sessionKey: "agent:main:main",
+        sourceRevision: 1,
+        sources: [message],
+      },
+      policy: {
+        requireResolverMatch: true,
+        delivery: "requester",
+        allowedDecisions: ["allow-once", "deny"],
       },
     };
+    request.request.authorization = authorization;
     const pendingPayload = await msTeamsApprovalNativeRuntime.presentation.buildPendingPayload({
       cfg: requesterOnlyCfg,
       accountId: "default",
       request,
-      approvalKind: "exec",
+      approvalKind: view.approvalKind,
       nowMs: Date.now(),
       view,
     });
     const plannedTarget = {
       surface: "origin" as const,
-      target: { to, threadId: null },
+      target: { to, threadId: source?.threadId ?? null },
       reason: "preferred" as const,
     };
     const prepared = await msTeamsApprovalNativeRuntime.transport.prepareTarget({
@@ -559,7 +749,7 @@ describe("msTeamsApprovalNativeRuntime with requester-only approvals", () => {
       accountId: "default",
       plannedTarget,
       request,
-      approvalKind: "exec",
+      approvalKind: view.approvalKind,
       view,
       pendingPayload,
     });
@@ -621,8 +811,151 @@ describe("msTeamsApprovalNativeRuntime with requester-only approvals", () => {
         requesterOnly: true,
       });
     }
+    await msTeamsApprovalNativeRuntime.transport.updateEntry?.({
+      cfg: requesterOnlyCfg,
+      accountId: "default",
+      request,
+      approvalKind: "exec",
+      entry,
+      payload: { type: "AdaptiveCard" },
+      phase: "resolved",
+    });
+    expect(editAdaptiveCardMSTeams).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: `conversation:${REQUESTER_CHAT}`,
+        activityId: "approval-activity-1",
+      }),
+    );
     msTeamsApprovalControls.unregister(binding ?? []);
   });
+
+  it.each(
+    [true, false].flatMap((requesterOnly) => [
+      {
+        requesterOnly,
+        conversationKind: "channel" as const,
+        conversationId: "19:channel@thread.tacv2",
+        type: "channel",
+        threadId: "thread-root",
+        phase: "resolved" as const,
+      },
+      {
+        requesterOnly,
+        conversationKind: "channel" as const,
+        conversationId: "19:channel@thread.tacv2",
+        type: "channel",
+        threadId: "thread-root",
+        phase: "expired" as const,
+      },
+      {
+        requesterOnly,
+        conversationKind: "group" as const,
+        conversationId: "19:group@thread.v2",
+        type: "groupChat",
+        threadId: undefined,
+        phase: "resolved" as const,
+      },
+    ]),
+  )(
+    "delivers and updates the same origin card in $conversationKind ($phase, requesterOnly=$requesterOnly)",
+    async ({ requesterOnly, conversationKind, conversationId, type, threadId, phase }) => {
+      storedConversations.set(conversationId, {
+        conversation: { id: conversationId, conversationType: type },
+        aadObjectId: COLLEAGUE_ID,
+      });
+      sendAdaptiveCardMSTeams.mockResolvedValue({ messageId: "shared-card", conversationId });
+      const scenario = await createRequesterScenario(
+        `conversation:${conversationId}`,
+        { conversationKind, conversationId, threadId },
+        createPluginPendingView(),
+      );
+      const deliveryCfg = {
+        ...cfg,
+        channels: {
+          msteams: { ...requesterOnlyCfg.channels?.msteams, approvals: { requesterOnly } },
+        },
+      };
+      if (!requesterOnly && scenario.request.request.authorization) {
+        scenario.request.request.authorization = {
+          ...scenario.request.request.authorization,
+          policy: { requireResolverMatch: false, delivery: "default" },
+        };
+      }
+      const entry = await msTeamsApprovalNativeRuntime.transport.deliverPending({
+        ...scenario,
+        cfg: deliveryCfg,
+        accountId: "default",
+        approvalKind: "plugin",
+        preparedTarget: scenario.prepared.target,
+      });
+      expect(sendAdaptiveCardMSTeams).toHaveBeenCalledWith({
+        cfg: deliveryCfg,
+        to: `conversation:${conversationId}${threadId ? `;messageid=${threadId}` : ""}`,
+        card: scenario.pendingPayload.card,
+      });
+      expect(sendAdaptiveCardMSTeams).toHaveBeenCalledTimes(1);
+      if (!entry) {
+        throw new Error("Expected origin card");
+      }
+      const terminal =
+        phase === "expired"
+          ? await msTeamsApprovalNativeRuntime.presentation.buildExpiredResult({
+              ...scenario,
+              cfg: deliveryCfg,
+              accountId: "default",
+              entry,
+              view: { ...scenario.view, phase: "expired" },
+            })
+          : await msTeamsApprovalNativeRuntime.presentation.buildResolvedResult({
+              ...scenario,
+              cfg: deliveryCfg,
+              accountId: "default",
+              entry,
+              view: { ...scenario.view, phase: "resolved", decision: "allow-once" },
+              resolved: { id: scenario.request.id, decision: "allow-once", ts: Date.now() },
+            });
+      if (terminal.kind !== "update") {
+        throw new Error("Expected card update");
+      }
+      await msTeamsApprovalNativeRuntime.transport.updateEntry?.({
+        ...scenario,
+        cfg: deliveryCfg,
+        accountId: "default",
+        approvalKind: "plugin",
+        entry,
+        payload: terminal.payload,
+        phase,
+      });
+      expect(editAdaptiveCardMSTeams).toHaveBeenCalledWith({
+        cfg: deliveryCfg,
+        to: `conversation:${conversationId}`,
+        activityId: "shared-card",
+        card: terminal.payload,
+      });
+      expect(terminal.payload).not.toHaveProperty("actions");
+      for (const badReference of [
+        null,
+        { conversation: { id: conversationId, conversationType: "personal" } },
+        { conversation: { id: "19:other@thread.v2", conversationType: type } },
+      ]) {
+        if (badReference) {
+          storedConversations.set(conversationId, badReference);
+        } else {
+          storedConversations.delete(conversationId);
+        }
+        await expect(
+          msTeamsApprovalNativeRuntime.transport.deliverPending({
+            ...scenario,
+            cfg: deliveryCfg,
+            accountId: "default",
+            approvalKind: "plugin",
+            preparedTarget: scenario.prepared.target,
+          }),
+        ).resolves.toBeNull();
+      }
+      expect(sendAdaptiveCardMSTeams).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it.each([
     { name: "a group chat", to: "conversation:19:team@thread.v2" },
@@ -712,7 +1045,7 @@ describe("msTeamsApprovalNativeRuntime with requester-only approvals", () => {
     expect(sendMessageMSTeams).not.toHaveBeenCalled();
   });
 
-  it("keeps stamped delivery private when the option is disabled", async () => {
+  it("keeps stamped delivery bound to its origin when the option is disabled", async () => {
     const { view, request, pendingPayload, prepared } = await createRequesterScenario();
     const optionOffCfg: OpenClawConfig = {
       channels: {

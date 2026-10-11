@@ -1,9 +1,11 @@
-import { isImplicitSameChatApprovalAuthorization } from "openclaw/plugin-sdk/approval-auth-runtime";
+import path from "node:path";
 import type { ExecApprovalRequest } from "openclaw/plugin-sdk/approval-runtime";
 import type { ChannelOutboundPayloadHint } from "openclaw/plugin-sdk/channel-contract";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { patchSessionEntry } from "openclaw/plugin-sdk/session-store-runtime";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import type { StoredConversationReference } from "./conversation-store.js";
 
 const storedConversations = vi.hoisted(() => new Map<string, StoredConversationReference>());
@@ -43,6 +45,8 @@ import {
   shouldSuppressLocalMSTeamsExecApprovalPrompt,
 } from "./approval-native.js";
 
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+
 const APPROVER_ID = "40a1a0ed-4ff2-4164-a219-55518990c197";
 const OTHER_USER_ID = "b2d381f1-36dd-4120-b6fb-8dd37388ff11";
 const CONVERSATION_ID = "19:channel@thread.tacv2";
@@ -67,13 +71,56 @@ function createConfig(
   };
 }
 
+beforeEach(() => {
+  storedConversations.clear();
+  storedConversations.set(CONVERSATION_ID, {
+    conversation: { id: CONVERSATION_ID, conversationType: "channel" },
+  });
+});
+
 function createExecRequest(
   overrides: Partial<ExecApprovalRequest["request"]> = {},
 ): ExecApprovalRequest {
+  const to = overrides.turnSourceTo ?? `conversation:${CONVERSATION_ID}`;
+  const message = {
+    conversationId: to.replace(/^teams:/, "").replace(/^conversation:/, ""),
+    conversationKind: "channel" as const,
+    messageId: "source-root",
+    threadId: overrides.turnSourceThreadId?.toString(),
+    eventKind: "message" as const,
+  };
+  const actor = {
+    channel: overrides.turnSourceChannel ?? "msteams",
+    accountId: "default",
+    senderId: APPROVER_ID,
+    actorKind: "human" as const,
+  };
+  const authorization: NonNullable<ExecApprovalRequest["request"]["authorization"]> = {
+    version: 1,
+    source: {
+      version: 1,
+      runId: "run",
+      sessionKey: "agent:main:main",
+      revision: 1,
+      completeness: "complete",
+      inputs: [{ inputId: "input", origin: "user", actor, message }],
+    },
+    requesterBinding: {
+      state: "bound",
+      inputOrigin: "user",
+      ...actor,
+      runId: "run",
+      sessionKey: "agent:main:main",
+      sourceRevision: 1,
+      sources: [message],
+    },
+    policy: { requireResolverMatch: false, delivery: "default" },
+  };
   return {
     id: "approval-1",
     request: {
       command: "echo hello",
+      authorization,
       turnSourceChannel: "msteams",
       turnSourceTo: `conversation:${CONVERSATION_ID}`,
       turnSourceAccountId: "default",
@@ -209,17 +256,31 @@ describe("Microsoft Teams native approval capability", () => {
     }
   });
 
-  it("preserves implicit same-chat authorization when no approvers are configured", () => {
-    const authorization = msTeamsApprovalCapability.authorizeActorAction?.({
-      cfg: createConfig({ teams: { allowFrom: undefined } }),
-      senderId: OTHER_USER_ID,
-      action: "approve",
-      approvalKind: "exec",
-    });
+  it.each([false, true])(
+    "rejects /approve after the approver roster is cleared (requesterOnly=%s)",
+    (requesterOnly) => {
+      const cfg = createConfig({ teams: { approvals: { requesterOnly } } });
+      const authorization = createExecRequest().request.authorization;
+      const input = {
+        cfg,
+        authorization,
+        senderId: APPROVER_ID.toUpperCase(),
+        accountId: "default",
+        action: "approve" as const,
+        approvalKind: "exec" as const,
+      };
+      expect(msTeamsApprovalCapability.authorizeActorAction?.(input)).toEqual({ authorized: true });
 
-    expect(authorization).toEqual({ authorized: true });
-    expect(isImplicitSameChatApprovalAuthorization(authorization)).toBe(true);
-  });
+      cfg.channels!.msteams!.allowFrom = [];
+
+      expect(msTeamsApprovalCapability.authorizeActorAction?.(input)).toMatchObject({
+        authorized: false,
+      });
+      expect(
+        msTeamsApprovalCapability.authorizeActorAction?.({ ...input, authorization: undefined }),
+      ).toMatchObject({ authorized: false });
+    },
+  );
 
   it("restricts routing to the single Teams account and originating channel", () => {
     const cfg = createConfig();
@@ -267,14 +328,14 @@ describe("Microsoft Teams native approval capability", () => {
     ).toBe(false);
   });
 
-  it("preserves the normalized conversation and source thread for native delivery", () => {
-    const request = createExecRequest({
-      turnSourceTo: `teams:conversation:${CONVERSATION_ID}`,
-      turnSourceThreadId: "thread-root-123",
-    });
+  it.each([
+    { to: `teams:conversation:${CONVERSATION_ID}`, threadId: "thread-root-123" },
+    { to: `conversation:${CONVERSATION_ID};messageid=thread-root-123`, threadId: undefined },
+  ])("preserves normalized channel-thread delivery for $to", async ({ to, threadId }) => {
+    const request = createExecRequest({ turnSourceTo: to, turnSourceThreadId: threadId });
 
     expect(
-      msTeamsApprovalCapability.native?.resolveOriginTarget?.({
+      await msTeamsApprovalCapability.native?.resolveOriginTarget?.({
         cfg: createConfig(),
         accountId: "default",
         approvalKind: "exec",
@@ -287,7 +348,174 @@ describe("Microsoft Teams native approval capability", () => {
     });
   });
 
-  it("maps stable allowlisted approvers to user-prefixed Teams DM targets", () => {
+  it.each([
+    {
+      sourceSuffix: "",
+      sourceThread: "thread-root",
+      storedSuffix: ";messageid=thread-root",
+      storedThread: undefined,
+    },
+    {
+      sourceSuffix: ";messageid=thread-root",
+      sourceThread: undefined,
+      storedSuffix: "",
+      storedThread: "thread-root",
+    },
+  ])(
+    "matches equivalent turn and stored channel-thread targets ($sourceSuffix/$storedSuffix)",
+    async ({ sourceSuffix, sourceThread, storedSuffix, storedThread }) => {
+      const cfg = createConfig();
+      const storePath = path.join(
+        tempDirs.make("openclaw-msteams-approval-origin-"),
+        "sessions.sqlite",
+      );
+      cfg.session = { store: storePath };
+      const sessionKey = "agent:main:msteams:channel:approval-thread";
+      const to = `conversation:${CONVERSATION_ID}${storedSuffix}`;
+      await patchSessionEntry({
+        agentId: "main",
+        sessionKey,
+        storePath,
+        skipMaintenance: true,
+        fallbackEntry: { sessionId: "approval-session", updatedAt: 1 },
+        update: () => ({
+          delivery: {
+            kind: "external",
+            route: {
+              channel: "msteams",
+              accountId: "default",
+              target: { to },
+              ...(storedThread ? { thread: { id: storedThread } } : {}),
+            },
+            context: { channel: "msteams", accountId: "default", to, threadId: storedThread },
+            origin: { provider: "msteams", accountId: "default", to, threadId: storedThread },
+          },
+        }),
+      });
+      const request = createExecRequest({
+        sessionKey,
+        turnSourceTo: `conversation:${CONVERSATION_ID}${sourceSuffix}`,
+        turnSourceThreadId: sourceThread,
+      });
+      const input = { cfg, accountId: "default", approvalKind: "exec" as const, request };
+      expect(await msTeamsApprovalCapability.native?.resolveOriginTarget?.(input)).toEqual({
+        to: `conversation:${CONVERSATION_ID}`,
+        accountId: "default",
+        threadId: "thread-root",
+      });
+      request.request.turnSourceTo = `conversation:${CONVERSATION_ID}`;
+      request.request.turnSourceThreadId = "different-thread";
+      expect(await msTeamsApprovalCapability.native?.resolveOriginTarget?.(input)).toMatchObject({
+        threadId: "thread-root",
+      });
+      expect(msTeamsApprovalCapability.native?.resolveApproverDmTargets?.(input)).toEqual([]);
+    },
+  );
+
+  it.each([
+    { state: "non-user", origins: ["cron"] },
+    { state: "non-user", origins: ["heartbeat"] },
+    { state: "non-user", origins: ["subagent"] },
+    { state: "unavailable", reason: "missing-source" },
+  ] satisfies NonNullable<ExecApprovalRequest["request"]["authorization"]>["requesterBinding"][])(
+    "withholds default-mode cards for $state provenance ($origins)",
+    async (requesterBinding) => {
+      const request = createExecRequest();
+      request.request.authorization = { ...request.request.authorization!, requesterBinding };
+      const input = {
+        cfg: createConfig(),
+        accountId: "default",
+        approvalKind: "exec" as const,
+        request,
+      };
+      expect(shouldHandleMSTeamsNativeApprovalRequest(input)).toBe(false);
+      await expect(
+        msTeamsApprovalCapability.native?.resolveOriginTarget?.(input),
+      ).resolves.toBeNull();
+      expect(msTeamsApprovalCapability.native?.resolveApproverDmTargets?.(input)).toEqual([]);
+    },
+  );
+
+  it.each([undefined, "root-thread"])(
+    "uses the default-mode bound root/thread despite misleading user routing (%s)",
+    async (threadId) => {
+      const request = createExecRequest({ turnSourceThreadId: threadId });
+      request.request.turnSourceTo = `user:${OTHER_USER_ID}`;
+      request.request.turnSourceThreadId = "wrong-thread";
+      const input = {
+        cfg: createConfig({
+          teams: { allowFrom: [OTHER_USER_ID], approvals: { requesterOnly: false } },
+        }),
+        accountId: "default",
+        approvalKind: "exec" as const,
+        request,
+      };
+      expect(shouldHandleMSTeamsNativeApprovalRequest(input)).toBe(true);
+      await expect(msTeamsApprovalCapability.native?.resolveOriginTarget?.(input)).resolves.toEqual(
+        {
+          to: `conversation:${CONVERSATION_ID}`,
+          accountId: "default",
+          threadId: threadId ?? "source-root",
+        },
+      );
+    },
+  );
+
+  it("rejects default-mode user aliases and channel sources with no root identity", async () => {
+    for (const request of [
+      createExecRequest({ turnSourceTo: `user:${APPROVER_ID}` }),
+      createExecRequest(),
+    ]) {
+      const binding = request.request.authorization?.requesterBinding;
+      if (binding?.state === "bound" && request.request.turnSourceTo?.startsWith("conversation:")) {
+        request.request.authorization = {
+          ...request.request.authorization!,
+          requesterBinding: {
+            ...binding,
+            sources: binding.sources.map((source) => ({ ...source, messageId: "" })),
+          },
+        };
+      }
+      await expect(
+        msTeamsApprovalCapability.native?.resolveOriginTarget?.({
+          cfg: createConfig(),
+          request,
+          accountId: "default",
+          approvalKind: "exec",
+        }),
+      ).resolves.toBeNull();
+    }
+  });
+
+  it("suppresses unsafe forwarding even when the bound origin has zero delivery targets", async () => {
+    const request = createExecRequest();
+    storedConversations.clear();
+    const input = {
+      cfg: createConfig(),
+      accountId: "default",
+      approvalKind: "exec" as const,
+      request,
+    };
+    expect(shouldHandleMSTeamsNativeApprovalRequest(input)).toBe(true);
+    await expect(
+      msTeamsApprovalCapability.native?.resolveOriginTarget?.(input),
+    ).resolves.toBeNull();
+    expect(msTeamsApprovalCapability.native?.resolveApproverDmTargets?.(input)).toEqual([]);
+    for (const to of [
+      `user:${APPROVER_ID}`,
+      `conversation:${CONVERSATION_ID}`,
+      "conversation:19:other@thread.v2",
+    ]) {
+      expect(
+        msTeamsApprovalCapability.delivery?.shouldSuppressForwardingFallback?.({
+          ...input,
+          target: { channel: "msteams", to },
+        }),
+      ).toBe(true);
+    }
+  });
+
+  it("never fans native cards out to the approver roster", () => {
     expect(
       msTeamsApprovalCapability.native?.resolveApproverDmTargets?.({
         cfg: createConfig(),
@@ -295,7 +523,7 @@ describe("Microsoft Teams native approval capability", () => {
         approvalKind: "exec",
         request: createExecRequest(),
       }),
-    ).toEqual([{ to: `user:${APPROVER_ID}`, accountId: "default" }]);
+    ).toEqual([]);
   });
 
   it("suppresses the duplicate text prompt only while native exec delivery owns it", () => {
@@ -441,6 +669,93 @@ describe("Microsoft Teams requester-only native approvals", () => {
     expect(msTeamsApprovalCapability.native?.resolveApproverDmTargets?.(input)).toEqual([]);
   });
 
+  it.each([
+    {
+      kind: "channel" as const,
+      id: CONVERSATION_ID,
+      type: "channel",
+      threadId: "thread-root",
+      messageId: "reply",
+    },
+    {
+      kind: "channel" as const,
+      id: CONVERSATION_ID,
+      type: "channel",
+      threadId: undefined,
+      messageId: "new-root",
+    },
+    {
+      kind: "group" as const,
+      id: "19:group@thread.v2",
+      type: "groupChat",
+      threadId: undefined,
+      messageId: "group-message",
+    },
+  ])(
+    "routes a bound $kind request to its origin independently of session targets",
+    async ({ kind, id, type, threadId, messageId }) => {
+      const cfg = createRequesterOnlyConfig();
+      const request = createDirectRequest({
+        turnSourceTo: `user:${COLLEAGUE_ID}`,
+        turnSourceThreadId: "wrong-routing-thread",
+      });
+      const authorization = request.request.authorization;
+      if (!authorization || authorization.requesterBinding.state !== "bound") {
+        throw new Error("Expected bound fixture");
+      }
+      const message = {
+        conversationId: id,
+        conversationKind: kind,
+        threadId,
+        messageId,
+        eventKind: "message" as const,
+      };
+      request.request.authorization = {
+        ...authorization,
+        requesterBinding: { ...authorization.requesterBinding, sources: [message] },
+        source: {
+          ...authorization.source,
+          inputs: authorization.source.inputs.map((input) =>
+            input.origin === "user" ? { ...input, message } : input,
+          ),
+        },
+      };
+      const reference = { conversation: { id, conversationType: type }, aadObjectId: COLLEAGUE_ID };
+      storedConversations.set(id, reference);
+      const input = { cfg, accountId: "default", approvalKind: "exec" as const, request };
+      expect(shouldHandleMSTeamsNativeApprovalRequest(input)).toBe(true);
+      await expect(
+        msTeamsApprovalCapability.native?.resolveRequesterTarget?.(input),
+      ).resolves.toEqual({
+        to: `conversation:${id}`,
+        accountId: "default",
+        threadId: kind === "channel" ? (threadId ?? messageId) : null,
+      });
+      await expect(
+        msTeamsApprovalCapability.native?.resolveOriginTarget?.(input),
+      ).resolves.toMatchObject({ to: `conversation:${id}` });
+      expect(msTeamsApprovalCapability.native?.resolveApproverDmTargets?.(input)).toEqual([]);
+      // Blocked notices must never disclose approval details in shared conversations.
+      await expect(
+        msTeamsApprovalCapability.native?.resolveRequesterNoticeTarget?.(input),
+      ).resolves.toBeNull();
+      for (const conversation of [
+        { id, conversationType: "personal" },
+        { id: "19:wrong@thread.v2", conversationType: type },
+      ]) {
+        storedConversations.set(id, { ...reference, conversation });
+        await expect(
+          msTeamsApprovalCapability.native?.resolveRequesterTarget?.(input),
+        ).resolves.toBeNull();
+        expect(msTeamsApprovalCapability.native?.resolveApproverDmTargets?.(input)).toEqual([]);
+      }
+      storedConversations.delete(id);
+      await expect(
+        msTeamsApprovalCapability.native?.resolveRequesterTarget?.(input),
+      ).resolves.toBeNull();
+    },
+  );
+
   it("does not deliver when the stored chat is not the requester's personal chat", async () => {
     const cfg = createRequesterOnlyConfig();
     for (const reference of [
@@ -496,6 +811,39 @@ describe("Microsoft Teams requester-only native approvals", () => {
     ).resolves.toBeNull();
     expect(msTeamsApprovalCapability.native?.resolveApproverDmTargets?.(input)).toEqual([]);
   });
+
+  it.each(["cron", "heartbeat"] as const)(
+    "withholds all card and shared-notice targets for a genuine %s run",
+    async (origin) => {
+      const request = createDirectRequest();
+      const authorization = request.request.authorization;
+      if (!authorization) {
+        throw new Error("Expected authorization fixture");
+      }
+      request.request.authorization = {
+        ...authorization,
+        source: {
+          ...authorization.source,
+          inputs: [{ inputId: "scheduled-input", origin }],
+        },
+        requesterBinding: { state: "non-user", origins: [origin] },
+      };
+      const input = {
+        cfg: createRequesterOnlyConfig(),
+        accountId: "default",
+        approvalKind: "exec" as const,
+        request,
+      };
+      expect(shouldHandleMSTeamsNativeApprovalRequest(input)).toBe(false);
+      await expect(
+        msTeamsApprovalCapability.native?.resolveRequesterTarget?.(input),
+      ).resolves.toBeNull();
+      await expect(
+        msTeamsApprovalCapability.native?.resolveRequesterNoticeTarget?.(input),
+      ).resolves.toBeNull();
+      expect(msTeamsApprovalCapability.native?.resolveApproverDmTargets?.(input)).toEqual([]);
+    },
+  );
 
   it("admits roster actors to core custody and leaves /approve to the central requester check", () => {
     const cfg = createRequesterOnlyConfig();
@@ -598,7 +946,7 @@ describe("Microsoft Teams requester-only native approvals", () => {
     expect(msTeamsApprovalCapability.native?.resolveApproverDmTargets?.(input)).toEqual([]);
   });
 
-  it("revalidates stamped personal-source scope during resolution after the option is disabled", () => {
+  it("revalidates stamped conversation scope during resolution after the option is disabled", () => {
     const cfg = createRequesterOnlyConfig({ approvals: { requesterOnly: false } });
     const authorization = createDirectRequest().request.authorization;
     if (!authorization || authorization.requesterBinding.state !== "bound") {
@@ -638,7 +986,7 @@ describe("Microsoft Teams requester-only native approvals", () => {
         ...input,
         authorization: groupAuthorization,
       }),
-    ).toMatchObject({ authorized: false });
+    ).toEqual({ authorized: true });
   });
 
   it("keeps a stamped request strict after the option is disabled", async () => {
@@ -788,23 +1136,23 @@ describe("Microsoft Teams requester-only native approvals", () => {
     ).toBe(true);
   });
 
-  it("keeps upstream behavior when the option is absent or false", async () => {
+  it("keeps roster authorization and origin delivery without DM fan-out when the option is absent or false", async () => {
     for (const approvals of [undefined, {}, { requesterOnly: false }]) {
       const cfg = createConfig({
         teams: { allowFrom: [REQUESTER_ID, COLLEAGUE_ID], approvals },
       });
+      storedConversations.set(CONVERSATION_ID, {
+        conversation: { id: CONVERSATION_ID, conversationType: "channel" },
+      });
       const request = createExecRequest();
       const input = { cfg, accountId: "default", approvalKind: "exec" as const, request };
       expect(shouldHandleMSTeamsNativeApprovalRequest(input)).toBe(true);
-      expect(msTeamsApprovalCapability.native?.resolveOriginTarget?.(input)).toEqual({
+      expect(await msTeamsApprovalCapability.native?.resolveOriginTarget?.(input)).toEqual({
         to: `conversation:${CONVERSATION_ID}`,
         accountId: "default",
-        threadId: null,
+        threadId: "source-root",
       });
-      expect(msTeamsApprovalCapability.native?.resolveApproverDmTargets?.(input)).toEqual([
-        { to: `user:${REQUESTER_ID}`, accountId: "default" },
-        { to: `user:${COLLEAGUE_ID}`, accountId: "default" },
-      ]);
+      expect(msTeamsApprovalCapability.native?.resolveApproverDmTargets?.(input)).toEqual([]);
       expect(
         msTeamsApprovalCapability.authorizeActorAction?.({
           cfg,

@@ -237,7 +237,10 @@ describe("Full Access delegated chat", () => {
       runConfigSet,
     } = await createDelegatedChatFixture("typed", "durable");
     const publishResolved = vi.fn();
-    context.approvalEvents = { publishRequested: () => 0, publishResolved };
+    context.approvalEvents = {
+      publishRequested: async () => ({ deliveredCount: 0, originUnavailable: false }),
+      publishResolved,
+    };
     const pending = withGatewayToolCallerIdentity(
       {
         agentId: "main",

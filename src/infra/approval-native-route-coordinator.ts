@@ -4,6 +4,7 @@ import {
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
 import type { ChannelApprovalNativeTarget } from "../channels/plugins/approval-native.types.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
 import type {
   ChannelApprovalNativeDeliveryPlan,
   ChannelApprovalNativePlannedTarget,
@@ -20,6 +21,8 @@ import type { ApprovalRequestChannelRouteClass, ChannelApprovalKind } from "./ap
 import type { ExecApprovalRequest } from "./exec-approvals.js";
 import type { PluginApprovalRequest } from "./plugin-approvals.js";
 import type { SystemAgentApprovalRequest } from "./system-agent-approvals.js";
+
+const log = createSubsystemLogger("gateway/approvals");
 
 type GatewayRequestFn = <T = unknown>(
   method: string,
@@ -245,6 +248,29 @@ function createPendingApprovalRouteNotice(
 }
 
 function resolveRouteNoticeTargetFromRequest(request: ApprovalRequest): RouteNoticeTarget | null {
+  const authorization = request.request.authorization;
+  if (authorization) {
+    const binding = authorization.requesterBinding;
+    if (binding.state !== "bound") {
+      return null;
+    }
+    const first = binding.sources[0];
+    if (
+      !first?.conversationId ||
+      binding.sources.some(
+        (source) =>
+          source.conversationId !== first.conversationId || source.threadId !== first.threadId,
+      )
+    ) {
+      return null;
+    }
+    return {
+      channel: binding.channel,
+      to: first.conversationId,
+      accountId: binding.accountId,
+      threadId: first.threadId,
+    };
+  }
   const channel = request.request.turnSourceChannel?.trim();
   const to = request.request.turnSourceTo?.trim();
   if (!channel || !to) {
@@ -313,21 +339,27 @@ function resolveApprovalRouteNotice(params: {
 }): { requestGateway: GatewayRequestFn; target: RouteNoticeTarget; text: string } | null {
   const explicitTarget = resolveRouteNoticeTargetFromRequest(params.request);
   const originChannel = normalizeChannel(
-    explicitTarget?.channel ?? params.request.request.turnSourceChannel,
+    params.request.request.authorization?.requesterBinding.state === "bound"
+      ? params.request.request.authorization.requesterBinding.channel
+      : (explicitTarget?.channel ?? params.request.request.turnSourceChannel),
   );
   const fallbackTarget =
     params.reports
       .filter((report) => normalizeChannel(report.channel) === originChannel || !originChannel)
       .map(resolveFallbackRouteNoticeTarget)
       .find((target) => target !== null) ?? null;
-  const target = explicitTarget
-    ? {
-        ...fallbackTarget,
-        ...explicitTarget,
-        accountId: explicitTarget.accountId ?? fallbackTarget?.accountId,
-        threadId: explicitTarget.threadId ?? fallbackTarget?.threadId,
-      }
-    : fallbackTarget;
+  // Admitted requests use immutable provenance, including when only another
+  // channel has a native approval runtime. Do not fill its thread from routing.
+  const target = params.request.request.authorization
+    ? (explicitTarget ?? fallbackTarget)
+    : explicitTarget
+      ? {
+          ...fallbackTarget,
+          ...explicitTarget,
+          accountId: explicitTarget.accountId ?? fallbackTarget?.accountId,
+          threadId: explicitTarget.threadId ?? fallbackTarget?.threadId,
+        }
+      : fallbackTarget;
   if (!target) {
     return null;
   }
@@ -489,6 +521,34 @@ async function maybeFinalizeApprovalRouteNotice(
   }
 
   const reports = Array.from(entry.reports.values());
+  if (
+    reports.some(
+      (report) =>
+        (selection.verdicts.get(report.runtimeId)?.kind === "selected" ||
+          report.skipReason === "owner-unavailable") &&
+        (entry.request.request.authorization ||
+          state.activeRuntimes.get(report.runtimeId)?.resolveRequesterNoticeTarget),
+    ) &&
+    reports.every(
+      (report) => !hasPlannedNativeTargets(report) && report.deliveredTargets.length === 0,
+    ) &&
+    !missingSelectedRuntime
+  ) {
+    // Zero targets never enter transport error callbacks. Use only core's private
+    // notice resolver; mutable turn/session targets cannot select a recipient.
+    clearPendingApprovalRouteNotice(state, approvalId);
+    const outcome = await reportBlockedRequesterNotice({
+      kind: entry.approvalKind,
+      notice: "delivery-failed",
+      request: entry.request,
+      runtimes: [...state.activeRuntimes.values()],
+      isCurrent: (runtime) =>
+        !state.closed &&
+        [...state.activeRuntimes.values()].includes(runtime as ApprovalRouteRuntimeRecord),
+    });
+    log.error(`approval ${approvalId}: native delivery blocked; notice outcome=${outcome}`);
+    return;
+  }
   const notice = resolveApprovalRouteNotice({
     state,
     approvalKind: entry.approvalKind,

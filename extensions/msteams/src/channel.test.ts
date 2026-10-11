@@ -266,18 +266,25 @@ describe("msteamsPlugin", () => {
     },
   );
 
-  it("exposes native approval delivery without replacing existing approval authorization", () => {
+  it("exposes native approval delivery and requires a configured approver roster", () => {
+    const cfg = createConfiguredMSTeamsCfg();
     const authorization = {
-      cfg: createConfiguredMSTeamsCfg(),
+      cfg,
       senderId: "40a1a0ed-4ff2-4164-a219-55518990c197",
       action: "approve",
       approvalKind: "exec",
     } as const;
 
     expect(msteamsPlugin.approvalCapability).toBe(msTeamsApprovalCapability);
-    expect(msteamsPlugin.approvalCapability?.authorizeActorAction?.(authorization)).toEqual(
-      msTeamsApprovalAuth.authorizeActorAction?.(authorization),
-    );
+    expect(msteamsPlugin.approvalCapability?.authorizeActorAction?.(authorization)).toMatchObject({
+      authorized: false,
+    });
+    cfg.channels = {
+      msteams: { ...cfg.channels?.msteams, allowFrom: [authorization.senderId] },
+    };
+    expect(msteamsPlugin.approvalCapability?.authorizeActorAction?.(authorization)).toEqual({
+      authorized: true,
+    });
     expect(msteamsPlugin.approvalCapability?.nativeRuntime?.eventKinds).toEqual([
       "exec",
       "plugin",

@@ -1,10 +1,16 @@
 // Msteams tests cover sdk proactive plugin behavior.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { sendMSTeamsActivityWithReference } from "./sdk-proactive.js";
+import {
+  sendMSTeamsActivityWithReference,
+  updateMSTeamsActivityWithReference,
+} from "./sdk-proactive.js";
 import type { MSTeamsApp } from "./sdk.js";
 
 const clientState = vi.hoisted(() => ({
   created: [] as Array<{ serviceUrl: string; http: unknown }>,
+  update: vi.fn(async (_conversationId: string, _activityId: string, _activity: unknown) => ({
+    id: "card-activity",
+  })),
   create: vi.fn(async (_payload: { conversationId: string; activity: unknown }) => ({
     id: "activity-1",
   })),
@@ -18,6 +24,8 @@ vi.mock("@microsoft/teams.api", async (importOriginal) => ({
       serviceUrl,
       conversations: {
         activities: (conversationId: string) => ({
+          update: (activityId: string, activity: unknown) =>
+            clientState.update(conversationId, activityId, activity),
           create: (activity: unknown) =>
             clientState.create({
               conversationId,
@@ -31,6 +39,7 @@ vi.mock("@microsoft/teams.api", async (importOriginal) => ({
 
 describe("sendMSTeamsActivityWithReference", () => {
   beforeEach(() => {
+    clientState.update.mockClear();
     clientState.created.length = 0;
     clientState.create.mockClear().mockResolvedValue({ id: "activity-1" });
   });
@@ -121,5 +130,42 @@ describe("sendMSTeamsActivityWithReference", () => {
         channelData: { tenant: { id: "tenant-1" } },
       }),
     });
+  });
+  it("updates a channel-thread card by its original conversation and activity id", async () => {
+    const app = {
+      client: { request: vi.fn() },
+      api: { serviceUrl: "https://smba.trafficmanager.net/teams" },
+    } as unknown as MSTeamsApp;
+    const conversationId = "19:channel@thread.tacv2";
+    const reference = {
+      serviceUrl: "https://smba.trafficmanager.net/amer/",
+      agent: { id: "28:bot" },
+      conversation: { id: conversationId, conversationType: "channel" },
+      channelId: "msteams",
+    };
+    const sent = await sendMSTeamsActivityWithReference(
+      app,
+      reference,
+      { type: "message", attachments: [] },
+      { threadActivityId: "root" },
+    );
+    expect(clientState.create).toHaveBeenCalledWith(
+      expect.objectContaining({ conversationId: `${conversationId};messageid=root` }),
+    );
+    if (!sent.id) {
+      throw new Error("Expected sent card activity id");
+    }
+    const terminal = {
+      type: "message",
+      id: sent.id,
+      attachments: [
+        {
+          contentType: "application/vnd.microsoft.card.adaptive",
+          content: { type: "AdaptiveCard", body: [] },
+        },
+      ],
+    };
+    await updateMSTeamsActivityWithReference(app, reference, sent.id, terminal);
+    expect(clientState.update).toHaveBeenCalledWith(conversationId, sent.id, terminal);
   });
 });

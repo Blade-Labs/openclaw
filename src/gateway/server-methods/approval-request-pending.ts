@@ -122,11 +122,13 @@ export async function handlePendingApprovalRequest<
           "denied",
         );
         requesterDeliveryBlocked = denied.outcome === "denied";
-        await reportBlockedApprovalRequest({
-          context: params.context,
-          approvalKind: params.approvalKind ?? "exec",
-          event: params.requestEvent,
-        });
+        if (requesterDeliveryBlocked) {
+          await reportBlockedApprovalRequest({
+            context: params.context,
+            approvalKind: params.approvalKind ?? "exec",
+            event: params.requestEvent,
+          });
+        }
       } else if (params.twoPhase) {
         params.respond(
           true,
@@ -175,13 +177,18 @@ export async function handlePendingApprovalRequest<
         });
       }
     }
-    const internalApprovalSubscriberCount =
+    const nativeDelivery =
       suppressDelivery || approvalClientsOnly
-        ? 0
-        : (params.context.approvalEvents?.publishRequested(
-            params.approvalKind ?? "exec",
-            params.requestEvent,
-          ) ?? 0);
+        ? undefined
+        : await params.manager.trackActiveWork(() =>
+            Promise.resolve(
+              params.context.approvalEvents?.publishRequested(
+                params.approvalKind ?? "exec",
+                params.requestEvent,
+              ),
+            ),
+          );
+    const internalApprovalSubscriberCount = nativeDelivery?.deliveredCount ?? 0;
 
     const hasApprovalClients = suppressDelivery
       ? false
@@ -198,6 +205,7 @@ export async function handlePendingApprovalRequest<
     const hasTurnSourceRoute =
       !suppressDelivery &&
       !approvalClientsOnly &&
+      !nativeDelivery?.originUnavailable &&
       !hasApprovalClients &&
       !delivered &&
       hasApprovalTurnSourceRoute({
@@ -221,7 +229,25 @@ export async function handlePendingApprovalRequest<
       !delivered
     ) {
       try {
-        noRouteWon = await params.manager.expire(params.record.id, "no-approval-route");
+        if (nativeDelivery?.originUnavailable) {
+          const denied = await params.manager.forceDenyDetailed(
+            params.record.id,
+            "requester-unavailable",
+            { kind: "system", id: null },
+            "denied",
+          );
+          requesterDeliveryBlocked = denied.outcome === "denied";
+          noRouteWon = requesterDeliveryBlocked;
+          if (requesterDeliveryBlocked) {
+            await reportBlockedApprovalRequest({
+              context: params.context,
+              approvalKind: params.approvalKind ?? "exec",
+              event: params.requestEvent,
+            });
+          }
+        } else {
+          noRouteWon = await params.manager.expire(params.record.id, "no-approval-route");
+        }
       } catch (err) {
         deliveryReady.resolve(false);
         handoff.abandon();

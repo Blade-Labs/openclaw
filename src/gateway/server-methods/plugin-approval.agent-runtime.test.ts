@@ -146,7 +146,7 @@ describe("plugin approval signed agent runtime", () => {
         });
         const delivered = createDeferredCore();
         opts.context.approvalEvents = {
-          publishRequested: vi.fn(() => 1),
+          publishRequested: vi.fn(async () => ({ deliveredCount: 1, originUnavailable: false })),
           publishResolved: vi.fn(),
           deliverRequester: vi.fn(async () => {
             delivered.resolve();

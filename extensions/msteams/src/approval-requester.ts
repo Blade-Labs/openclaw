@@ -12,8 +12,9 @@ import type {
   MSTeamsConversationStore,
   StoredConversationReference,
 } from "./conversation-store.js";
-import { normalizeMSTeamsConversationId } from "./inbound.js";
+import { extractMSTeamsConversationMessageId, normalizeMSTeamsConversationId } from "./inbound.js";
 import { normalizeMSTeamsMessagingTarget } from "./resolve-allowlist.js";
+import { inferMSTeamsTargetChatType } from "./session-route.js";
 
 type MSTeamsApprovalRequest =
   | ExecApprovalRequest
@@ -26,7 +27,12 @@ const PERSONAL_CONVERSATION_ID_RE = /^a:[^\s;@]+$/i;
 
 export type MSTeamsApprovalRequester = {
   aadObjectId: string;
-  target: { kind: "conversation"; conversationId: string };
+  target: {
+    kind: "conversation";
+    conversationId: string;
+    conversationKind: "direct" | "group" | "channel";
+    threadId?: string;
+  };
 };
 
 export type MSTeamsApprovalRequesterRejection =
@@ -84,25 +90,58 @@ export function classifyMSTeamsApprovalRequester(
   if (!aadObjectId) {
     return { ok: false, reason: "unverified-actor" };
   }
-  const first = binding.sources[0];
+  const targets = binding.sources.map((source) => {
+    const conversationId = normalizeMSTeamsConversationId(source.conversationId);
+    const embeddedThreadId = extractMSTeamsConversationMessageId(source.conversationId);
+    const kind = source.conversationKind;
+    if (kind === "unknown") {
+      return null;
+    }
+    if (
+      (kind === "direct"
+        ? !PERSONAL_CONVERSATION_ID_RE.test(source.conversationId)
+        : inferMSTeamsTargetChatType(conversationId) !== kind) ||
+      (embeddedThreadId && source.threadId && embeddedThreadId !== source.threadId) ||
+      (kind !== "channel" && (source.threadId || embeddedThreadId)) ||
+      (kind === "channel" && !(source.threadId ?? embeddedThreadId ?? source.messageId)?.trim())
+    ) {
+      return null;
+    }
+    return {
+      kind: "conversation" as const,
+      conversationId,
+      conversationKind: kind,
+      ...(kind === "channel"
+        ? { threadId: source.threadId ?? embeddedThreadId ?? source.messageId }
+        : {}),
+    };
+  });
+  const first = targets[0];
   if (
     !first ||
-    binding.sources.some(
-      (source) =>
-        source.conversationKind !== "direct" ||
-        !PERSONAL_CONVERSATION_ID_RE.test(source.conversationId),
+    targets.some(
+      (target) =>
+        !target ||
+        target.conversationId !== first.conversationId ||
+        target.conversationKind !== first.conversationKind ||
+        target.threadId !== first.threadId,
     )
   ) {
     return { ok: false, reason: "turn-source-target" };
   }
-  if (!getMSTeamsApprovalApprovers({ cfg: params.cfg }).includes(aadObjectId)) {
+  const authorization =
+    "request" in params ? params.request.request.authorization : params.authorization;
+  if (
+    (isMSTeamsRequesterOnlyApprovals(params.cfg) || authorization?.policy.requireResolverMatch) &&
+    !getMSTeamsApprovalApprovers({ cfg: params.cfg }).includes(aadObjectId)
+  ) {
     return { ok: false, reason: "not-an-approver" };
   }
   return {
     ok: true,
     requester: {
       aadObjectId,
-      target: { kind: "conversation", conversationId: first.conversationId },
+      target: first,
     },
   };
 }
@@ -143,7 +182,11 @@ export function resolveMSTeamsApprovalNoticeRequester(
   }
   return {
     aadObjectId,
-    target: { kind: "conversation", conversationId: first.message.conversationId },
+    target: {
+      kind: "conversation",
+      conversationId: first.message.conversationId,
+      conversationKind: "direct",
+    },
   };
 }
 
@@ -163,28 +206,52 @@ function isPersonalConversationOwnedBy(
   );
 }
 
-/** Prefer the admitted personal chat, then only the same sender's verified personal DM. */
+function matchesConversationReference(
+  reference: StoredConversationReference | null | undefined,
+  conversationId: string,
+  conversationKind: MSTeamsApprovalRequester["target"]["conversationKind"],
+): boolean {
+  return Boolean(
+    reference?.conversation?.id &&
+    normalizeMSTeamsConversationId(reference.conversation.id) === conversationId &&
+    normalizeOptionalLowercaseString(reference.conversation.conversationType) ===
+      (conversationKind === "direct"
+        ? "personal"
+        : conversationKind === "group"
+          ? "groupchat"
+          : "channel"),
+  );
+}
+
+/**
+ * Shared references identify a conversation, not its owner: their user is the last sender.
+ * Core's binding proves the requester; only personal references prove destination ownership.
+ */
 export async function verifyMSTeamsRequesterConversation(params: {
   requester: MSTeamsApprovalRequester;
-  store: Pick<MSTeamsConversationStore, "get" | "findPreferredDmByUserId">;
+  store: Pick<MSTeamsConversationStore, "get">;
 }): Promise<string | null> {
   const { requester, store } = params;
   const conversationId = requester.target.conversationId;
-  if (isPersonalConversationOwnedBy(await store.get(conversationId), requester.aadObjectId)) {
-    return conversationId;
+  const reference = await store.get(conversationId);
+  if (reference) {
+    return matchesConversationReference(
+      reference,
+      conversationId,
+      requester.target.conversationKind,
+    ) &&
+      (requester.target.conversationKind !== "direct" ||
+        isPersonalConversationOwnedBy(reference, requester.aadObjectId))
+      ? conversationId
+      : null;
   }
-  const entry = await store.findPreferredDmByUserId(requester.aadObjectId);
-  return entry &&
-    PERSONAL_CONVERSATION_ID_RE.test(entry.conversationId) &&
-    isPersonalConversationOwnedBy(entry.reference, requester.aadObjectId)
-    ? entry.conversationId
-    : null;
+  return null;
 }
 
 /** Re-check destination ownership at the send boundary. */
 export async function isMSTeamsRequesterDeliveryTarget(params: {
   to: string;
-  aadObjectId: string;
+  requester: MSTeamsApprovalRequester;
   store: Pick<MSTeamsConversationStore, "get">;
 }): Promise<boolean> {
   const normalized = normalizeMSTeamsMessagingTarget(params.to);
@@ -192,8 +259,20 @@ export async function isMSTeamsRequesterDeliveryTarget(params: {
     return false;
   }
   const conversationId = normalizeMSTeamsConversationId(normalized.slice("conversation:".length));
+  const { requester } = params;
+  const threadId = extractMSTeamsConversationMessageId(normalized);
+  if (
+    conversationId !== requester.target.conversationId ||
+    threadId !== requester.target.threadId
+  ) {
+    return false;
+  }
+  const reference = await params.store.get(conversationId);
   return (
-    PERSONAL_CONVERSATION_ID_RE.test(conversationId) &&
-    isPersonalConversationOwnedBy(await params.store.get(conversationId), params.aadObjectId)
+    matchesConversationReference(reference, conversationId, requester.target.conversationKind) &&
+    (requester.target.conversationKind !== "direct" ||
+      (PERSONAL_CONVERSATION_ID_RE.test(conversationId) &&
+        !threadId &&
+        isPersonalConversationOwnedBy(reference, requester.aadObjectId)))
   );
 }

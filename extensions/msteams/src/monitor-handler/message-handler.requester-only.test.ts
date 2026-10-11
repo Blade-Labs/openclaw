@@ -59,10 +59,10 @@ function createConfig(requesterOnly: boolean): OpenClawConfig {
   } as OpenClawConfig;
 }
 
-async function dispatchDirectMessage(cfg: OpenClawConfig) {
+async function dispatchMessage(cfg: OpenClawConfig, activity = directActivity()) {
   const { deps } = createMessageHandlerDeps(cfg);
   const handler = createMSTeamsMessageHandler(deps);
-  await handler(context(directActivity()), lifecycle());
+  await handler(context(activity), lifecycle());
   const dispatch = runtimeApiMockState.dispatchReplyWithBufferedBlockDispatcher;
   expect(dispatch).toHaveBeenCalledTimes(1);
   return dispatch.mock.calls[0]?.[0] as
@@ -73,6 +73,7 @@ async function dispatchDirectMessage(cfg: OpenClawConfig) {
           MessageSid?: string;
           OriginatingChannel?: string;
           OriginatingTo?: string;
+          MessageThreadId?: string;
         };
         replyOptions?: { onAgentRunStart?: (runId: string) => unknown };
       }
@@ -87,7 +88,7 @@ describe("Microsoft Teams requester-only turn provenance", () => {
   it.each([true, false])(
     "passes the personal message source to core without a plugin run callback (requesterOnly=%s)",
     async (requesterOnly) => {
-      const dispatchParams = await dispatchDirectMessage(createConfig(requesterOnly));
+      const dispatchParams = await dispatchMessage(createConfig(requesterOnly));
       expect(dispatchParams?.ctx).toMatchObject({
         SenderId: REQUESTER_ID,
         ChatType: "direct",
@@ -96,6 +97,53 @@ describe("Microsoft Teams requester-only turn provenance", () => {
         OriginatingTo: `conversation:${PERSONAL_CHAT}`,
       });
       expect(dispatchParams?.replyOptions?.onAgentRunStart).toBeUndefined();
+    },
+  );
+  it.each([
+    {
+      kind: "channel",
+      type: "channel",
+      id: "19:channel@thread.tacv2",
+      suffix: ";messageid=thread-root",
+      replyToId: undefined,
+      threadId: "thread-root",
+    },
+    {
+      kind: "channel",
+      type: "channel",
+      id: "19:channel@thread.tacv2",
+      suffix: "",
+      replyToId: "thread-root",
+      threadId: "thread-root",
+    },
+    {
+      kind: "group",
+      type: "groupChat",
+      id: "19:group@thread.v2",
+      suffix: "",
+      replyToId: undefined,
+      threadId: undefined,
+    },
+  ])(
+    "passes authenticated $kind origin and thread facts to core",
+    async ({ kind, type, id, suffix, replyToId, threadId }) => {
+      const cfg = createConfig(true);
+      cfg.channels = {
+        msteams: { ...cfg.channels?.msteams, groupPolicy: "open", requireMention: false },
+      };
+      const dispatch = await dispatchMessage(cfg, {
+        ...directActivity(),
+        conversation: { id: `${id}${suffix}`, conversationType: type },
+        replyToId,
+      });
+      expect(dispatch?.ctx).toMatchObject({
+        SenderId: REQUESTER_ID,
+        ChatType: kind,
+        MessageSid: "activity-1",
+        OriginatingChannel: "msteams",
+        OriginatingTo: `conversation:${id}`,
+      });
+      expect(dispatch?.ctx?.MessageThreadId).toBe(threadId);
     },
   );
 });

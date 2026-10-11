@@ -5,6 +5,8 @@ import {
   createApprovalNativeRouteCoordinator,
   createApprovalNativeRouteReporter as createApprovalNativeRouteReporterRaw,
 } from "./approval-native-route-coordinator.js";
+import { classifyApprovalRequester } from "./approval-requester-binding.js";
+import { createHostChannelTurnSource, projectHostTurnSource } from "./host-turn-source.js";
 
 const approvalRouteReporters: Array<ReturnType<typeof createApprovalNativeRouteReporterRaw>> = [];
 const defaultRouteSelector = {
@@ -36,6 +38,114 @@ function createGatewayRequestMock() {
 }
 
 describe("createApprovalNativeRouteReporter", () => {
+  it.each([false, true])(
+    "routes an authorized Slack origin notice after Discord delivery (ambiguous origin: %s)",
+    async (ambiguousOrigin) => {
+      const coordinator = createApprovalNativeRouteCoordinator();
+      const requestGateway = createGatewayRequestMock();
+      const initialSource = projectHostTurnSource(
+        createHostChannelTurnSource({
+          actor: {
+            channel: "slack",
+            accountId: "work",
+            senderId: "U123",
+            actorKind: "human",
+          },
+          message: {
+            messageId: "1712345678.123457",
+            conversationId: "C123",
+            conversationKind: "channel",
+            threadId: "1712345678.123456",
+            eventKind: "reply",
+          },
+        }),
+        "synthetic-run",
+        "synthetic-session",
+      );
+      const source = ambiguousOrigin
+        ? {
+            ...initialSource,
+            inputs: initialSource.inputs.flatMap((input) =>
+              input.origin === "user"
+                ? [
+                    input,
+                    {
+                      ...input,
+                      inputId: "synthetic-other-thread",
+                      message: { ...input.message, threadId: "1712345678.999999" },
+                    },
+                  ]
+                : [input],
+            ),
+          }
+        : initialSource;
+      const authorization = {
+        ...requesterAuthorization(false),
+        source,
+        requesterBinding: classifyApprovalRequester(source),
+      };
+      const request = {
+        id: "approval-slack-to-discord",
+        request: {
+          command: "echo hi",
+          authorization,
+          turnSourceChannel: "telegram",
+          turnSourceTo: "synthetic-forged-chat",
+          turnSourceAccountId: "synthetic-forged-account",
+          turnSourceThreadId: "synthetic-forged-thread",
+        },
+        createdAtMs: 0,
+        expiresAtMs: Date.now() + 60_000,
+      };
+      const reporter = coordinator.createReporter({
+        ...defaultRouteSelector,
+        handledKinds: new Set(["exec"]),
+        channel: "discord",
+        channelLabel: "Discord",
+        accountId: "default",
+        requestGateway,
+      });
+      reporter.start();
+      try {
+        expect(reporter.selectRequest({ approvalKind: "exec", request })).toEqual({
+          kind: "selected",
+        });
+        const deliveredTargets = [
+          {
+            surface: "approver-dm" as const,
+            target: { to: "user:owner" },
+            reason: "preferred" as const,
+          },
+        ];
+        await reporter.reportDelivery({
+          approvalKind: "exec",
+          request,
+          deliveryPlan: {
+            targets: deliveredTargets,
+            originTarget: null,
+            notifyOriginWhenDmOnly: false,
+          },
+          deliveredTargets,
+        });
+        if (ambiguousOrigin) {
+          expect(requestGateway).not.toHaveBeenCalled();
+        } else {
+          expect(requestGateway).toHaveBeenCalledExactlyOnceWith("send", {
+            channel: "slack",
+            to: "C123",
+            accountId: "work",
+            threadId: "1712345678.123456",
+            message:
+              "Approval required. I sent the approval request to Discord DMs, not this chat.",
+            idempotencyKey: "approval-route-notice:approval-slack-to-discord",
+          });
+        }
+      } finally {
+        coordinator.close();
+      }
+    },
+  );
+
   it("records blocked requester notice outcomes and uses the existing approval idempotency key", async () => {
     const coordinator = createApprovalNativeRouteCoordinator();
     const requestGateway = createGatewayRequestMock();

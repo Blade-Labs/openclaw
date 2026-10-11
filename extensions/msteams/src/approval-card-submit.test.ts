@@ -13,6 +13,9 @@ import { createMSTeamsMessageHandlerDeps } from "./monitor-handler.test-helpers.
 import type { MSTeamsMessageHandlerDeps } from "./monitor-handler.types.js";
 import type { MSTeamsTurnContext } from "./sdk-types.js";
 
+const editAdaptiveCardMSTeams = vi.hoisted(() => vi.fn());
+vi.mock("./send.js", () => ({ editAdaptiveCardMSTeams }));
+
 const resolveApprovalOverGateway = vi.hoisted(() => vi.fn());
 const accountRuntime = vi.hoisted(() => ({
   current: undefined as ChannelApprovalResolutionRuntimeV2 | undefined,
@@ -87,6 +90,7 @@ function createContext(params: {
   token?: string;
   senderId?: string;
   conversationId?: string;
+  conversationType?: string;
   replyToId?: string;
   nested?: boolean;
   value?: unknown;
@@ -100,7 +104,10 @@ function createContext(params: {
       type: "message",
       id: "authenticated-click",
       from: { aadObjectId: params.senderId ?? APPROVER_ID },
-      conversation: { id: params.conversationId ?? CONVERSATION_ID, conversationType: "personal" },
+      conversation: {
+        id: params.conversationId ?? CONVERSATION_ID,
+        conversationType: params.conversationType ?? "personal",
+      },
       ...(params.replyToId ? { replyToId: params.replyToId } : {}),
       value:
         params.value ??
@@ -142,6 +149,7 @@ function registerBinding(params: {
 
 describe("maybeHandleMSTeamsApprovalCardSubmit", () => {
   beforeEach(() => {
+    editAdaptiveCardMSTeams.mockReset().mockResolvedValue({ conversationId: CONVERSATION_ID });
     accountRuntime.current = undefined;
     resolveApprovalOverGateway
       .mockReset()
@@ -246,19 +254,13 @@ describe("maybeHandleMSTeamsApprovalCardSubmit", () => {
       accountId: "default",
       senderId: APPROVER_ID,
     });
-    expect(authorizedContext.updateActivity).toHaveBeenCalledWith({
-      type: "message",
-      id: ACTIVITY_ID,
-      attachments: [
-        {
-          contentType: "application/vnd.microsoft.card.adaptive",
-          content: expect.objectContaining({ type: "AdaptiveCard" }),
-        },
-      ],
+    expect(editAdaptiveCardMSTeams).toHaveBeenCalledWith({
+      cfg: deps.cfg,
+      to: `conversation:${CONVERSATION_ID}`,
+      activityId: ACTIVITY_ID,
+      card: expect.objectContaining({ type: "AdaptiveCard" }),
     });
-    expect(JSON.stringify(vi.mocked(authorizedContext.updateActivity).mock.calls[0])).toContain(
-      "Denied",
-    );
+    expect(JSON.stringify(editAdaptiveCardMSTeams.mock.calls[0])).toContain("Denied");
     expect(msTeamsApprovalControls.get(token)).toBeNull();
   });
 
@@ -277,6 +279,9 @@ describe("maybeHandleMSTeamsApprovalCardSubmit", () => {
     ).resolves.toBe(true);
 
     expect(resolveApprovalOverGateway).toHaveBeenCalledTimes(1);
+    expect(editAdaptiveCardMSTeams).toHaveBeenCalledWith(
+      expect.objectContaining({ to: `conversation:${CONVERSATION_ID}`, activityId: ACTIVITY_ID }),
+    );
   });
 
   it("allows only one gateway resolution while simultaneous clicks are in flight", async () => {
@@ -322,7 +327,7 @@ describe("maybeHandleMSTeamsApprovalCardSubmit", () => {
       createResolution({ approvalId: `approval-${token}`, decision: "deny", applied: false }),
     );
     const failedContext = createContext({ token });
-    vi.mocked(failedContext.updateActivity).mockRejectedValueOnce(new Error("update failed"));
+    editAdaptiveCardMSTeams.mockRejectedValueOnce(new Error("update failed"));
     const deps = createDeps();
 
     await expect(
@@ -334,7 +339,7 @@ describe("maybeHandleMSTeamsApprovalCardSubmit", () => {
     ).resolves.toBe(true);
 
     expect(resolveApprovalOverGateway).toHaveBeenCalledTimes(2);
-    const cardJson = JSON.stringify(vi.mocked(retriedContext.updateActivity).mock.calls[0]?.[0]);
+    const cardJson = JSON.stringify(editAdaptiveCardMSTeams.mock.calls[1]?.[0]);
     expect(cardJson).toContain("Exec Approval: Denied");
     expect(cardJson).toContain("Already resolved");
     expect(cardJson).not.toContain("Exec Approval: Allowed once");
@@ -354,7 +359,7 @@ describe("maybeHandleMSTeamsApprovalCardSubmit", () => {
 
     await expect(maybeHandleMSTeamsApprovalCardSubmit({ context, deps })).resolves.toBe(true);
     expect(msTeamsApprovalControls.get(token)).toBeNull();
-    expect(context.updateActivity).not.toHaveBeenCalled();
+    expect(editAdaptiveCardMSTeams).not.toHaveBeenCalled();
 
     await expect(maybeHandleMSTeamsApprovalCardSubmit({ context, deps })).resolves.toBe(true);
     expect(resolveApprovalOverGateway).toHaveBeenCalledTimes(1);
@@ -379,6 +384,7 @@ describe("maybeHandleMSTeamsApprovalCardSubmit with requester-only approvals", (
   }
 
   beforeEach(() => {
+    editAdaptiveCardMSTeams.mockReset().mockResolvedValue({ conversationId: CONVERSATION_ID });
     resolveApprovalOverGateway.mockReset();
     const actor: ReturnType<ChannelApprovalResolutionRuntimeV2["admitInteractionActor"]> = {
       kind: "admitted-channel-actor",
@@ -423,7 +429,7 @@ describe("maybeHandleMSTeamsApprovalCardSubmit with requester-only approvals", (
         interactionId: "authenticated-click",
       });
       expect(resolveWithActor).toHaveBeenCalledTimes(1);
-      expect(context.updateActivity).toHaveBeenCalledTimes(1);
+      expect(editAdaptiveCardMSTeams).toHaveBeenCalledTimes(1);
       expect(msTeamsApprovalControls.get(token)).toBeNull();
     },
   );
@@ -449,16 +455,32 @@ describe("maybeHandleMSTeamsApprovalCardSubmit with requester-only approvals", (
 
       expect(resolveWithActor).not.toHaveBeenCalled();
       expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
-      expect(context.updateActivity).not.toHaveBeenCalled();
+      expect(editAdaptiveCardMSTeams).not.toHaveBeenCalled();
       expect(msTeamsApprovalControls.get(token)).not.toBeNull();
     },
   );
 
-  it.each(["exec", "plugin", "system-agent"] as const)(
-    "rejects another approver's %s click without consuming the requester's card",
-    async (approvalKind) => {
+  it.each([
+    {
+      approvalKind: "exec" as const,
+      conversationId: CONVERSATION_ID,
+      conversationType: "personal",
+    },
+    {
+      approvalKind: "plugin" as const,
+      conversationId: "19:channel@thread.tacv2",
+      conversationType: "channel",
+    },
+    {
+      approvalKind: "system-agent" as const,
+      conversationId: "19:group@thread.v2",
+      conversationType: "groupChat",
+    },
+  ])(
+    "rejects another approver's $approvalKind click in $conversationType without consuming the requester's card",
+    async ({ approvalKind, conversationId, conversationType }) => {
       const token = `requester-only-${approvalKind}`;
-      registerBinding({ token, approvalKind, requesterOnly: true });
+      registerBinding({ token, approvalKind, conversationId, requesterOnly: true });
       const deps = createRequesterOnlyDeps();
       resolveWithActor.mockRejectedValueOnce(
         Object.assign(new Error("Approval requester unavailable: ineligible"), {
@@ -468,7 +490,12 @@ describe("maybeHandleMSTeamsApprovalCardSubmit with requester-only approvals", (
 
       await expect(
         maybeHandleMSTeamsApprovalCardSubmit({
-          context: createContext({ token, senderId: COLLEAGUE_ID }),
+          context: createContext({
+            token,
+            senderId: COLLEAGUE_ID,
+            conversationId,
+            conversationType,
+          }),
           deps,
         }),
       ).rejects.toThrow("Approval requester unavailable");
@@ -480,9 +507,15 @@ describe("maybeHandleMSTeamsApprovalCardSubmit with requester-only approvals", (
       });
       expect(msTeamsApprovalControls.get(token)).not.toBeNull();
 
+      const requesterContext = createContext({
+        token,
+        senderId: REQUESTER_ID.toUpperCase(),
+        conversationId,
+        conversationType,
+      });
       await expect(
         maybeHandleMSTeamsApprovalCardSubmit({
-          context: createContext({ token, senderId: REQUESTER_ID.toUpperCase() }),
+          context: requesterContext,
           deps,
         }),
       ).resolves.toBe(true);
@@ -499,6 +532,9 @@ describe("maybeHandleMSTeamsApprovalCardSubmit with requester-only approvals", (
         actorKind: "human",
         interactionId: "authenticated-click",
       });
+      expect(editAdaptiveCardMSTeams).toHaveBeenCalledWith(
+        expect.objectContaining({ to: `conversation:${conversationId}`, activityId: ACTIVITY_ID }),
+      );
       expect(msTeamsApprovalControls.get(token)).toBeNull();
     },
   );
@@ -530,8 +566,9 @@ describe("maybeHandleMSTeamsApprovalCardSubmit with requester-only approvals", (
 
     expect(resolveWithActor).toHaveBeenCalledTimes(2);
     expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
-    for (const context of [first, second]) {
-      const cardJson = JSON.stringify(vi.mocked(context.updateActivity).mock.calls[0]?.[0]);
+    expect(editAdaptiveCardMSTeams).toHaveBeenCalledTimes(2);
+    for (const [update] of editAdaptiveCardMSTeams.mock.calls) {
+      const cardJson = JSON.stringify(update.card);
       expect(cardJson).toContain("Exec Approval: Denied");
       expect(cardJson).not.toContain("Exec Approval: Allowed once");
     }
@@ -574,20 +611,24 @@ describe("maybeHandleMSTeamsApprovalCardSubmit with requester-only approvals", (
     expect(msTeamsApprovalControls.get(token)).toBeNull();
   });
 
-  it("rejects the requester once they are removed from the approver roster", async () => {
-    const token = "requester-only-removed";
-    registerBinding({ token, requesterOnly: true });
+  it.each([false, true])(
+    "rejects a card click after the approver roster is cleared (requesterOnly=%s)",
+    async (requesterOnly) => {
+      const token = `roster-cleared-${requesterOnly}`;
+      const deps = createRequesterOnlyDeps(requesterOnly);
+      registerBinding({ token, requesterOnly });
+      deps.cfg.channels!.msteams!.allowFrom = [];
 
-    await maybeHandleMSTeamsApprovalCardSubmit({
-      context: createContext({ token, senderId: REQUESTER_ID }),
-      deps: createMSTeamsMessageHandlerDeps({
-        cfg: { channels: { msteams: { allowFrom: [], approvals: { requesterOnly: true } } } },
-      }),
-    });
-    expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
-    expect(resolveWithActor).not.toHaveBeenCalled();
-    expect(msTeamsApprovalControls.get(token)).not.toBeNull();
-  });
+      await maybeHandleMSTeamsApprovalCardSubmit({
+        context: createContext({ token, senderId: REQUESTER_ID.toUpperCase() }),
+        deps,
+      });
+      expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
+      expect(resolveWithActor).not.toHaveBeenCalled();
+      expect(editAdaptiveCardMSTeams).not.toHaveBeenCalled();
+      expect(msTeamsApprovalControls.get(token)).not.toBeNull();
+    },
+  );
 
   it("fails closed without the matched core runtime after requesterOnly is disabled", async () => {
     const token = "missing-runtime";
@@ -602,7 +643,7 @@ describe("maybeHandleMSTeamsApprovalCardSubmit with requester-only approvals", (
       }),
     ).resolves.toBe(true);
     expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
-    expect(context.updateActivity).not.toHaveBeenCalled();
+    expect(editAdaptiveCardMSTeams).not.toHaveBeenCalled();
     expect(msTeamsApprovalControls.get(token)).not.toBeNull();
   });
 });

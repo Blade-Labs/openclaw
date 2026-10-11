@@ -1,6 +1,7 @@
 import { DEFAULT_ACCOUNT_ID } from "openclaw/plugin-sdk/account-id";
 import { resolveApprovalOverGateway } from "openclaw/plugin-sdk/approval-gateway-runtime";
 import type { ChannelApprovalResolutionRuntimeV2 } from "openclaw/plugin-sdk/approval-runtime";
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
 import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { getMSTeamsApprovalApprovers, msTeamsApprovalAuth } from "./approval-auth.js";
 import {
@@ -16,6 +17,8 @@ import { isMSTeamsReplayedActivity, normalizeMSTeamsConversationId } from "./inb
 import type { MSTeamsMessageHandlerDeps } from "./monitor-handler.types.js";
 import { getOptionalMSTeamsRuntime } from "./runtime.js";
 import type { MSTeamsTurnContext } from "./sdk-types.js";
+
+const loadCardTransport = createLazyRuntimeModule(() => import("./send.js"));
 
 function isMSTeamsApprovalSubmit(value: unknown): boolean {
   if (!isRecord(value)) {
@@ -70,12 +73,8 @@ export async function maybeHandleMSTeamsApprovalCardSubmit(params: {
   }
 
   const requesterOnly = isMSTeamsRequesterOnlyApprovals(deps.cfg) || binding.requesterOnly === true;
-  const aadObjectId = normalizeMSTeamsAadObjectId(context.activity.from?.aadObjectId);
-  const senderId = requesterOnly ? aadObjectId : context.activity.from?.aadObjectId;
-  if (
-    requesterOnly &&
-    (!senderId || !getMSTeamsApprovalApprovers({ cfg: deps.cfg }).includes(senderId))
-  ) {
+  const senderId = normalizeMSTeamsAadObjectId(context.activity.from?.aadObjectId);
+  if (!senderId || !getMSTeamsApprovalApprovers({ cfg: deps.cfg }).includes(senderId)) {
     ignored(`unauthorized actor ${senderId || "unknown"}`);
     return true;
   }
@@ -97,15 +96,8 @@ export async function maybeHandleMSTeamsApprovalCardSubmit(params: {
       accountId: DEFAULT_ACCOUNT_ID,
       capability: "approval.gateway",
     });
-  if (
-    requesterOnly &&
-    (resolutionRuntime?.version !== 2 ||
-      context.activity.conversation?.conversationType !== "personal" ||
-      context.activity.conversation?.isGroup === true ||
-      context.activity.channelData?.team !== undefined ||
-      context.activity.channelData?.channel !== undefined)
-  ) {
-    ignored("requester-only: authenticated personal-chat approval runtime unavailable");
+  if (requesterOnly && resolutionRuntime?.version !== 2) {
+    ignored("requester-only: authenticated approval runtime unavailable");
     return true;
   }
   if (
@@ -126,7 +118,7 @@ export async function maybeHandleMSTeamsApprovalCardSubmit(params: {
         ? await resolutionRuntime.resolve(
             { id: consumed.approvalId, kind: consumed.approvalKind, decision: consumed.decision },
             resolutionRuntime.admitInteractionActor({
-              senderId: aadObjectId ?? senderId,
+              senderId,
               actorKind: isMSTeamsReplayedActivity(context.activity)
                 ? "unknown"
                 : context.activity.from?.role === "bot"
@@ -144,15 +136,12 @@ export async function maybeHandleMSTeamsApprovalCardSubmit(params: {
             accountId: DEFAULT_ACCOUNT_ID,
             senderId,
           });
-    await context.updateActivity({
-      type: "message",
-      id: consumed.activityId,
-      attachments: [
-        {
-          contentType: "application/vnd.microsoft.card.adaptive",
-          content: buildMSTeamsCanonicalApprovalTerminalCard(result),
-        },
-      ],
+    const { editAdaptiveCardMSTeams } = await loadCardTransport();
+    await editAdaptiveCardMSTeams({
+      cfg: deps.cfg,
+      to: `conversation:${consumed.conversationId}`,
+      activityId: consumed.activityId,
+      card: buildMSTeamsCanonicalApprovalTerminalCard(result),
     });
     return result;
   });

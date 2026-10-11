@@ -111,6 +111,7 @@ export function createExecApprovalChannelRuntime<
   const eventKinds = new Set<ChannelApprovalKind>(adapter.eventKinds ?? ["exec"]);
   const configuredGatewayRuntime = getGatewayNativeApprovalRuntime();
   const pending = createPendingApprovalRegistry<PendingApprovalValue<TPending, TRequest>>();
+  const deliveries = new Map<string, Promise<boolean>>();
   let gatewayClient: GatewayClient | null = null;
   let gatewayRuntime: typeof configuredGatewayRuntime;
   let unsubscribeGatewayRuntime: (() => void) | null = null;
@@ -150,47 +151,69 @@ export function createExecApprovalChannelRuntime<
     await finalizeExpiredEntry(entry);
   };
 
+  const deliverRequested = async (
+    requestInput: TRequest,
+    opts?: { ignoreIfInactive?: boolean; alreadyAccepted?: boolean },
+  ): Promise<boolean> => {
+    if (opts?.ignoreIfInactive && !shouldKeepRunning()) {
+      return false;
+    }
+    const request = normalizeApprovalRequest(requestInput);
+    const delivering = deliveries.get(request.id);
+    if (delivering) {
+      return await delivering;
+    }
+    if (pending.has(request.id)) {
+      log.debug(`ignored duplicate request ${request.id}`);
+      return true;
+    }
+    if (opts?.alreadyAccepted !== true && !adapter.shouldHandle(request)) {
+      return false;
+    }
+
+    // Replay and publication must share the completed delivery result, not the
+    // pending reservation created before the transport has accepted the card.
+    const entry = pending.begin(request.id, { request, entries: [] });
+    const delivery = Promise.resolve().then(async () => {
+      log.debug(`received request ${request.id}`);
+      let entries: TPending[];
+      try {
+        entries = await adapter.deliverRequested(request);
+      } catch (err) {
+        pending.remove(request.id, entry);
+        throw err;
+      }
+      if (!pending.isCurrent(entry)) {
+        return false;
+      }
+      if (!entries.length) {
+        pending.remove(request.id, entry);
+        return false;
+      }
+      await pending.completeDelivery(entry, { request, entries });
+      if (!pending.isCurrent(entry)) {
+        return true;
+      }
+
+      const timeoutMs = Math.max(0, request.expiresAtMs - nowMs());
+      pending.scheduleExpiry(entry, timeoutMs, (expired) => {
+        spawn("error handling approval expiration", finalizeExpiredEntry(expired));
+      });
+      return true;
+    });
+    deliveries.set(request.id, delivery);
+    try {
+      return await delivery;
+    } finally {
+      deliveries.delete(request.id);
+    }
+  };
+
   const handleRequested = async (
     requestInput: TRequest,
     opts?: { ignoreIfInactive?: boolean; alreadyAccepted?: boolean },
   ): Promise<void> => {
-    if (opts?.ignoreIfInactive && !shouldKeepRunning()) {
-      return;
-    }
-    const request = normalizeApprovalRequest(requestInput);
-    if (pending.has(request.id)) {
-      log.debug(`ignored duplicate request ${request.id}`);
-      return;
-    }
-    if (opts?.alreadyAccepted !== true && !adapter.shouldHandle(request)) {
-      return;
-    }
-
-    log.debug(`received request ${request.id}`);
-    const entry = pending.begin(request.id, { request, entries: [] });
-    let entries: TPending[];
-    try {
-      entries = await adapter.deliverRequested(request);
-    } catch (err) {
-      pending.remove(request.id, entry);
-      throw err;
-    }
-    if (!pending.isCurrent(entry)) {
-      return;
-    }
-    if (!entries.length) {
-      pending.remove(request.id, entry);
-      return;
-    }
-    await pending.completeDelivery(entry, { request, entries });
-    if (!pending.isCurrent(entry)) {
-      return;
-    }
-
-    const timeoutMs = Math.max(0, request.expiresAtMs - nowMs());
-    pending.scheduleExpiry(entry, timeoutMs, (expired) => {
-      spawn("error handling approval expiration", finalizeExpiredEntry(expired));
-    });
+    await deliverRequested(requestInput, opts);
   };
 
   const handleResolved = async (resolved: TResolved): Promise<void> => {
@@ -326,8 +349,7 @@ export function createExecApprovalChannelRuntime<
             channel: adapter.channel,
             accountId: adapter.accountId,
             deliverRequester: async (request) => {
-              await handleRequested(request as TRequest, { ignoreIfInactive: true });
-              return pending.has(request.id);
+              return await deliverRequested(request as TRequest, { ignoreIfInactive: true });
             },
             eventKinds,
             // SAFETY: Handled event kinds select the adapter's canonical request union.

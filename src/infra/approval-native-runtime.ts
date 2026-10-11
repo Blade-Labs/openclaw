@@ -201,13 +201,20 @@ export function createChannelNativeApprovalRuntime<
     channel: adapter.channel,
     channelLabel: adapter.channelLabel,
     accountId: adapter.accountId,
-    resolveRequesterNoticeTarget: async (request, kind) =>
-      (await adapter.nativeAdapter?.resolveRequesterNoticeTarget?.({
-        cfg: adapter.cfg,
-        accountId: adapter.accountId,
-        approvalKind: kind,
-        request,
-      })) ?? null,
+    ...(adapter.nativeAdapter?.resolveRequesterNoticeTarget
+      ? {
+          resolveRequesterNoticeTarget: async (
+            request: ApprovalRequest,
+            kind: ChannelApprovalKind,
+          ) =>
+            (await adapter.nativeAdapter?.resolveRequesterNoticeTarget?.({
+              cfg: adapter.cfg,
+              accountId: adapter.accountId,
+              approvalKind: kind,
+              request,
+            })) ?? null,
+        }
+      : {}),
     // SAFETY: the route coordinator receives only normalized requests from this runtime.
     shouldHandle: (request) => adapter.shouldHandle(request as NormalizedApprovalRequest<TRequest>),
     classifyRoute: (request) =>

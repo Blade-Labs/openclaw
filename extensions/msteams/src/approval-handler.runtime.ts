@@ -21,7 +21,7 @@ import {
 import { createMSTeamsConversationStoreState } from "./conversation-store-state.js";
 import { extractMSTeamsConversationMessageId } from "./inbound.js";
 import { normalizeMSTeamsMessagingTarget } from "./resolve-allowlist.js";
-import { editAdaptiveCardMSTeams, sendAdaptiveCardMSTeams, sendMessageMSTeams } from "./send.js";
+import { editAdaptiveCardMSTeams, sendAdaptiveCardMSTeams } from "./send.js";
 import { inferMSTeamsTargetChatType } from "./session-route.js";
 
 const log = createSubsystemLogger("msteams/approvals");
@@ -83,26 +83,22 @@ export const msTeamsApprovalNativeRuntime = createChannelApprovalNativeRuntimeAd
     },
     deliverPending: async ({ cfg, accountId, preparedTarget, pendingPayload, request }) => {
       const requesterOnly = isMSTeamsRequesterOnlyRequest(cfg, request);
-      if (requesterOnly) {
-        if (accountId != null && accountId !== DEFAULT_ACCOUNT_ID) {
-          return null;
-        }
-        // Send boundary: deliver only into the requester's own, store-verified personal chat.
-        const requester = resolveMSTeamsApprovalRequester({ cfg, request });
-        if (
-          !requester ||
-          !(await isMSTeamsRequesterDeliveryTarget({
-            to: preparedTarget.to,
-            aadObjectId: requester.aadObjectId,
-            store: createMSTeamsConversationStoreState(),
-          })) ||
-          !resolveMSTeamsApprovalRequester({ cfg, request })
-        ) {
-          log.warn(
-            `msteams approvals: requester-only refused delivery of ${request.id} to an unverified target`,
-          );
-          return null;
-        }
+      if (accountId != null && accountId !== DEFAULT_ACCOUNT_ID) {
+        return null;
+      }
+      // Both policies revalidate the exact admitted origin before the send.
+      const requester = resolveMSTeamsApprovalRequester({ cfg, request });
+      if (
+        !requester ||
+        !(await isMSTeamsRequesterDeliveryTarget({
+          to: preparedTarget.to,
+          requester,
+          store: createMSTeamsConversationStoreState(),
+        })) ||
+        !shouldHandleMSTeamsNativeApprovalRequest({ cfg, accountId, request })
+      ) {
+        log.warn(`msteams approvals: refused delivery of ${request.id} to an unverified target`);
+        return null;
       }
       const sent = await sendAdaptiveCardMSTeams({
         cfg,
@@ -123,7 +119,7 @@ export const msTeamsApprovalNativeRuntime = createChannelApprovalNativeRuntimeAd
     updateEntry: async ({ cfg, entry, payload }) => {
       await editAdaptiveCardMSTeams({
         cfg,
-        to: entry.conversationId,
+        to: `conversation:${entry.conversationId}`,
         activityId: entry.activityId,
         card: payload,
       });
@@ -157,25 +153,9 @@ export const msTeamsApprovalNativeRuntime = createChannelApprovalNativeRuntimeAd
       msTeamsApprovalControls.unregister(entry.actionTokens.map(({ token }) => token)),
   },
   observe: {
-    onDeliveryError: ({ cfg, error, plannedTarget, request, approvalKind, pendingPayload }) => {
+    onDeliveryError: ({ error, request }) => {
       log.error(`msteams approvals: failed to deliver request ${request.id}: ${String(error)}`);
-      if (isMSTeamsRequesterOnlyRequest(cfg, request)) {
-        // Core denies the request and owns its idempotent blocked notice.
-        return;
-      }
-      // The active native route suppressed the local text prompt, so a failed
-      // card send must still surface a visible approval path (#130040 tracks
-      // the shared-boundary fix); losing both prompts is a silent failure.
-      const decisions = pendingPayload.allowedDecisions.join("|");
-      void sendMessageMSTeams({
-        cfg,
-        to: plannedTarget.target.to,
-        text: `⚠️ Could not deliver the ${approvalKind} approval card for ${request.id}. Reply "/approve ${request.id} <${decisions}>" to resolve it.`,
-      }).catch((fallbackError: unknown) => {
-        log.error(
-          `msteams approvals: fallback prompt for ${request.id} also failed: ${String(fallbackError)}`,
-        );
-      });
+      // Core owns failed-delivery and private blocked notices, including zero targets.
     },
   },
 });

@@ -2,18 +2,25 @@
 import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ChannelApprovalNativeAdapter } from "../channels/plugins/types.adapters.js";
+import type { ChannelPlugin } from "../channels/plugins/types.public.js";
+import { requesterAuthorization } from "../gateway/approval-requester.test-support.js";
+import { withPluginRuntimeRegistryScope } from "../plugins/runtime/gateway-request-scope.js";
+import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
 import {
   createChannelNativeApprovalRuntime as createChannelNativeApprovalRuntimeRaw,
   deliverApprovalRequestViaChannelNativePlan,
 } from "./approval-native-runtime.js";
+import type { ApprovalRequestAuthorization } from "./approval-requester-binding.js";
+import { createExecApprovalForwarder } from "./exec-approval-forwarder.js";
 
 const hoisted = vi.hoisted(() => ({
+  logError: vi.fn(),
   callGatewayLeastPrivilege: vi.fn(async () => ({ ok: true })),
   createOperatorApprovalsGatewayClient: vi.fn(
     async (params: { onHelloOk?: (hello: unknown) => void }) => {
       queueMicrotask(() => params.onHelloOk?.({ type: "hello-ok" }));
       return {
-        request: vi.fn(async () => ({ ok: true })),
+        request: vi.fn(async () => []),
         stop: vi.fn(),
       };
     },
@@ -22,6 +29,15 @@ const hoisted = vi.hoisted(() => ({
     ready: true,
     aborted: false,
   })),
+}));
+
+vi.mock("../logging/subsystem.js", () => ({
+  createSubsystemLogger: () => ({
+    error: hoisted.logError,
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+  }),
 }));
 
 vi.mock("../gateway/call.js", () => ({
@@ -57,7 +73,8 @@ function createChannelNativeApprovalRuntime(
 
 afterEach(async () => {
   await Promise.all(approvalRuntimes.splice(0).map((runtime) => runtime.stop()));
-  hoisted.callGatewayLeastPrivilege.mockClear();
+  hoisted.logError.mockClear();
+  hoisted.callGatewayLeastPrivilege.mockReset().mockResolvedValue({ ok: true });
   hoisted.createOperatorApprovalsGatewayClient.mockClear();
   hoisted.startGatewayClientWhenEventLoopReady.mockClear();
   vi.useRealTimers();
@@ -69,6 +86,150 @@ function mockCallArg(mock: ReturnType<typeof vi.fn>, index = 0): Record<string, 
   const arg = mock.mock.calls[index]?.[0];
   return requireRecord(arg);
 }
+
+describe("native zero-target delivery", () => {
+  it.each(["private", "shared", "unavailable", "failed-notice", "missing-provenance"] as const)(
+    "records zero-target native delivery with a safe %s notice outcome",
+    async (sourceKind) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(1000);
+      let authorization: ApprovalRequestAuthorization | undefined = requesterAuthorization(false);
+      if (sourceKind === "missing-provenance") {
+        authorization = undefined;
+      } else if (sourceKind === "unavailable") {
+        authorization = {
+          ...authorization,
+          source: { ...authorization.source, completeness: "unavailable" },
+          requesterBinding: { state: "unavailable", reason: "missing-source" },
+        };
+      } else if (sourceKind === "shared") {
+        authorization = {
+          ...authorization,
+          source: {
+            ...authorization.source,
+            inputs: authorization.source.inputs.map((input) =>
+              input.origin === "user"
+                ? {
+                    ...input,
+                    message: {
+                      ...input.message,
+                      conversationKind: "channel",
+                      conversationId: "shared-origin",
+                    },
+                  }
+                : input,
+            ),
+          },
+        };
+      }
+      if (sourceKind === "failed-notice") {
+        hoisted.callGatewayLeastPrivilege.mockRejectedValueOnce(new Error("notice unavailable"));
+      }
+      const request = {
+        ...execRequest,
+        id: `zero-${sourceKind}`,
+        request: {
+          ...execRequest.request,
+          authorization,
+          turnSourceChannel: "test",
+          turnSourceAccountId: "default",
+          turnSourceTo: "user:misleading-target",
+          turnSourceThreadId: "wrong-thread",
+        },
+      };
+      const deliverTarget = vi.fn();
+      const onDeliveryError = vi.fn();
+      const runtime = createChannelNativeApprovalRuntime({
+        label: "test/zero-target",
+        clientDisplayName: "Test",
+        channel: "test",
+        accountId: "default",
+        cfg: {},
+        isConfigured: () => true,
+        shouldHandle: () => sourceKind !== "unavailable",
+        nativeAdapter: {
+          describeDeliveryCapabilities: () => ({
+            enabled: true,
+            preferredSurface: "origin",
+            supportsOriginSurface: true,
+            supportsApproverDmSurface: false,
+          }),
+          resolveOriginTarget: () => null,
+          resolveRequesterNoticeTarget: async () => ({ to: "verified-private-origin" }),
+        },
+        buildPendingContent: () => "private command",
+        prepareTarget: vi.fn(),
+        deliverTarget,
+        onDeliveryError,
+        finalizeResolved: async () => {},
+      });
+      const plugin: ChannelPlugin = {
+        ...createChannelTestPluginBase({ id: "test" }),
+        approvalCapability: {
+          delivery: { shouldSuppressForwardingFallback: () => true },
+        },
+      };
+      const forwarded = vi.fn();
+      await withPluginRuntimeRegistryScope(
+        createTestRegistry([{ pluginId: "test", source: "test", plugin }]),
+        async () => {
+          const forwarder = createExecApprovalForwarder({
+            getConfig: () => ({
+              approvals: {
+                exec: {
+                  enabled: true,
+                  mode: "targets",
+                  targets: [{ channel: "test", to: "user:misleading-target" }],
+                },
+              },
+            }),
+            deliver: forwarded,
+            nowMs: () => 1000,
+          });
+          try {
+            await runtime.start();
+            await expect(forwarder.handleRequested(request)).resolves.toBe(false);
+            expect(forwarded).not.toHaveBeenCalled();
+            await runtime.handleRequested(request);
+          } finally {
+            await forwarder.stop();
+            await runtime.stop();
+          }
+        },
+      );
+      expect(deliverTarget).not.toHaveBeenCalled();
+      expect(onDeliveryError).not.toHaveBeenCalled();
+      const expectedOutcome =
+        sourceKind === "private"
+          ? "sent"
+          : sourceKind === "failed-notice"
+            ? "failed"
+            : "no-unique-chat";
+      expect(hoisted.logError).toHaveBeenCalledWith(
+        `approval ${request.id}: native delivery blocked; notice outcome=${expectedOutcome}`,
+      );
+      if (sourceKind === "private" || sourceKind === "failed-notice") {
+        expect(hoisted.callGatewayLeastPrivilege).toHaveBeenCalledWith(
+          expect.objectContaining({
+            method: "send",
+            params: expect.objectContaining({
+              to: "verified-private-origin",
+              idempotencyKey: `approval-route-notice:delivery-failed:${request.id}`,
+              message:
+                "The native approval card could not be delivered. Check the request's status in Control UI or terminal UI.",
+            }),
+          }),
+        );
+      } else {
+        expect(hoisted.callGatewayLeastPrivilege).not.toHaveBeenCalled();
+      }
+      expect(JSON.stringify(hoisted.callGatewayLeastPrivilege.mock.calls)).not.toMatch(
+        /misleading-target|wrong-thread|private command/,
+      );
+      await runtime.stop();
+    },
+  );
+});
 
 describe("deliverApprovalRequestViaChannelNativePlan", () => {
   it("dedupes converged prepared targets", async () => {

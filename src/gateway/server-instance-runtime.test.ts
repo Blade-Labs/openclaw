@@ -12,6 +12,7 @@ import {
   createChannelApprovalHandlerFromCapability,
   createChannelApprovalNativeRuntimeAdapter,
 } from "../infra/approval-handler-runtime.js";
+import { createExecApprovalChannelRuntime } from "../infra/exec-approval-channel-runtime.js";
 import type { ExecApprovalRequest } from "../infra/exec-approvals.js";
 import { findDeliveryIntentOwner } from "../infra/outbound/delivery-queue-storage.js";
 import {
@@ -296,7 +297,7 @@ describe("createGatewayInstanceRuntime", () => {
     });
   });
 
-  it("keeps approval subscribers isolated by Gateway instance and unregisters exactly once", () => {
+  it("keeps approval subscribers isolated by Gateway instance and unregisters exactly once", async () => {
     const registry = createRegistry({});
     const first = createGatewayInstanceRuntime({
       getContext: createContext,
@@ -323,14 +324,26 @@ describe("createGatewayInstanceRuntime", () => {
       expiresAtMs: 2,
     } as ExecApprovalRequest;
 
-    expect(second.approvalEvents.publishRequested("exec", request)).toBe(0);
-    expect(first.approvalEvents.publishRequested("plugin", request)).toBe(0);
-    expect(first.approvalEvents.publishRequested("exec", request)).toBe(1);
+    expect(await second.approvalEvents.publishRequested("exec", request)).toEqual({
+      deliveredCount: 0,
+      originUnavailable: false,
+    });
+    expect(await first.approvalEvents.publishRequested("plugin", request)).toEqual({
+      deliveredCount: 0,
+      originUnavailable: false,
+    });
+    expect(await first.approvalEvents.publishRequested("exec", request)).toEqual({
+      deliveredCount: 1,
+      originUnavailable: false,
+    });
     expect(onRequested).toHaveBeenCalledOnce();
 
     unsubscribe();
     unsubscribe();
-    expect(first.approvalEvents.publishRequested("exec", request)).toBe(0);
+    expect(await first.approvalEvents.publishRequested("exec", request)).toEqual({
+      deliveredCount: 0,
+      originUnavailable: false,
+    });
 
     const declined = vi.fn();
     first.nativeApprovals.subscribe({
@@ -339,7 +352,10 @@ describe("createGatewayInstanceRuntime", () => {
       onRequested: declined,
       onResolved: vi.fn(),
     });
-    expect(first.approvalEvents.publishRequested("exec", request)).toBe(0);
+    expect(await first.approvalEvents.publishRequested("exec", request)).toEqual({
+      deliveredCount: 0,
+      originUnavailable: false,
+    });
     expect(declined).not.toHaveBeenCalled();
     first.close();
     expect(getGatewayRecoveryRuntime()).toBe(second.recovery);
@@ -417,7 +433,10 @@ describe("createGatewayInstanceRuntime", () => {
         createdAtMs: 1,
         expiresAtMs: 100,
       };
-      expect(runtime.approvalEvents.publishRequested("exec", request)).toBe(0);
+      expect(await runtime.approvalEvents.publishRequested("exec", request)).toEqual({
+        deliveredCount: 0,
+        originUnavailable: false,
+      });
       await expect(runtime.approvalEvents.deliverRequester!("exec", request)).resolves.toBe(true);
       expect(selected).toHaveBeenCalledOnce();
       expect(general).not.toHaveBeenCalled();
@@ -523,7 +542,10 @@ describe("createGatewayInstanceRuntime", () => {
     }
     try {
       await handler.start();
-      expect(runtime.approvalEvents.publishRequested("exec", request)).toBe(0);
+      expect(await runtime.approvalEvents.publishRequested("exec", request)).toEqual({
+        deliveredCount: 0,
+        originUnavailable: false,
+      });
       await expect(runtime.approvalEvents.deliverRequester!("exec", request)).resolves.toBe(true);
       expect(deliverPending).toHaveBeenCalledOnce();
       expect(deliverPending).toHaveBeenCalledWith(
@@ -538,6 +560,59 @@ describe("createGatewayInstanceRuntime", () => {
       runtime.close();
     }
   });
+
+  it.each([false, true])(
+    "joins unfinished replay when publishing an approval (delivered=%s)",
+    async (delivered) => {
+      const request: ExecApprovalRequest = {
+        id: "replay-publication-overlap",
+        request: { command: "echo synthetic", authorization: requesterAuthorization(false) },
+        createdAtMs: Date.now(),
+        expiresAtMs: Date.now() + 60_000,
+      };
+      const started = createDeferred();
+      const delivery = createDeferred<Array<{ messageId: string }>>();
+      const context = createContext();
+      const runtime = createGatewayInstanceRuntime({
+        getContext: () => context,
+        getMethodRegistry: () =>
+          createRegistry({ "exec.approval.list": ({ respond }) => respond(true, [request]) }),
+        isDispatchAvailable: () => true,
+      });
+      const deliverRequested = vi.fn(async () => {
+        started.resolve();
+        return await delivery.promise;
+      });
+      const handler = withGatewayNativeApprovalRuntime(runtime.nativeApprovals, () =>
+        createExecApprovalChannelRuntime({
+          label: "test/replay-publication",
+          clientDisplayName: "Replay approvals",
+          channel: "test",
+          accountId: "default",
+          cfg: {},
+          isConfigured: () => true,
+          shouldHandle: () => true,
+          deliverRequested,
+          finalizeResolved: async () => {},
+        }),
+      );
+      try {
+        await handler.start();
+        await started.promise;
+        const publication = runtime.approvalEvents.publishRequested("exec", request);
+        delivery.resolve(delivered ? [{ messageId: "card-1" }] : []);
+        await expect(publication).resolves.toEqual({
+          deliveredCount: delivered ? 1 : 0,
+          originUnavailable: !delivered,
+        });
+        expect(deliverRequested).toHaveBeenCalledOnce();
+      } finally {
+        delivery.resolve([]);
+        await handler.stop();
+        runtime.close();
+      }
+    },
+  );
 
   it("rejects methods outside each closed internal principal", async () => {
     const runtime = createGatewayInstanceRuntime({

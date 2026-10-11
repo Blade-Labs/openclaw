@@ -20,7 +20,7 @@ export const msTeamsChannelConfigUiHints = {
   },
   "approvals.requesterOnly": {
     label: "MS Teams Requester-Only Approvals",
-    help: "Bind approval delivery and every resolution path to the verified requester of personal Teams messages on the default account. Requires explicit approver membership and a matching OpenClaw core. Cards and /approve allow only that requester; operators cannot override. Unverifiable requests are denied with a notice when a personal chat is verified. Pending requests stay strict if disabled (default: false).",
+    help: "Post approval cards in the authenticated origin conversation and channel thread; bind every resolution path to the verified requester on the default account. Requires explicit approver membership and a matching OpenClaw core. Cards and /approve allow only that requester; operators cannot override. Unverifiable requests are denied with a notice when a personal chat is verified. Pending requests stay strict if disabled (default: false).",
   },
   graphMediaFallback: {
     label: "MS Teams Graph Media Fallback",

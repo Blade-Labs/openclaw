@@ -156,8 +156,8 @@ export type MSTeamsConfig = Omit<
     approvals?: {
       /**
        * Bind approval delivery and every resolution path, including cards and /approve, to the
-       * verified personal-message requester on the default account. Requires explicit approver
-       * membership and a matching OpenClaw core; operators cannot override. Unverifiable requests
+       * verified requester on the default account. Cards go in the origin conversation and thread.
+       * Requires explicit approver membership and a matching OpenClaw core; operators cannot override. Unverifiable requests
        * fail closed with a notice when a personal chat is verified. Stamped requests remain strict
        * after disabling this option. Default: false.
        */

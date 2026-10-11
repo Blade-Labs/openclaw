@@ -11,6 +11,7 @@ import {
   isMSTeamsRequesterOnlyApprovals,
   isMSTeamsRequesterOnlyRequest,
   verifyMSTeamsRequesterConversation,
+  type MSTeamsApprovalRequester,
 } from "./approval-requester.js";
 import { MSTeamsConfigSchema } from "./config-schema.js";
 import type { StoredConversationReference } from "./conversation-store.js";
@@ -156,7 +157,11 @@ describe("Microsoft Teams requester-only approval policy", () => {
         ok: true,
         requester: {
           aadObjectId: REQUESTER_ID,
-          target: { kind: "conversation", conversationId: PERSONAL_CONVERSATION_ID },
+          target: {
+            kind: "conversation",
+            conversationId: PERSONAL_CONVERSATION_ID,
+            conversationKind: "direct",
+          },
         },
       });
     },
@@ -187,7 +192,7 @@ describe("Microsoft Teams requester-only approval policy", () => {
         {
           messageId: "group-message",
           conversationId: "19:group@thread.v2",
-          conversationKind: "group" as const,
+          conversationKind: "channel" as const,
           eventKind: "message" as const,
         },
       ],
@@ -255,10 +260,14 @@ describe("Microsoft Teams requester-only approval policy", () => {
     }
   });
 
-  it("prefers the bound personal chat, otherwise only the same sender's verified DM", async () => {
-    const requester = {
+  it("requires the exact bound personal chat even when another requester-owned DM exists", async () => {
+    const requester: MSTeamsApprovalRequester = {
       aadObjectId: REQUESTER_ID,
-      target: { kind: "conversation" as const, conversationId: PERSONAL_CONVERSATION_ID },
+      target: {
+        kind: "conversation",
+        conversationId: PERSONAL_CONVERSATION_ID,
+        conversationKind: "direct",
+      },
     };
     const store = createStore({ [PERSONAL_CONVERSATION_ID]: personalReference(REQUESTER_ID) });
     await expect(verifyMSTeamsRequesterConversation({ requester, store })).resolves.toBe(
@@ -266,7 +275,6 @@ describe("Microsoft Teams requester-only approval policy", () => {
     );
     expect(store.findPreferredDmByUserId).not.toHaveBeenCalled();
     const fallbackStore = createStore({
-      [PERSONAL_CONVERSATION_ID]: personalReference(OTHER_USER_ID),
       [OTHER_PERSONAL_CONVERSATION_ID]: personalReference(REQUESTER_ID, {
         conversation: { id: OTHER_PERSONAL_CONVERSATION_ID, conversationType: "personal" },
       }),
@@ -276,8 +284,15 @@ describe("Microsoft Teams requester-only approval policy", () => {
         requester,
         store: fallbackStore,
       }),
-    ).resolves.toBe(OTHER_PERSONAL_CONVERSATION_ID);
-    expect(fallbackStore.findPreferredDmByUserId).toHaveBeenCalledWith(REQUESTER_ID);
+    ).resolves.toBeNull();
+    expect(fallbackStore.findPreferredDmByUserId).not.toHaveBeenCalled();
+    await expect(
+      isMSTeamsRequesterDeliveryTarget({
+        to: `conversation:${OTHER_PERSONAL_CONVERSATION_ID}`,
+        requester,
+        store: fallbackStore,
+      }),
+    ).resolves.toBe(false);
     for (const reference of [
       personalReference(OTHER_USER_ID),
       personalReference(REQUESTER_ID, {
@@ -302,24 +317,108 @@ describe("Microsoft Teams requester-only approval policy", () => {
 
   it("re-checks personal destination ownership at the send boundary", async () => {
     const store = createStore({ [PERSONAL_CONVERSATION_ID]: personalReference(REQUESTER_ID) });
+    const requester: MSTeamsApprovalRequester = {
+      aadObjectId: REQUESTER_ID,
+      target: {
+        kind: "conversation",
+        conversationId: PERSONAL_CONVERSATION_ID,
+        conversationKind: "direct",
+      },
+    };
     await expect(
       isMSTeamsRequesterDeliveryTarget({
         to: `conversation:${PERSONAL_CONVERSATION_ID}`,
-        aadObjectId: REQUESTER_ID,
+        requester,
         store,
       }),
     ).resolves.toBe(true);
     await expect(
       isMSTeamsRequesterDeliveryTarget({
         to: `conversation:${PERSONAL_CONVERSATION_ID}`,
-        aadObjectId: OTHER_USER_ID,
+        requester: { ...requester, aadObjectId: OTHER_USER_ID },
         store,
       }),
     ).resolves.toBe(false);
     for (const to of [`user:${REQUESTER_ID}`, "conversation:19:abc@thread.v2"]) {
-      await expect(
-        isMSTeamsRequesterDeliveryTarget({ to, aadObjectId: REQUESTER_ID, store }),
-      ).resolves.toBe(false);
+      await expect(isMSTeamsRequesterDeliveryTarget({ to, requester, store })).resolves.toBe(false);
     }
   });
+  it.each([
+    { kind: "channel" as const, id: "19:channel@thread.tacv2", type: "channel", threadId: "root" },
+    { kind: "group" as const, id: "19:group@thread.v2", type: "groupChat", threadId: undefined },
+  ])(
+    "verifies the bound $kind origin and refuses mismatched destinations",
+    async ({ kind, id, type, threadId }) => {
+      const authorization = createAuthorization();
+      if (authorization.requesterBinding.state !== "bound") {
+        throw new Error("Expected bound fixture");
+      }
+      const message = {
+        messageId: "reply",
+        conversationId: id,
+        conversationKind: kind,
+        eventKind: "reply" as const,
+        threadId,
+      };
+      const result = classifyMSTeamsApprovalRequester({
+        cfg: createConfig(),
+        authorization: {
+          ...authorization,
+          requesterBinding: { ...authorization.requesterBinding, sources: [message] },
+        },
+      });
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        throw new Error("Expected shared origin");
+      }
+      // Another user's newer activity can refresh a shared reference without changing the requester.
+      const reference = {
+        conversation: { id, conversationType: type },
+        aadObjectId: OTHER_USER_ID,
+      };
+      const store = createStore({ [id]: reference });
+      await expect(
+        verifyMSTeamsRequesterConversation({ requester: result.requester, store }),
+      ).resolves.toBe(id);
+      expect(store.findPreferredDmByUserId).not.toHaveBeenCalled();
+      const to = `conversation:${id}${threadId ? `;messageid=${threadId}` : ""}`;
+      await expect(
+        isMSTeamsRequesterDeliveryTarget({ to, requester: result.requester, store }),
+      ).resolves.toBe(true);
+      for (const badTo of [
+        `conversation:${id};messageid=wrong`,
+        `conversation:19:other@thread.v2`,
+        `user:${REQUESTER_ID}`,
+      ]) {
+        await expect(
+          isMSTeamsRequesterDeliveryTarget({ to: badTo, requester: result.requester, store }),
+        ).resolves.toBe(false);
+      }
+      for (const badReference of [
+        { ...reference, conversation: { id, conversationType: "personal" } },
+        { ...reference, conversation: { id: "19:other@thread.v2", conversationType: type } },
+      ]) {
+        await expect(
+          verifyMSTeamsRequesterConversation({
+            requester: result.requester,
+            store: createStore({ [id]: badReference }),
+          }),
+        ).resolves.toBeNull();
+      }
+      await expect(
+        verifyMSTeamsRequesterConversation({ requester: result.requester, store: createStore({}) }),
+      ).resolves.toBeNull();
+      const ambiguous = classifyMSTeamsApprovalRequester({
+        cfg: createConfig(),
+        authorization: {
+          ...authorization,
+          requesterBinding: {
+            ...authorization.requesterBinding,
+            sources: [message, { ...message, conversationId: "19:other@thread.v2" }],
+          },
+        },
+      });
+      expect(ambiguous.ok).toBe(false);
+    },
+  );
 });

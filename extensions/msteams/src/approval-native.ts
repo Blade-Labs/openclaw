@@ -4,8 +4,6 @@ import { createApproverRestrictedNativeApprovalCapability } from "openclaw/plugi
 import { createLazyChannelApprovalNativeRuntimeAdapter } from "openclaw/plugin-sdk/approval-handler-adapter-runtime";
 import type { ChannelApprovalKind } from "openclaw/plugin-sdk/approval-handler-runtime";
 import {
-  createChannelApproverDmTargetResolver,
-  createChannelNativeOriginTargetResolver,
   createNativeApprovalChannelRouteGates,
   createNativeApprovalMessagingTargetResolvers,
   shouldSuppressLocalNativeExecApprovalPrompt,
@@ -29,6 +27,7 @@ import {
   classifyMSTeamsApprovalRequester,
   isMSTeamsRequesterOnlyApprovals,
   isMSTeamsRequesterOnlyRequest,
+  normalizeMSTeamsAadObjectId,
   resolveMSTeamsApprovalNoticeRequester,
   resolveMSTeamsApprovalRequester,
   verifyMSTeamsRequesterConversation,
@@ -61,28 +60,14 @@ const msTeamsMessagingTargetResolvers = createNativeApprovalMessagingTargetResol
   normalizeTo: normalizeMSTeamsMessagingTarget,
 });
 
-const msTeamsApprovalTargetResolvers = {
-  ...msTeamsMessagingTargetResolvers,
-  resolveTurnSourceTarget: (request: MSTeamsApprovalRequest) => {
-    const target = msTeamsMessagingTargetResolvers.resolveTurnSourceTarget(request);
-    return target ? { ...target, threadId: request.request.turnSourceThreadId ?? null } : null;
-  },
-  resolveSessionTarget: (
-    sessionTarget: Parameters<typeof msTeamsMessagingTargetResolvers.resolveSessionTarget>[0],
-  ) => {
-    const target = msTeamsMessagingTargetResolvers.resolveSessionTarget(sessionTarget);
-    return target ? { ...target, threadId: sessionTarget.threadId ?? null } : null;
-  },
-};
-
 const msTeamsApprovalRouteGates = createNativeApprovalChannelRouteGates({
   channel: "msteams",
   defaultForwardingMode: "session",
   isTransportEnabled: isMSTeamsApprovalTransportEnabled,
   listAccountIds: msteamsConfigAdapter.listAccountIds,
   resolveDefaultAccountId: () => DEFAULT_ACCOUNT_ID,
-  normalizeForwardTarget: msTeamsApprovalTargetResolvers.normalizeForwardTarget,
-  resolveTurnSourceTarget: msTeamsApprovalTargetResolvers.resolveTurnSourceTarget,
+  normalizeForwardTarget: msTeamsMessagingTargetResolvers.normalizeForwardTarget,
+  resolveTurnSourceTarget: msTeamsMessagingTargetResolvers.resolveTurnSourceTarget,
 });
 
 export function isMSTeamsNativeApprovalClientEnabled(params: {
@@ -107,11 +92,23 @@ function shouldHandleMSTeamsApprovalRoute(params: {
   approvalKind?: ChannelApprovalKind;
   request: MSTeamsApprovalRequest;
 }): boolean {
-  return (
-    msTeamsApprovalRouteGates.shouldHandleApprovalRequest(params) &&
-    getMSTeamsApprovalApprovers(params).length > 0 &&
-    Boolean(msTeamsApprovalTargetResolvers.resolveTurnSourceTarget(params.request))
-  );
+  const requester = resolveMSTeamsApprovalRequester(params);
+  if (!requester || getMSTeamsApprovalApprovers(params).length === 0) {
+    return false;
+  }
+  // Forwarding policy consumes the admitted route, never mutable session/turn destinations.
+  const request = { ...params.request };
+  request.request = {
+    ...request.request,
+    turnSourceChannel: "msteams",
+    turnSourceAccountId: DEFAULT_ACCOUNT_ID,
+    turnSourceTo: `conversation:${requester.target.conversationId}`,
+    turnSourceThreadId: requester.target.threadId,
+  };
+  return msTeamsApprovalRouteGates.shouldHandleApprovalRequest({
+    ...params,
+    request,
+  });
 }
 
 export function shouldHandleMSTeamsNativeApprovalRequest(params: {
@@ -141,22 +138,13 @@ export function shouldSuppressLocalMSTeamsExecApprovalPrompt(params: {
   });
 }
 
-const resolveMSTeamsTurnSourceOriginTarget = createChannelNativeOriginTargetResolver({
-  channel: "msteams",
-  shouldHandleRequest: shouldHandleMSTeamsNativeApprovalRequest,
-  resolveTurnSourceTarget: msTeamsApprovalTargetResolvers.resolveTurnSourceTarget,
-  resolveSessionTarget: msTeamsApprovalTargetResolvers.resolveSessionTarget,
-  normalizeTarget: msTeamsApprovalTargetResolvers.normalizeTarget,
-});
+type MSTeamsOriginTargetParams = Parameters<
+  NonNullable<NonNullable<ChannelApprovalCapability["native"]>["resolveOriginTarget"]>
+>[0];
 
-type MSTeamsOriginTargetParams = Parameters<typeof resolveMSTeamsTurnSourceOriginTarget>[0];
-
-/**
- * Requester-only origin: the requester's own personal chat, proven against the conversation store
- * (explicit personal type and owner AAD id). Never a group/channel or another user's chat.
- */
+/** Resolve the admitted origin without consulting mutable session routing. */
 async function resolveMSTeamsRequesterOriginTarget(params: MSTeamsOriginTargetParams) {
-  if (!isMSTeamsApprovalTransportEnabled(params)) {
+  if (!shouldHandleMSTeamsNativeApprovalRequest(params)) {
     return null;
   }
   const classified = classifyMSTeamsApprovalRequester({
@@ -165,7 +153,7 @@ async function resolveMSTeamsRequesterOriginTarget(params: MSTeamsOriginTargetPa
   });
   if (!classified.ok) {
     log.info(
-      `msteams approvals: requester-only withheld the card for ${params.request.id} (${classified.reason})`,
+      `msteams approvals: withheld the card for ${params.request.id} (${classified.reason})`,
     );
     return null;
   }
@@ -173,23 +161,17 @@ async function resolveMSTeamsRequesterOriginTarget(params: MSTeamsOriginTargetPa
     requester: classified.requester,
     store: createMSTeamsConversationStoreState(),
   });
-  if (!conversationId || !resolveMSTeamsApprovalRequester(params)) {
+  if (!conversationId || !shouldHandleMSTeamsNativeApprovalRequest(params)) {
     log.info(
-      `msteams approvals: requester-only withheld the card for ${params.request.id} (no verified personal chat)`,
+      `msteams approvals: withheld the card for ${params.request.id} (no verified origin conversation)`,
     );
     return null;
   }
   return {
     to: `conversation:${conversationId}`,
     accountId: DEFAULT_ACCOUNT_ID,
-    threadId: null,
+    threadId: classified.requester.target.threadId ?? null,
   };
-}
-
-function resolveMSTeamsOriginTarget(params: MSTeamsOriginTargetParams) {
-  return isMSTeamsRequesterOnlyRequest(params.cfg, params.request)
-    ? resolveMSTeamsRequesterOriginTarget(params)
-    : resolveMSTeamsTurnSourceOriginTarget(params);
 }
 
 const msTeamsLazyApprovalNativeRuntime = createLazyChannelApprovalNativeRuntimeAdapter({
@@ -204,20 +186,8 @@ const msTeamsLazyApprovalNativeRuntime = createLazyChannelApprovalNativeRuntimeA
   },
 });
 
-const resolveMSTeamsAllApproverDmTargets = createChannelApproverDmTargetResolver({
-  shouldHandleRequest: shouldHandleMSTeamsNativeApprovalRequest,
-  resolveApprovers: getMSTeamsApprovalApprovers,
-  mapApprover: (approver, params) => ({
-    to: `user:${approver}`,
-    accountId: normalizeOptionalString(params.accountId),
-  }),
-});
-
-// Requester-only never fans a card out to the approver roster, not even as a fallback.
-const resolveMSTeamsApproverDmTargets: typeof resolveMSTeamsAllApproverDmTargets = (params) =>
-  isMSTeamsRequesterOnlyRequest(params.cfg, params.request)
-    ? []
-    : resolveMSTeamsAllApproverDmTargets(params);
+// Native cards stay in the origin conversation; never probe the roster's DMs.
+const resolveMSTeamsApproverDmTargets = () => [];
 
 const msTeamsNativeApprovalCapability = createApproverRestrictedNativeApprovalCapability({
   channel: "msteams",
@@ -244,11 +214,11 @@ const msTeamsNativeApprovalCapability = createApproverRestrictedNativeApprovalCa
     })?.authorized ?? false,
   isNativeDeliveryEnabled: isMSTeamsNativeApprovalClientEnabled,
   resolveNativeDeliveryMode: () => "channel",
-  requireMatchingTurnSourceChannel: true,
+  requireMatchingTurnSourceChannel: false,
   resolveSuppressionAccountId: ({ target, request }) =>
     normalizeOptionalString(target.accountId) ??
     normalizeOptionalString(request.request.turnSourceAccountId),
-  resolveOriginTarget: resolveMSTeamsOriginTarget,
+  resolveOriginTarget: resolveMSTeamsRequesterOriginTarget,
   resolveApproverDmTargets: resolveMSTeamsApproverDmTargets,
   nativeRuntime: msTeamsLazyApprovalNativeRuntime,
 });
@@ -271,11 +241,14 @@ export const msTeamsApprovalCapability: ChannelApprovalCapability = {
     const strict =
       isMSTeamsRequesterOnlyApprovals(params.cfg) ||
       params.authorization?.policy.requireResolverMatch === true;
-    if (
-      strict &&
-      (getMSTeamsApprovalApprovers(params).length === 0 ||
-        (params.accountId != null && params.accountId !== DEFAULT_ACCOUNT_ID))
-    ) {
+    const senderId = normalizeMSTeamsAadObjectId(params.senderId);
+    if (!senderId || !getMSTeamsApprovalApprovers(params).includes(senderId)) {
+      return {
+        authorized: false,
+        reason: `❌ You are not authorized to approve ${params.approvalKind} requests on Microsoft Teams.`,
+      };
+    }
+    if (strict && params.accountId != null && params.accountId !== DEFAULT_ACCOUNT_ID) {
       return {
         authorized: false,
         reason:
@@ -309,7 +282,7 @@ export const msTeamsApprovalCapability: ChannelApprovalCapability = {
     ) {
       return {
         authorized: false,
-        reason: "Microsoft Teams requester approvals require a bound personal-message source.",
+        reason: "Microsoft Teams requester approvals require a bound conversation source.",
       };
     }
     return msTeamsApprovalAuth.authorizeActorAction?.(params) ?? { authorized: false };
@@ -340,12 +313,9 @@ export const msTeamsApprovalCapability: ChannelApprovalCapability = {
     ? {
         delivery: {
           ...msTeamsNativeDelivery,
-          // Generic forwarding does not prove the requester's private destination.
+          // Generic forwarding does not prove the requester's origin destination.
           shouldSuppressForwardingFallback: (input) =>
-            isMSTeamsRequesterOnlyRequest(input.cfg, input.request) &&
-            normalizeOptionalString(input.target.channel)?.toLowerCase() === "msteams"
-              ? true
-              : (msTeamsNativeDelivery.shouldSuppressForwardingFallback?.(input) ?? false),
+            normalizeOptionalString(input.target.channel)?.toLowerCase() === "msteams",
         },
       }
     : {}),

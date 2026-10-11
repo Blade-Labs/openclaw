@@ -16,6 +16,7 @@ type NoticeRuntime = {
 export async function reportBlockedRequesterNotice(params: {
   request: ApprovalRequestInput;
   kind: ChannelApprovalKind;
+  notice?: "delivery-failed";
   runtimes: readonly NoticeRuntime[];
   isCurrent: (runtime: NoticeRuntime) => boolean;
 }): Promise<"sent" | "no-unique-chat" | "failed"> {
@@ -65,8 +66,10 @@ export async function reportBlockedRequesterNotice(params: {
       to: target.to,
       threadId: target.threadId,
       message:
-        "Approval blocked: the requester could not be verified or reached. No action was approved. Send a new request in your personal chat.",
-      idempotencyKey: `approval-route-notice:blocked:${params.request.id}`,
+        params.notice === "delivery-failed"
+          ? "The native approval card could not be delivered. Check the request's status in Control UI or terminal UI."
+          : "Approval blocked: the requester could not be verified or reached. No action was approved. Send a new request in your personal chat.",
+      idempotencyKey: `approval-route-notice:${params.notice ?? "blocked"}:${params.request.id}`,
     });
     return "sent";
   } catch {

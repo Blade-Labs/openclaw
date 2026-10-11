@@ -188,9 +188,9 @@ describe("conversation-owned temporary environments", () => {
                 execApprovalManager: fixture.manager,
                 hasExecApprovalClients: () => true,
                 approvalEvents: {
-                  publishRequested: (_kind, event) => {
+                  publishRequested: async (_kind, event) => {
                     delivered.resolve((event as { id: string }).id);
-                    return 1;
+                    return { deliveredCount: 1, originUnavailable: false };
                   },
                   publishResolved: vi.fn(),
                   deliverRequester: async (_kind, event) => {

@@ -7,9 +7,12 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GATEWAY_CLIENT_IDS } from "../../../packages/gateway-protocol/src/client-info.js";
 import { admitChannelApprovalActor } from "../../channels/message-access/approval-actor.js";
+import { withGatewayNativeApprovalRuntime } from "../../infra/approval-gateway-runtime-context.js";
 import { classifyApprovalRequester } from "../../infra/approval-requester-binding.js";
 import { reportBlockedRequesterNotice } from "../../infra/approval-requester-notice.js";
+import { createExecApprovalChannelRuntime } from "../../infra/exec-approval-channel-runtime.js";
 import type { TurnSourceProvenance } from "../../infra/turn-source-provenance.js";
+import { trackAsyncWork } from "../../shared/async-work-scope.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import {
   closeOpenClawStateDatabaseByPathAsync,
@@ -26,7 +29,9 @@ import {
   createTestApprovalFixture,
   createTestApprovalManager,
 } from "../exec-approval-manager.test-support.js";
+import { createGatewayMethodRegistry } from "../methods/registry.js";
 import * as operatorApprovalStore from "../operator-approval-store.js";
+import { createGatewayInstanceRuntime } from "../server-instance-runtime.js";
 import {
   bindApprovalReviewerDeviceIds,
   registerPendingApprovalRecord,
@@ -445,6 +450,178 @@ describe("strict legacy approval resolution", () => {
 });
 
 describe("handlePendingApprovalRequest", () => {
+  it("does not report a blocked strict request when approval wins during delivery", async (testContext) => {
+    await withRequesterApprovalChannel(async () => {
+      const manager = createTestApprovalManager(testContext);
+      const record = manager.create({ command: "echo synthetic" }, 60_000);
+      record.authorization = requesterAuthorization();
+      await manager.register(record, 60_000);
+      const respond = vi.fn();
+      const reportBlockedRequest = vi.fn(async () => "sent" as const);
+      const context = {
+        getRuntimeConfig: () => ({}),
+        logGateway: { error: vi.fn() },
+        approvalEvents: {
+          deliverRequester: async () => {
+            expect(
+              await manager.resolveDetailed(record.id, "allow-once", {
+                kind: "channel",
+                id: "test:default",
+                actor: {
+                  kind: "channel",
+                  channel: "test",
+                  accountId: "default",
+                  senderId: "synthetic-requester",
+                  actorKind: "human",
+                },
+              }),
+            ).toMatchObject({ outcome: "resolved" });
+            return false;
+          },
+          reportBlockedRequest,
+        },
+      } as unknown as GatewayRequestContext;
+      await handlePendingApprovalRequest({
+        manager,
+        record,
+        respond,
+        context,
+        requestEventName: "exec.approval.requested",
+        requestEvent: {
+          id: record.id,
+          request: record.request,
+          createdAtMs: record.createdAtMs,
+          expiresAtMs: record.expiresAtMs,
+        },
+        twoPhase: true,
+        deliverRequest: () => false,
+      });
+      expect(await manager.getSnapshot(record.id)).toMatchObject({ decision: "allow-once" });
+      expect(respond).toHaveBeenCalledExactlyOnceWith(
+        true,
+        expect.objectContaining({ id: record.id, decision: "allow-once" }),
+        undefined,
+      );
+      expect(reportBlockedRequest).not.toHaveBeenCalled();
+      expect(context.logGateway.error).not.toHaveBeenCalled();
+    });
+  });
+
+  it.for([false, true])(
+    "settles publication from the real replay delivery result (delivered=%s)",
+    async (delivered, testContext) => {
+      const manager = createTestApprovalManager(testContext);
+      const record = manager.create(
+        {
+          command: "echo synthetic",
+          turnSourceChannel: "test",
+          turnSourceAccountId: "default",
+        },
+        60_000,
+      );
+      await manager.register(record, 60_000);
+      const requestEvent = {
+        id: record.id,
+        request: record.request,
+        createdAtMs: record.createdAtMs,
+        expiresAtMs: record.expiresAtMs,
+      };
+      const responseSent = createDeferredCore();
+      const deliveryStarted = createDeferredCore();
+      const deliveryFinished = createDeferredCore<string[]>();
+      const respond = vi.fn(() => responseSent.resolve());
+      const context = {
+        getRuntimeConfig: () => ({}),
+        broadcast: vi.fn(),
+        hasExecApprovalClients: () => false,
+        trackExecution: trackAsyncWork,
+        logGateway: { error: vi.fn(), warn: vi.fn() },
+      } as unknown as GatewayRequestContext;
+      const registry = createGatewayMethodRegistry([
+        {
+          name: "exec.approval.list",
+          owner: { kind: "core", area: "test" },
+          scope: "operator.approvals",
+          handler: ({ respond }) => respond(true, [requestEvent]),
+        },
+      ]);
+      const runtime = createGatewayInstanceRuntime({
+        getContext: () => context,
+        getMethodRegistry: () => registry,
+        isDispatchAvailable: () => true,
+      });
+      context.approvalEvents = runtime.approvalEvents;
+      const deliverRequested = vi.fn(() => {
+        deliveryStarted.resolve();
+        return deliveryFinished.promise;
+      });
+      const nativeRuntime = withGatewayNativeApprovalRuntime(runtime.nativeApprovals, () =>
+        createExecApprovalChannelRuntime({
+          channel: "test",
+          accountId: "default",
+          label: "synthetic-replay",
+          clientDisplayName: "Synthetic replay approvals",
+          cfg: {},
+          isConfigured: () => true,
+          shouldHandle: () => true,
+          deliverRequested,
+          finalizeResolved: async () => {},
+        }),
+      );
+      let requestPromise: Promise<void> | undefined;
+      try {
+        await nativeRuntime.start();
+        await deliveryStarted.promise;
+        requestPromise = handlePendingApprovalRequest({
+          manager,
+          record,
+          respond,
+          context,
+          requestEventName: "exec.approval.requested",
+          requestEvent,
+          twoPhase: true,
+          deliverRequest: () => false,
+        });
+        deliveryFinished.resolve(delivered ? ["synthetic-card"] : []);
+        await Promise.race([responseSent.promise, requestPromise]);
+        expect(deliverRequested).toHaveBeenCalledOnce();
+        if (delivered) {
+          expect(respond).toHaveBeenCalledWith(
+            true,
+            expect.objectContaining({ status: "accepted", deliveryRoute: "approval-client" }),
+            undefined,
+          );
+          expect(await manager.resolve(record.id, "allow-once")).toBe(true);
+          await requestPromise;
+          expect(respond).toHaveBeenLastCalledWith(
+            true,
+            expect.objectContaining({ decision: "allow-once" }),
+            undefined,
+          );
+        } else {
+          expect(respond).toHaveBeenCalledExactlyOnceWith(
+            false,
+            undefined,
+            expect.objectContaining({
+              details: expect.objectContaining({ code: "APPROVAL_REQUESTER_UNAVAILABLE" }),
+            }),
+          );
+          await requestPromise;
+          expect(await manager.getSnapshot(record.id)).toMatchObject({
+            decision: "deny",
+            terminalReason: "requester-unavailable",
+          });
+        }
+      } finally {
+        deliveryFinished.resolve([]);
+        await manager.resolve(record.id, "deny");
+        await requestPromise;
+        await nativeRuntime.stop();
+        runtime.close();
+      }
+    },
+  );
+
   it("blocks strict delivery when source authority closes during the verified send", async (testContext) => {
     const manager = createTestApprovalManager(testContext);
     const record = manager.create(
@@ -637,6 +814,134 @@ describe("handlePendingApprovalRequest", () => {
   );
 
   it.for([
+    "missing-origin",
+    "ineligible",
+    "client",
+    "forwarder",
+    "other-native",
+    "resolved",
+  ] as const)(
+    "settles failed default native delivery unless another surface succeeds: %s",
+    async (route, testContext) => {
+      const manager = createTestApprovalManager(testContext);
+      const record = manager.create(
+        {
+          command: "echo synthetic",
+          turnSourceChannel: "test",
+          turnSourceAccountId: "default",
+        },
+        60_000,
+        `native-delivery-${route}`,
+      );
+      await manager.register(record, 60_000);
+      const responseSent = createDeferredCore();
+      const respond = vi.fn(() => responseSent.resolve());
+      const context = {
+        getRuntimeConfig: () => ({}),
+        broadcast: vi.fn(),
+        hasExecApprovalClients: () => route === "client",
+        logGateway: { error: vi.fn() },
+      } as unknown as GatewayRequestContext;
+      const runtime = createGatewayInstanceRuntime({
+        getContext: () => context,
+        getMethodRegistry: () => createGatewayMethodRegistry([]),
+        isDispatchAvailable: () => true,
+      });
+      context.approvalEvents = runtime.approvalEvents;
+      const deliverNative = vi.fn(async () => {
+        if (route === "resolved") {
+          expect(await manager.resolve(record.id, "allow-once")).toBe(true);
+        }
+        return false;
+      });
+      runtime.nativeApprovals.subscribe({
+        channel: "test",
+        accountId: "default",
+        eventKinds: new Set(["exec"]),
+        shouldHandle: () => route !== "ineligible",
+        deliverRequester: deliverNative,
+        onRequested: vi.fn(),
+        onResolved: vi.fn(),
+      });
+      if (route === "other-native") {
+        runtime.nativeApprovals.subscribe({
+          channel: "other",
+          accountId: "default",
+          eventKinds: new Set(["exec"]),
+          shouldHandle: () => true,
+          deliverRequester: async () => true,
+          onRequested: vi.fn(),
+          onResolved: vi.fn(),
+        });
+      }
+      const requestPromise = handlePendingApprovalRequest({
+        manager,
+        record,
+        respond,
+        context,
+        requestEventName: "exec.approval.requested",
+        requestEvent: {
+          id: record.id,
+          request: record.request,
+          createdAtMs: record.createdAtMs,
+          expiresAtMs: record.expiresAtMs,
+        },
+        twoPhase: true,
+        deliverRequest: () => route === "forwarder",
+      });
+      try {
+        await Promise.race([responseSent.promise, requestPromise]);
+        expect(deliverNative).toHaveBeenCalledTimes(route === "ineligible" ? 0 : 1);
+        expect(hasApprovalTurnSourceRouteMock).not.toHaveBeenCalled();
+        if (route === "missing-origin" || route === "ineligible") {
+          expect(respond).toHaveBeenCalledWith(
+            false,
+            undefined,
+            expect.objectContaining({
+              details: expect.objectContaining({ code: "APPROVAL_REQUESTER_UNAVAILABLE" }),
+            }),
+          );
+          expect(await manager.getSnapshot(record.id)).toMatchObject({
+            decision: "deny",
+            terminalReason: "requester-unavailable",
+          });
+        } else if (route === "resolved") {
+          await requestPromise;
+          expect(respond).toHaveBeenCalledWith(
+            true,
+            expect.objectContaining({ decision: "allow-once" }),
+            undefined,
+          );
+          expect(await manager.getSnapshot(record.id)).toMatchObject({ decision: "allow-once" });
+          expect(context.logGateway.error).not.toHaveBeenCalled();
+        } else {
+          expect(respond).toHaveBeenCalledWith(
+            true,
+            expect.objectContaining({
+              status: "accepted",
+              deliveryRoute: route === "forwarder" ? "forwarder" : "approval-client",
+            }),
+            undefined,
+          );
+          expect(await manager.resolve(record.id, "allow-once")).toBe(true);
+          await requestPromise;
+          expect(respond).toHaveBeenLastCalledWith(
+            true,
+            expect.objectContaining({
+              decision: "allow-once",
+            }),
+            undefined,
+          );
+        }
+      } finally {
+        await manager.resolve(record.id, "deny");
+        await requestPromise;
+        runtime.close();
+      }
+    },
+  );
+
+  it.for([
     { delivered: true, noticeFails: false },
     { delivered: false, noticeFails: false },
     { delivered: false, noticeFails: true },
@@ -656,7 +961,7 @@ describe("handlePendingApprovalRequest", () => {
         selected.resolve();
         return delivered;
       });
-      const publishRequested = vi.fn(() => 4);
+      const publishRequested = vi.fn(async () => ({ deliveredCount: 4, originUnavailable: false }));
       const broadcast = vi.fn();
       const broadcastToConnIds = vi.fn();
       const deliverRequest = vi.fn(() => true);
@@ -1022,7 +1327,7 @@ describe("handlePendingApprovalRequest", () => {
     await manager.register(record, 60_000);
     const responseSent = createDeferredCore();
     const respond = vi.fn(() => responseSent.resolve());
-    const publishRequested = vi.fn(() => 1);
+    const publishRequested = vi.fn(async () => ({ deliveredCount: 1, originUnavailable: false }));
     const getApprovalClientConnIds = vi.fn(() => new Set<string>());
     const requestPromise = handlePendingApprovalRequest({
       manager,
@@ -1555,7 +1860,7 @@ describe("handlePendingApprovalRequest", () => {
     const respond = vi.fn();
     const broadcast = vi.fn();
     const deliverRequest = vi.fn(() => true);
-    const publishRequested = vi.fn(() => 1);
+    const publishRequested = vi.fn(async () => ({ deliveredCount: 1, originUnavailable: false }));
 
     const requestPromise = handlePendingApprovalRequest({
       manager,
@@ -1613,7 +1918,7 @@ describe("handlePendingApprovalRequest", () => {
     const respond = vi.fn();
     const afterDecision = vi.fn();
     const deliverRequest = vi.fn(() => true);
-    const publishRequested = vi.fn(() => 1);
+    const publishRequested = vi.fn(async () => ({ deliveredCount: 1, originUnavailable: false }));
 
     await handlePendingApprovalRequest({
       manager,

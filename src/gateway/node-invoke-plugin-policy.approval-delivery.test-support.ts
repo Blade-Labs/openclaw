@@ -291,9 +291,9 @@ export function registerNodePolicyApprovalDeliveryTests() {
                   validateAgentRunDelegatedAuthority(identity.delegatedAuthority),
               });
               context.approvalEvents = {
-                publishRequested: (_kind, request) => {
+                publishRequested: async (_kind, request) => {
                   delivered.resolve((request as { id: string }).id);
-                  return 1;
+                  return { deliveredCount: 1, originUnavailable: false };
                 },
                 publishResolved: vi.fn(),
                 deliverRequester: async (_kind, request) => {

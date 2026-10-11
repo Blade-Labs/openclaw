@@ -300,18 +300,58 @@ export function createGatewayInstanceRuntime(
   return {
     createAgentTurnFacade,
     approvalEvents: {
-      publishRequested: (kind, request) =>
-        requiresApprovalRequesterMatch(
-          (request as GatewayApprovalRequest).request.authorization,
-          options.getContext().getRuntimeConfig(),
-          kind,
-        )
-          ? 0
-          : publish(
-              kind,
-              (subscriber) => subscriber.onRequested(request as GatewayApprovalRequest),
-              (subscriber) => subscriber.shouldHandle(request as GatewayApprovalRequest),
-            ),
+      publishRequested: async (kind, input) => {
+        const request = input as GatewayApprovalRequest;
+        if (
+          closed ||
+          requiresApprovalRequesterMatch(
+            request.request.authorization,
+            options.getContext().getRuntimeConfig(),
+            kind,
+          )
+        ) {
+          return { deliveredCount: 0, originUnavailable: false };
+        }
+        const binding = request.request.authorization?.requesterBinding;
+        // Unbound routing hints identify failed delivery only; they grant no send authority.
+        const originChannel =
+          binding?.state === "bound"
+            ? binding.channel
+            : request.request.turnSourceChannel?.trim().toLowerCase();
+        const originAccountId =
+          binding?.state === "bound" ? binding.accountId : request.request.turnSourceAccountId;
+        const outcomes = await Promise.all(
+          [...approvalSubscribers]
+            .filter((subscriber) => subscriber.eventKinds.has(kind))
+            .map(async (subscriber) => {
+              const isOrigin = Boolean(
+                subscriber.deliverRequester &&
+                originChannel &&
+                subscriber.channel === originChannel &&
+                (!originAccountId || subscriber.accountId === originAccountId),
+              );
+              let delivered = false;
+              try {
+                if (subscriber.shouldHandle(request)) {
+                  if (subscriber.deliverRequester) {
+                    delivered = await subscriber.deliverRequester(request);
+                  } else {
+                    subscriber.onRequested(request);
+                    delivered = true;
+                  }
+                }
+              } catch (error) {
+                options.logError?.(`internal approval subscriber failed: ${String(error)}`);
+              }
+              delivered = delivered && !closed && approvalSubscribers.has(subscriber);
+              return { delivered, originUnavailable: isOrigin && !delivered };
+            }),
+        );
+        return {
+          deliveredCount: outcomes.filter((outcome) => outcome.delivered).length,
+          originUnavailable: outcomes.some((outcome) => outcome.originUnavailable),
+        };
+      },
       deliverRequester: async (kind, input) => {
         assertDispatchAvailable("approval requester delivery");
         const request = input as GatewayApprovalRequest;

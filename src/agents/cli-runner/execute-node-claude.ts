@@ -9,7 +9,10 @@ import type {
   resolveRegisteredExecApprovalDecision,
 } from "../bash-tools.exec-approval-request.js";
 import { resolveReplyExpectation } from "../reply-completion.js";
-import { createCliRunCurrentAssertion } from "./execution-target.js";
+import {
+  withCliGatewayToolCallerIdentity,
+  createCliRunCurrentAssertion,
+} from "./execution-target.js";
 import type { NodeClaudePlacement, PreparedCliRunContext } from "./types.js";
 
 const NODE_CLI_MAX_TIMEOUT_MS = 24 * 60 * 60 * 1000;
@@ -253,45 +256,52 @@ export async function executeNodeClaudeRun(params: {
     const approval = parseNodeClaudeApprovalRequired(nodeResult);
     if (approval) {
       skillRuntime?.assertCurrent();
-      const approvalId = crypto.randomUUID();
-      const registration = await waitForNodeOperation({
-        operation: params.deps.registerExecApprovalRequestForHostOrThrow({
-          approvalId,
-          command: approval.systemRunPlan.commandText,
-          commandArgv: approval.systemRunPlan.argv,
-          systemRunPlan: approval.systemRunPlan,
-          workdir: approval.systemRunPlan.cwd ?? undefined,
-          host: "node",
-          nodeId: params.nodePlacement.nodeId,
-          security: approval.security,
-          ask: approval.ask,
-          unavailableDecisions: ["allow-always"],
-          agentId: contextParams.agentId,
-          sessionKey: contextParams.sessionKey,
-          ...(contextParams.approvalReviewerDeviceId
-            ? { approvalReviewerDeviceIds: [contextParams.approvalReviewerDeviceId] }
-            : {}),
-        }),
-        signal: skillRuntime?.signal ?? nodeAbortController.signal,
-      });
-      const decision = await waitForNodeOperation({
-        operation: params.deps.resolveRegisteredExecApprovalDecision({
-          approvalId: registration.id,
-          preResolvedDecision: registration.finalDecision,
-        }),
-        signal: skillRuntime?.signal ?? nodeAbortController.signal,
-      });
-      if (decision === "allow-once" || decision === "allow-always") {
-        nodeResult = await invokeNode({ decision, plan: approval.systemRunPlan });
-      } else {
-        nodeResult = {
-          ok: false,
-          error: {
-            code: "PERMISSION_DENIED",
-            message: "paired-node Claude CLI agent run was not approved",
-          },
-        };
-      }
+      const approvalSignal = skillRuntime?.signal ?? nodeRunAbortSignal;
+      nodeResult = await withCliGatewayToolCallerIdentity(
+        contextParams,
+        approvalSignal,
+        async () => {
+          const approvalId = crypto.randomUUID();
+          const registration = await waitForNodeOperation({
+            operation: params.deps.registerExecApprovalRequestForHostOrThrow({
+              approvalId,
+              command: approval.systemRunPlan.commandText,
+              commandArgv: approval.systemRunPlan.argv,
+              systemRunPlan: approval.systemRunPlan,
+              workdir: approval.systemRunPlan.cwd ?? undefined,
+              host: "node",
+              nodeId: params.nodePlacement.nodeId,
+              security: approval.security,
+              ask: approval.ask,
+              unavailableDecisions: ["allow-always"],
+              agentId: contextParams.agentId,
+              sessionKey: contextParams.sessionKey,
+              ...(contextParams.approvalReviewerDeviceId
+                ? { approvalReviewerDeviceIds: [contextParams.approvalReviewerDeviceId] }
+                : {}),
+            }),
+            signal: approvalSignal,
+          });
+          const decision = await waitForNodeOperation({
+            operation: params.deps.resolveRegisteredExecApprovalDecision({
+              approvalId: registration.id,
+              preResolvedDecision: registration.finalDecision,
+            }),
+            signal: approvalSignal,
+          });
+          if (decision === "allow-once" || decision === "allow-always") {
+            return await invokeNode({ decision, plan: approval.systemRunPlan });
+          } else {
+            return {
+              ok: false,
+              error: {
+                code: "PERMISSION_DENIED",
+                message: "paired-node Claude CLI agent run was not approved",
+              },
+            };
+          }
+        },
+      );
     }
   } catch (error) {
     if (!hardDeadlineReached) {

@@ -21,7 +21,10 @@ import {
   requestCliNativeToolApproval,
   resolveCliNativeToolApprovalPlan,
 } from "./cli-native-tool-approval.js";
-import { createCliRunCurrentAssertion } from "./execution-target.js";
+import {
+  withCliGatewayToolCallerIdentity,
+  createCliRunCurrentAssertion,
+} from "./execution-target.js";
 import { normalizeCliToolName } from "./tool-policy.js";
 import type { PreparedCliRunContext } from "./types.js";
 
@@ -49,10 +52,8 @@ export function createPluginToolPermissionHandler(params: {
 
   const handlePermission = async (
     request: CliBackendToolPermissionRequest,
+    signal: AbortSignal,
   ): Promise<CliBackendToolPermissionResult> => {
-    const signal = request.abortSignal
-      ? AbortSignal.any([params.abortSignal, request.abortSignal])
-      : params.abortSignal;
     const assertRunActive = createCliRunCurrentAssertion(run, signal);
     const sourceSnapshot = captureAdmittedRunSource(run.admittedRunContext);
     const strict = () => captureAdmittedRunSource(run.admittedRunContext).requireResolverMatch;
@@ -231,6 +232,7 @@ export function createPluginToolPermissionHandler(params: {
         toolName,
         toolInput,
         pluginId: params.context.backendResolved.id,
+        approvalOwnerPluginId: params.context.backendResolved.pluginId,
         sessionKey: run.sessionKey,
         agentId: run.agentId,
         toolCallId: request.toolCallId,
@@ -311,7 +313,9 @@ export function createPluginToolPermissionHandler(params: {
       signal.addEventListener("abort", release, { once: true });
       let allowed = false;
       try {
-        const result = await handlePermission(request);
+        const result = await withCliGatewayToolCallerIdentity(run, signal, () =>
+          handlePermission(request, signal),
+        );
         allowed = result.behavior === "allow";
         return result;
       } finally {

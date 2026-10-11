@@ -28,6 +28,7 @@ import {
 } from "../../infra/system-run-approval-binding.js";
 import { sliceUtf16Safe, truncateUtf16Safe } from "../../utils.js";
 import { prepareApprovalExecution } from "../approval-execution.js";
+import { withGatewayToolApprovalOwner } from "../tools/gateway-caller-context.js";
 import { callGatewayTool } from "../tools/gateway.js";
 
 type CliNativeToolApprovalOutcome =
@@ -98,6 +99,7 @@ export async function requestCliNativeToolApproval(params: {
   toolName: string;
   toolInput: Record<string, unknown>;
   pluginId: string;
+  approvalOwnerPluginId?: string;
   sessionKey?: string;
   agentId?: string;
   toolCallId?: string;
@@ -260,27 +262,29 @@ export async function requestCliNativeToolApproval(params: {
         ? ["allow-once", "deny"]
         : ["allow-once", "allow-always", "deny"];
     const requestResult = await racePromiseWithAbortSignal(
-      callGatewayTool<Partial<ApprovalWaitDecisionResult>>(
-        "plugin.approval.request",
-        { timeoutMs: gatewayTimeoutMs },
-        {
-          pluginId: params.pluginId,
-          toolName: params.toolName,
-          toolCallId: params.toolCallId,
-          agentId: params.agentId,
-          sessionKey: params.sessionKey,
-          title: truncateUtf16Safe(
-            `${params.pluginId} native tool: ${params.toolName}`,
-            PLUGIN_APPROVAL_TITLE_MAX_LENGTH,
-          ),
-          description: description.text,
-          detail: truncatePluginApprovalDetail(description.compact),
-          severity: "warning",
-          allowedDecisions,
-          timeoutMs,
-          twoPhase: true,
-        },
-        { expectFinal: false, signal: params.abortSignal },
+      withGatewayToolApprovalOwner(params.approvalOwnerPluginId, () =>
+        callGatewayTool<Partial<ApprovalWaitDecisionResult>>(
+          "plugin.approval.request",
+          { timeoutMs: gatewayTimeoutMs },
+          {
+            pluginId: params.pluginId,
+            toolName: params.toolName,
+            toolCallId: params.toolCallId,
+            agentId: params.agentId,
+            sessionKey: params.sessionKey,
+            title: truncateUtf16Safe(
+              `${params.pluginId} native tool: ${params.toolName}`,
+              PLUGIN_APPROVAL_TITLE_MAX_LENGTH,
+            ),
+            description: description.text,
+            detail: truncatePluginApprovalDetail(description.compact),
+            severity: "warning",
+            allowedDecisions,
+            timeoutMs,
+            twoPhase: true,
+          },
+          { expectFinal: false, signal: params.abortSignal },
+        ),
       ),
       params.abortSignal,
     );

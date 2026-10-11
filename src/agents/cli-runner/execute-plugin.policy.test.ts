@@ -170,6 +170,7 @@ describe("plugin-owned CLI native tool policy", () => {
         {
           agentId: "main",
           sessionKey: "synthetic-session",
+          operationalRunInstance: context.params.admittedRunContext?.operationalRunInstance,
           gatewayContextResolver: () => gatewayContext,
         },
         () =>

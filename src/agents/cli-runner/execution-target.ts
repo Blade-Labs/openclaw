@@ -3,6 +3,11 @@ import type { CliBackendExecute } from "../../plugins/cli-backend.types.js";
 import { getPluginValueInstance } from "../../plugins/plugin-instance-scope.js";
 import type { PluginInstanceConsumer } from "../../plugins/plugin-instance.types.js";
 import { resolveAdmittedRunActiveAssertion } from "../admitted-run-context.js";
+import {
+  createAdmittedGatewayToolCallerIdentity,
+  withGatewayToolCallerIdentity,
+  withoutGatewayToolCallerIdentity,
+} from "../tools/gateway-caller-context.js";
 import type { CliExecutionTarget, PreparedCliRunContext, RunCliAgentParams } from "./types.js";
 
 /** Capture both the admitted run and any narrower caller-owned execution authority. */
@@ -22,6 +27,32 @@ export function createCliRunCurrentAssertion(
     }
     assertAdmitted();
   };
+}
+
+/** CLI callbacks carry the same admitted requester and lifetime as host-bound tools. */
+export async function withCliGatewayToolCallerIdentity<T>(
+  run: PreparedCliRunContext["params"],
+  signal: AbortSignal,
+  callback: () => Promise<T> | T,
+): Promise<T> {
+  const identity = run.admittedRunContext
+    ? createAdmittedGatewayToolCallerIdentity({
+        admittedRunContext: run.admittedRunContext,
+        receiptAuthority: createCliRunCurrentAssertion(run, signal),
+        approvalSignals: [signal, ...(run.abortSignal ? [run.abortSignal] : [])],
+        agentId: run.agentId,
+        sessionKey: run.sessionKey,
+        turnSourceChannel: run.messageChannel ?? run.messageProvider,
+        turnSourceTo: run.chatId ?? run.currentChannelId,
+        turnSourceAccountId: run.agentAccountId,
+        turnSourceThreadId: run.currentThreadTs,
+      })
+    : undefined;
+  // Native callbacks stay sessionless; MCP's separately assigned session is not
+  // their authority. Missing identity must clear any enclosing run's caller.
+  return identity
+    ? withGatewayToolCallerIdentity(identity, callback)
+    : withoutGatewayToolCallerIdentity(callback);
 }
 
 /** Preparation and execution must agree on the owner of private prompt context. */

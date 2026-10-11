@@ -52,6 +52,10 @@ import {
 import { writeCliSystemPromptFile } from "./cli-runner/helpers.js";
 import { cliBackendLog, formatCliBackendOutputDigest } from "./cli-runner/log.js";
 import type { PreparedCliRunContext } from "./cli-runner/types.js";
+import {
+  getGatewayToolCallerIdentity,
+  withGatewayToolCallerIdentity,
+} from "./tools/gateway-caller-context.js";
 
 const executePreparedCliRun = wrapPreparedCliRunWithTestAdmission(executePreparedCliRunImpl);
 
@@ -530,89 +534,130 @@ describe("runCliAgent spawn path", () => {
     }
   });
 
-  it("uses the canonical exec approval flow before retrying a node Claude run", async () => {
-    const plan = {
-      argv: ["/trusted/claude", "-p"],
-      cwd: "/work/on-node",
-      commandText: "/trusted/claude -p",
-      agentId: "main",
-      sessionKey: "agent:main:catalog-adopt:claude:node",
-    };
-    const invokeNode = vi.fn(async (input: Parameters<typeof invokeNodeClaudeCliRun>[0]) => {
-      if (invokeNode.mock.calls.length === 1) {
+  it.each([
+    { sessionless: false, unrelatedCaller: false },
+    { sessionless: true, unrelatedCaller: false },
+    { sessionless: true, unrelatedCaller: true },
+  ])(
+    "isolates admitted identity through node exec approval (sessionless=$sessionless, unrelated caller=$unrelatedCaller)",
+    async ({ sessionless, unrelatedCaller }) => {
+      let now = Date.now();
+      vi.spyOn(Date, "now").mockImplementation(() => now);
+      const assertApprovalCaller = () => {
+        const caller = getGatewayToolCallerIdentity();
+        if (sessionless) {
+          expect(caller).toBeUndefined();
+          return;
+        }
+        expect(caller).toMatchObject({ agentId: "main", sessionKey: plan.sessionKey });
+        expect(caller?.operationalRunInstance).toBe(
+          context.params.admittedRunContext?.operationalRunInstance,
+        );
+        expect(caller?.approvalAuthorityCheck?.()).not.toBe(false);
+        expect(caller?.approvalSignals).toContain(invokeNode.mock.calls[0]?.[0].signal);
+      };
+      const plan = {
+        argv: ["/trusted/claude", "-p"],
+        cwd: "/work/on-node",
+        commandText: "/trusted/claude -p",
+        agentId: "main",
+        sessionKey: "agent:main:catalog-adopt:claude:node",
+      };
+      const invokeNode = vi.fn(async (input: Parameters<typeof invokeNodeClaudeCliRun>[0]) => {
+        if (invokeNode.mock.calls.length === 1) {
+          return {
+            ok: true,
+            payloadJSON: JSON.stringify({
+              approvalRequired: true,
+              systemRunPlan: plan,
+              security: "allowlist",
+              ask: "on-miss",
+            }),
+          };
+        }
+        input.onProgress(
+          `${JSON.stringify({ type: "result", session_id: "approved-node-session", result: "ok" })}\n`,
+        );
         return {
           ok: true,
-          payloadJSON: JSON.stringify({
-            approvalRequired: true,
-            systemRunPlan: plan,
-            security: "allowlist",
-            ask: "on-miss",
-          }),
+          payloadJSON: JSON.stringify({ exitCode: 0, stderrTail: "", truncated: false }),
         };
-      }
-      input.onProgress(
-        `${JSON.stringify({ type: "result", session_id: "approved-node-session", result: "ok" })}\n`,
-      );
-      return {
-        ok: true,
-        payloadJSON: JSON.stringify({ exitCode: 0, stderrTail: "", truncated: false }),
-      };
-    });
-    const registerApproval = vi.fn(async () => ({
-      id: "approval-1",
-      expiresAtMs: Date.now() + 1_000,
-    }));
-    const resolveApproval = vi.fn(async () => {
-      await new Promise((resolve) => {
-        setTimeout(resolve, 20);
       });
-      return "allow-once";
-    });
-    setCliRunnerExecuteTestDeps({
-      invokeNodeClaudeCliRun: invokeNode,
-      registerExecApprovalRequestForHostOrThrow: registerApproval,
-      resolveRegisteredExecApprovalDecision: resolveApproval,
-    });
-    const context = buildPreparedCliRunContext({
-      model: "claude-opus-4-8",
-      runId: "run-node-approval",
-      sessionKey: plan.sessionKey,
-      agentId: "main",
-      sessionEntry: {
-        sessionId: "openclaw-session",
-        updatedAt: 1,
-        execHost: "node",
-        execNode: "node-a",
-        execCwd: plan.cwd,
-      },
-      timeoutMs: 500,
-    });
+      const registerApproval = vi.fn(async () => {
+        assertApprovalCaller();
+        return { id: "approval-1", expiresAtMs: Date.now() + 1_000 };
+      });
+      const resolveApproval = vi.fn(async () => {
+        assertApprovalCaller();
+        now += 20;
+        return sessionless ? "deny" : "allow-once";
+      });
+      setCliRunnerExecuteTestDeps({
+        invokeNodeClaudeCliRun: invokeNode,
+        registerExecApprovalRequestForHostOrThrow: registerApproval,
+        resolveRegisteredExecApprovalDecision: resolveApproval,
+      });
+      const context = buildPreparedCliRunContext({
+        model: "claude-opus-4-8",
+        runId: "run-node-approval",
+        sessionKey: plan.sessionKey,
+        agentId: "main",
+        sessionEntry: {
+          sessionId: "openclaw-session",
+          updatedAt: 1,
+          execHost: "node",
+          execNode: "node-a",
+          execCwd: plan.cwd,
+        },
+        timeoutMs: 500,
+      });
 
-    await expect(executePreparedCliRun(context)).resolves.toMatchObject({
-      text: "ok",
-      sessionId: "approved-node-session",
-    });
-    expect(registerApproval).toHaveBeenCalledWith(
-      expect.objectContaining({
+      if (sessionless) {
+        context.params.sessionKey = undefined;
+      }
+      await withGatewayToolCallerIdentity(
+        unrelatedCaller ? { agentId: "other", sessionKey: "agent:other:main" } : undefined,
+        async () => {
+          const execution = executePreparedCliRun(context);
+          if (sessionless) {
+            await expect(execution).rejects.toThrow("not approved");
+          } else {
+            await expect(execution).resolves.toMatchObject({
+              text: "ok",
+              sessionId: "approved-node-session",
+            });
+          }
+          expect(getGatewayToolCallerIdentity()?.agentId).toBe(
+            unrelatedCaller ? "other" : undefined,
+          );
+        },
+      );
+      expect(registerApproval).toHaveBeenCalledWith(
+        expect.objectContaining({
+          systemRunPlan: plan,
+          host: "node",
+          nodeId: "node-a",
+          security: "allowlist",
+          ask: "on-miss",
+        }),
+      );
+      expect(resolveApproval).toHaveBeenCalledWith(
+        expect.objectContaining({ approvalId: "approval-1" }),
+      );
+      if (sessionless) {
+        expect(invokeNode).toHaveBeenCalledOnce();
+        return;
+      }
+      expect(invokeNode).toHaveBeenCalledTimes(2);
+      expect(invokeNode.mock.calls[1]?.[0]).toMatchObject({
+        approvalDecision: "allow-once",
         systemRunPlan: plan,
-        host: "node",
-        nodeId: "node-a",
-        security: "allowlist",
-        ask: "on-miss",
-      }),
-    );
-    expect(resolveApproval).toHaveBeenCalledWith(
-      expect.objectContaining({ approvalId: "approval-1" }),
-    );
-    expect(invokeNode).toHaveBeenCalledTimes(2);
-    expect(invokeNode.mock.calls[1]?.[0]).toMatchObject({
-      approvalDecision: "allow-once",
-      systemRunPlan: plan,
-    });
-    expect(invokeNode.mock.calls[1]?.[0].timeoutMs).toBeLessThan(
-      invokeNode.mock.calls[0]?.[0].timeoutMs ?? 0,
-    );
-  });
+      });
+      expect(invokeNode.mock.calls[1]?.[0].timeoutMs).toBeLessThan(
+        invokeNode.mock.calls[0]?.[0].timeoutMs ?? 0,
+      );
+    },
+  );
 
   it("keeps the node Claude hard deadline while waiting for approval", async () => {
     const plan = {

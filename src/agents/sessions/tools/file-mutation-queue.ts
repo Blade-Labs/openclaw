@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { getAgentToolExecutionContext } from "../../../../packages/agent-core/src/tool-execution-context.js";
 /**
  * Per-file mutation queue.
@@ -15,6 +16,45 @@ const keyAdmissions = resolveGlobalSingleton(
   Symbol.for("openclaw.fileMutationKeyAdmissions"),
   () => ({ fallbackScope: {}, tails: new WeakMap<object, Promise<void>>() }),
 );
+
+type FileMutationAdmission = {
+  previous: Promise<void>;
+  release: () => void;
+  claimed: boolean;
+};
+const pendingAdmission = new AsyncLocalStorage<FileMutationAdmission>();
+
+function reserveFileMutationAdmission(): FileMutationAdmission {
+  const scope = getAgentToolExecutionContext()?.assistantMessage ?? keyAdmissions.fallbackScope;
+  const previous = keyAdmissions.tails.get(scope) ?? Promise.resolve();
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => released);
+  keyAdmissions.tails.set(scope, tail);
+  const cleanup = () => {
+    if (keyAdmissions.tails.get(scope) === tail) {
+      keyAdmissions.tails.delete(scope);
+    }
+  };
+  tail.then(cleanup, cleanup);
+  return { previous, release, claimed: false };
+}
+
+/** Reserve source order before asynchronous input preparation; acquire file keys only once. */
+export async function withFileMutationQueueAdmission<T>(fn: () => Promise<T>): Promise<T> {
+  if (pendingAdmission.getStore()?.claimed === false) {
+    return await fn();
+  }
+  const admission = reserveFileMutationAdmission();
+  try {
+    return await pendingAdmission.run(admission, fn);
+  } finally {
+    // A failed preparation or an operation with no file queue must not strand later calls.
+    admission.release();
+  }
+}
 
 function resolveLocalFileMutationQueueKey(filePath: string): string {
   return resolveIdentityPathViaExistingAncestorSync(filePath);
@@ -46,26 +86,18 @@ export async function withFileMutationQueueKeysResolution<T>(
   keysResolution: Promise<readonly string[]>,
   fn: () => Promise<T>,
 ): Promise<T> {
-  const scope = getAgentToolExecutionContext()?.assistantMessage ?? keyAdmissions.fallbackScope;
-  const previousAdmission = keyAdmissions.tails.get(scope) ?? Promise.resolve();
+  const pending = pendingAdmission.getStore();
+  const admission = pending && !pending.claimed ? pending : reserveFileMutationAdmission();
+  admission.claimed = true;
   void keysResolution.catch(() => undefined);
   let operation!: Promise<T>;
-  const admission = previousAdmission.then(async () => {
+  try {
+    await admission.previous;
     const keys = await keysResolution;
     operation = enqueueFileMutationQueueKeys(keys, fn);
-  });
-  const tail = admission.then(
-    () => undefined,
-    () => undefined,
-  );
-  keyAdmissions.tails.set(scope, tail);
-  const cleanup = () => {
-    if (keyAdmissions.tails.get(scope) === tail) {
-      keyAdmissions.tails.delete(scope);
-    }
-  };
-  tail.then(cleanup, cleanup);
-  await admission;
+  } finally {
+    admission.release();
+  }
   return await operation;
 }
 

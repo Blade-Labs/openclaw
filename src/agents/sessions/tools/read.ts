@@ -122,6 +122,8 @@ export interface ReadOperations {
   resolveQueueKey?: (absolutePath: string, signal?: AbortSignal) => string | Promise<string>;
   /** Resolve a user-supplied path for this read backend. */
   resolvePath?: (filePath: string, cwd: string) => string | Promise<string>;
+  /** Allow filename spelling fallback after an exact miss. Canonical backends disable this. */
+  allowPathVariants?: boolean;
   /** Decode text bytes for this backend. Custom backends default to UTF-8. */
   decodeText?: (params: { buffer: Buffer; absolutePath: string }) => string;
   /** Read file contents as a Buffer */
@@ -266,6 +268,9 @@ async function resolveReadToolPathFromAbsolute(
     await ops.access(absolutePath);
     return { absolutePath };
   } catch (error) {
+    if (ops.allowPathVariants === false) {
+      throw error;
+    }
     if (!hasErrnoCode(error, "ENOENT") && !hasErrnoCode(error, "ENOTDIR")) {
       throw error;
     }
@@ -434,7 +439,10 @@ export function createReadToolDefinition(
               const queueKeysResolution = inputPathResolution.then(
                 async (absoluteInputPath) =>
                   await Promise.all(
-                    getReadQueuePaths(absoluteInputPath).map(
+                    (ops.allowPathVariants === false
+                      ? [absoluteInputPath]
+                      : getReadQueuePaths(absoluteInputPath)
+                    ).map(
                       async (candidate) =>
                         await resolveFileMutationQueueKey(candidate, ops.resolveQueueKey, signal),
                     ),

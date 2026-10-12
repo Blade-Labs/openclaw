@@ -300,7 +300,9 @@ export function createCoreCodingTools(options: CoreCodingToolsOptions): AnyAgent
           ...(rooted
             ? {
                 operations: {
-                  resolvePath: rooted.resolveInput,
+                  // bind() already interpreted the model argument; only validate it here.
+                  resolvePath: (absolutePath) => rooted.resolve(absolutePath),
+                  allowPathVariants: false,
                   resolveQueueKey: rooted.queueKey,
                   readFile: rooted.readFile,
                   access: rooted.access,

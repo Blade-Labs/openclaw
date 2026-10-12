@@ -8,6 +8,7 @@ import { captureAgentToolSourceExecutionGuard } from "./agent-tool-source-execut
 import { normalizeFileToolPathParam } from "./agent-tools.params.js";
 import type { AnyAgentTool } from "./agent-tools.types.js";
 import { preserveAtPrefixedRelativePath } from "./path-policy.js";
+import { withFileMutationQueueAdmission } from "./sessions/tools/file-mutation-queue.js";
 import { resolveToCwd } from "./sessions/tools/path-utils.js";
 
 const directoryFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
@@ -136,8 +137,6 @@ export class ExecutionRootFiles {
     // acquires this single root; all operations reuse it.
     const handle = await (this.opening ??= this.openRoot());
     this.assertActive();
-    // Calls awaiting the same root share an in-flight identity observation. Separate
-    // stat completions can reorder otherwise synchronous file-queue admissions.
     // No observation survives settlement, and cancellation stays invocation-owned.
     await (this.checkingIdentity ??= Promise.all([
       handle.stat({ bigint: true }),
@@ -181,15 +180,17 @@ export class ExecutionRootFiles {
       execute: async (id, params, signal, update) => {
         const combined =
           this.signal && signal ? AbortSignal.any([this.signal, signal]) : (signal ?? this.signal);
-        return this.invocationSignal.run(combined, () =>
-          this.operation(async () => {
-            await this.ready();
-            const record = params as { path?: unknown } | undefined;
-            if (typeof record?.path === "string") {
-              params = { ...record, path: await this.resolveInput(record.path, cwd) };
-            }
-            return await tool.execute(id, params, signal, update);
-          }),
+        return withFileMutationQueueAdmission(() =>
+          this.invocationSignal.run(combined, () =>
+            this.operation(async () => {
+              await this.ready();
+              const record = params as { path?: unknown } | undefined;
+              if (typeof record?.path === "string") {
+                params = { ...record, path: await this.resolveInput(record.path, cwd) };
+              }
+              return await tool.execute(id, params, signal, update);
+            }),
+          ),
         );
       },
     });

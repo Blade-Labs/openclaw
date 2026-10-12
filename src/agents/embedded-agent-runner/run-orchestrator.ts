@@ -47,6 +47,7 @@ import {
 } from "../agent-scope.js";
 import { createAssistantErrorTranscript } from "../assistant-error-transcript.js";
 import { runBestEffortCallback } from "../embedded-agent-subscribe.callback.js";
+import { ExecutionRootFiles } from "../execution-root-files.js";
 import { resolveLegacyInheritedAuthDir } from "../legacy-inherited-auth-dir.js";
 import { resolveModelCandidateChain } from "../model-fallback-candidates.js";
 import {
@@ -127,14 +128,24 @@ export function runEmbeddedAgent(
     (internalParamsInput.preparedModelRuntimeMode === "isolated-read-only"
       ? undefined
       : getPreparedModelRuntimePluginGeneration());
+  const executionRootFiles =
+    internalParamsInput.executionRootFiles ??
+    (internalParamsInput.executionRoot
+      ? new ExecutionRootFiles(internalParamsInput.executionRoot, internalParamsInput.abortSignal)
+      : undefined);
   return withAgentRunLifecycleGeneration(lifecycleGeneration, () =>
     runEmbeddedAgentInternal({
       ...internalParamsInput,
+      executionRootFiles,
       config,
       lifecycleGeneration,
       ...(pluginGeneration ? { pluginGeneration } : {}),
     }),
-  );
+  ).finally(async () => {
+    if (!internalParamsInput.executionRootFiles) {
+      await executionRootFiles?.close();
+    }
+  });
 }
 
 async function runEmbeddedAgentInternal(

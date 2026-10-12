@@ -327,6 +327,7 @@ export async function buildPreparedCompactionRuntime(
             sandbox,
             sessionPermissionPolicy,
             requireWorkspaceOnly: params.requireWorkspaceOnly,
+            executionRootFiles: params.executionRootFiles,
             clientCaps: params.clientCaps,
             pinnedWidgetAuthoring: params.pinnedWidgetAuthoring,
             oneShotCliRun: params.oneShotCliRun,

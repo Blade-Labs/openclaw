@@ -1,4 +1,5 @@
 import type { RunEmbeddedAgentParams } from "./embedded-agent-runner/run/params.js";
+import { ExecutionRootFiles } from "./execution-root-files.js";
 import type { SandboxContext } from "./sandbox/types.js";
 import type { PreparedSessionPermissionPolicy } from "./tool-fs-policy.js";
 import type { WorkspaceSandboxParams } from "./workspace-sandbox.js";
@@ -11,6 +12,7 @@ export type PreparedRootedExecutionCapability = Readonly<{
   workspaceDir: string;
   cwd: string;
   requireWorkspaceOnly: true;
+  executionRootFiles?: ExecutionRootFiles;
   sandbox: SandboxContext | null;
   sessionPermissionPolicy?: PreparedSessionPermissionPolicy;
 }>;
@@ -31,6 +33,9 @@ export async function prepareRootedExecutionCapability(
     requireWorkspaceOnly: true,
   });
   return Object.freeze({
+    ...(!workspace.sandbox
+      ? { executionRootFiles: new ExecutionRootFiles(workspace.effectiveCwd) }
+      : {}),
     root: workspace.resolvedWorkspace,
     workspaceDir: workspace.effectiveWorkspace,
     cwd: workspace.effectiveCwd,
@@ -47,6 +52,7 @@ export function rootedAgentRunParams(workspaceDir: string, executionRoot?: strin
     bootstrapWorkspaceDir: workspaceDir,
     cwd: executionRoot,
     sessionRoot: executionRoot,
+    executionRoot,
     requireWritableSandbox: executionRoot ? true : undefined,
     requireWorkspaceOnly: executionRoot ? true : undefined,
   } satisfies Partial<RunEmbeddedAgentParams>;

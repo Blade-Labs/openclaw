@@ -716,6 +716,10 @@ export type PluginHookToolRequesterContext = {
 };
 
 export type PluginHookToolContext = {
+  /** Host file tools use a held Linux root descriptor; absent for other backends. */
+  executionRootContainment?: "operation-bound";
+  /** Absolute execution root bound by the host; meaningful only with containment above. */
+  executionRoot?: string;
   readonly source?: TurnSourceProvenance;
   agentId?: string;
   sessionKey?: string;

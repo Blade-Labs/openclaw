@@ -157,6 +157,10 @@ export type RunEmbeddedAgentParams = {
   sessionFile?: string;
   /** Require file tools to stay within the task workspace without changing exec policy. */
   requireWorkspaceOnly?: true;
+  /** Host-selected task root; absent for ordinary workspace-only sessions. */
+  executionRoot?: string;
+  /** One descriptor owner shared across retries and tool generations. */
+  executionRootFiles?: import("../../execution-root-files.js").ExecutionRootFiles;
   /** Refuse an enabled sandbox that would redirect a review away from its workspace. */
   requireWritableSandbox?: true;
   permissionMode?: SessionEntry["permissionMode"];

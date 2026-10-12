@@ -6,19 +6,34 @@ import "./test-helpers/fast-coding-tools.js";
 import "./test-helpers/fast-openclaw-tools.js";
 import { createOpenClawCodingTools } from "./agent-tools.js";
 import { createApplyPatchTool } from "./apply-patch.js";
+import { ExecutionRootFiles } from "./execution-root-files.js";
 import { expectReadWriteEditTools, getTextContent } from "./test-helpers/agent-tools-fs-helpers.js";
 import { createContainerWorkspaceSandboxFsBridge } from "./test-helpers/host-sandbox-fs-bridge.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const rootedOwners: ExecutionRootFiles[] = [];
+afterEach(async () => {
+  await Promise.all(rootedOwners.splice(0).map((owner) => owner.close()));
+});
+function rootedOwner(root: string, enabled: boolean) {
+  if (!enabled) return undefined;
+  const owner = new ExecutionRootFiles(root);
+  rootedOwners.push(owner);
+  return owner;
+}
 
 async function withWorkspace(run: (workspaceDir: string) => Promise<void>): Promise<void> {
   await run(tempDirs.make("openclaw-at-host-"));
 }
 
 describe("leading-@ host and mounted sandbox paths", () => {
-  it.each([false, true])(
-    "preserves literal files, new descendants, and file-reference shorthand with workspaceOnly=%s",
-    async (workspaceOnly) => {
+  it.each([
+    { workspaceOnly: false, rooted: false },
+    { workspaceOnly: true, rooted: false },
+    ...(process.platform === "linux" ? [{ workspaceOnly: true, rooted: true }] : []),
+  ])(
+    "preserves literal files, descendants, and references with workspaceOnly=$workspaceOnly rooted=$rooted",
+    async ({ workspaceOnly, rooted }) => {
       await withWorkspace(async (workspaceDir) => {
         const literalPath = path.join(workspaceDir, "@existing.md");
         const siblingPath = path.join(workspaceDir, "existing.md");
@@ -33,6 +48,7 @@ describe("leading-@ host and mounted sandbox paths", () => {
         const { readTool, writeTool, editTool } = expectReadWriteEditTools(
           createOpenClawCodingTools({
             workspaceDir,
+            executionRootFiles: rootedOwner(workspaceDir, rooted),
             config: { tools: { fs: { workspaceOnly } } },
           }),
         );
@@ -51,8 +67,16 @@ describe("leading-@ host and mounted sandbox paths", () => {
           path: "@existing.md",
           edits: [{ oldText: "updated", newText: "edited" }],
         });
+        if (rooted) {
+          await expect(
+            writeTool.execute("at-parent-traversal", {
+              path: "@notes/nested/../new.md",
+              content: "rejected",
+            }),
+          ).rejects.toThrow(/traversal/);
+        }
         await writeTool.execute("at-parent-write", {
-          path: "@notes/nested/../new.md",
+          path: rooted ? "@notes/new.md" : "@notes/nested/../new.md",
           content: "literal child",
         });
 
@@ -84,9 +108,12 @@ describe("leading-@ host and mounted sandbox paths", () => {
   );
 
   it.each([
-    { name: "workspace-confined host", workspaceOnly: true, mounted: false },
-    { name: "unconfined host", workspaceOnly: false, mounted: false },
-    { name: "mounted sandbox", workspaceOnly: true, mounted: true },
+    { name: "workspace-confined host", workspaceOnly: true, mounted: false, rooted: false },
+    { name: "unconfined host", workspaceOnly: false, mounted: false, rooted: false },
+    { name: "mounted sandbox", workspaceOnly: true, mounted: true, rooted: false },
+    ...(process.platform === "linux"
+      ? [{ name: "descriptor-rooted host", workspaceOnly: true, mounted: false, rooted: true }]
+      : []),
   ])("adds, updates, and deletes literal paths through the $name owner", async (runtime) => {
     await withWorkspace(async (workspaceDir) => {
       const literalParent = path.join(workspaceDir, "@notes");
@@ -97,6 +124,7 @@ describe("leading-@ host and mounted sandbox paths", () => {
       const patchTool = createApplyPatchTool({
         cwd: workspaceDir,
         workspaceOnly: runtime.workspaceOnly,
+        executionRootFiles: rootedOwner(workspaceDir, runtime.rooted),
         ...(runtime.mounted
           ? {
               sandbox: {
@@ -147,36 +175,44 @@ describe("leading-@ host and mounted sandbox paths", () => {
   });
 
   it.each([
-    { sibling: false, label: "without an unprefixed sibling" },
-    { sibling: true, label: "with an unprefixed sibling" },
-  ])("keeps literal replacement paths stable $label", async ({ sibling }) => {
-    await withWorkspace(async (workspaceDir) => {
-      await fs.writeFile(path.join(workspaceDir, "@replace.md"), "old literal\n", "utf8");
-      if (sibling) {
-        await fs.writeFile(path.join(workspaceDir, "replace.md"), "sibling\n", "utf8");
-      }
-      await createApplyPatchTool({ cwd: workspaceDir }).execute("at-patch-replace", {
-        input: [
-          "*** Begin Patch",
-          "*** Delete File: @replace.md",
-          "*** Add File: @replace.md",
-          "+new literal",
-          "*** End Patch",
-        ].join("\n"),
-      });
-
-      await expect(fs.readFile(path.join(workspaceDir, "@replace.md"), "utf8")).resolves.toBe(
-        "new literal\n",
-      );
-      if (sibling) {
-        await expect(fs.readFile(path.join(workspaceDir, "replace.md"), "utf8")).resolves.toBe(
-          "sibling\n",
-        );
-      } else {
-        await expect(fs.stat(path.join(workspaceDir, "replace.md"))).rejects.toMatchObject({
-          code: "ENOENT",
+    ...[false, true].flatMap((sibling) => [
+      { sibling, rooted: false },
+      ...(process.platform === "linux" ? [{ sibling, rooted: true }] : []),
+    ]),
+  ])(
+    "keeps literal replacement paths stable sibling=$sibling rooted=$rooted",
+    async ({ sibling, rooted }) => {
+      await withWorkspace(async (workspaceDir) => {
+        await fs.writeFile(path.join(workspaceDir, "@replace.md"), "old literal\n", "utf8");
+        if (sibling) {
+          await fs.writeFile(path.join(workspaceDir, "replace.md"), "sibling\n", "utf8");
+        }
+        await createApplyPatchTool({
+          cwd: workspaceDir,
+          executionRootFiles: rootedOwner(workspaceDir, rooted),
+        }).execute("at-patch-replace", {
+          input: [
+            "*** Begin Patch",
+            "*** Delete File: @replace.md",
+            "*** Add File: @replace.md",
+            "+new literal",
+            "*** End Patch",
+          ].join("\n"),
         });
-      }
-    });
-  });
+
+        await expect(fs.readFile(path.join(workspaceDir, "@replace.md"), "utf8")).resolves.toBe(
+          "new literal\n",
+        );
+        if (sibling) {
+          await expect(fs.readFile(path.join(workspaceDir, "replace.md"), "utf8")).resolves.toBe(
+            "sibling\n",
+          );
+        } else {
+          await expect(fs.stat(path.join(workspaceDir, "replace.md"))).rejects.toMatchObject({
+            code: "ENOENT",
+          });
+        }
+      });
+    },
+  );
 });

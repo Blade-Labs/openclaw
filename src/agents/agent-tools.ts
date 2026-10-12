@@ -22,6 +22,7 @@ import { resolveSessionAgentId } from "./agent-scope.js";
 import {
   bindAssembledAgentToolActionDescriptor,
   copyAgentToolMetadata,
+  getAgentToolExecutionRoot,
 } from "./agent-tool-metadata.js";
 import { createCodingToolsGatewayCaller } from "./agent-tools.caller.js";
 import { finalizeAgentTools } from "./agent-tools.finalize.js";
@@ -257,15 +258,18 @@ export function createOpenClawCodingToolsInternal(
   const memoryWriteProvenance = createMemoryWriteProvenanceObserver({
     mutationRoot: sandboxRoot ?? workspaceRoot,
     workspaceDir: sandboxRoot ?? workspaceRoot,
-    resolvePath: sandboxFsBridge
-      ? (filePath) =>
-          resolveSandboxFileIdentity({
-            bridge: sandboxFsBridge,
-            filePath,
-            cwd: sandboxRoot,
-            signal: options?.abortSignal,
-          })
-      : undefined,
+    resolvePath:
+      !sandbox && options?.executionRootFiles
+        ? options.executionRootFiles.resolveIdentity
+        : sandboxFsBridge
+          ? (filePath) =>
+              resolveSandboxFileIdentity({
+                bridge: sandboxFsBridge,
+                filePath,
+                cwd: sandboxRoot,
+                signal: options?.abortSignal,
+              })
+          : undefined,
     resolveOriginClass: () =>
       options?.senderIsOwner === false || options?.isTurnTainted?.() === true
         ? "untrusted"
@@ -675,7 +679,7 @@ export function createOpenClawCodingToolsInternal(
       if (tool.name === "write") {
         toolsForMemoryFlush.push(
           wrapToolMemoryFlushAppendOnlyWrite(tool, {
-            executionRootFiles,
+            executionRootFiles: getAgentToolExecutionRoot(tool)?.files,
             root: memoryFlushWriteRoot,
             relativePath: memoryFlushWritePath,
             memoryWriteProvenance,
@@ -777,11 +781,6 @@ export function createOpenClawCodingToolsInternal(
     ...(options?.config ? { config: options.config } : {}),
     cwd: codingRoot,
     workspaceDir: workspaceRoot,
-    ...(executionRootFiles
-      ? {
-          prepareExecutionRootContainment: executionRootFiles.prepareContainment,
-        }
-      : {}),
     ...(options?.skillsSnapshot ? { skillsSnapshot: options.skillsSnapshot } : {}),
     ...(options?.skillUsagePaths ? { skillUsagePaths: options.skillUsagePaths } : {}),
     ...(sandboxRoot && sandboxFsBridge && allowWorkspaceWrites
@@ -815,13 +814,7 @@ export function createOpenClawCodingToolsInternal(
     ...(options?.swarmCollector ? { approvalMode: "deny" as const } : {}),
     abortSignal: options?.abortSignal,
     recordToolPrepStage: options?.recordToolPrepStage,
-  }).map((tool) => {
-    const bound =
-      executionRootFiles && ["read", "ls", "edit", "write", "apply_patch"].includes(tool.name)
-        ? executionRootFiles.bind(tool, codingRoot)
-        : tool;
-    return wrapGatewayCaller(bound);
-  });
+  }).map(wrapGatewayCaller);
 }
 
 /** Build the SDK tool list without exposing core-only auxiliary read scope. */

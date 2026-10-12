@@ -454,6 +454,7 @@ export function wrapToolWithBeforeToolCallHook(
       let outcome: HookOutcome;
       try {
         outcome = await runBeforeToolCallHook({
+          tool,
           toolName,
           params: hookParams,
           ...hookMetadata,
@@ -719,14 +720,6 @@ export function rewrapToolWithBeforeToolCallHook(
   options: Partial<BeforeToolCallDiagnosticOptions> = {},
 ): AnyAgentTool {
   const preservedContext = getBeforeToolCallHookContext(tool);
-  // Rebuilding harness/source hooks must retain the file backend's descriptor owner.
-  // Acquisition runs in policy, before plugins see its containment attestation.
-  if (ctx && preservedContext?.prepareExecutionRootContainment) {
-    ctx = {
-      ...ctx,
-      prepareExecutionRootContainment: preservedContext.prepareExecutionRootContainment,
-    };
-  }
   const sourceTool = getBeforeToolCallSourceTool(tool) ?? tool;
   const preservedOptions = getBeforeToolCallDiagnosticOptions(tool);
   const wrapperOptions = { ...preservedOptions, ...options };

@@ -55,6 +55,8 @@ export function toDisplayPath(resolved: string, cwd: string): string {
  */
 
 export type ApplyPatchPathExtractionOptions = {
+  /** Host-selected descriptor backend input resolver. */
+  resolveInputPath?: (input: string, cwd?: string) => Promise<string>;
   /** Tool execution cwd. Defaults to process.cwd(), matching createApplyPatchTool. */
   cwd?: string;
   /** Run cancellation propagated to remote path disambiguation. */
@@ -72,6 +74,9 @@ export async function resolveApplyPatchInputPath(
   options: ApplyPatchPathExtractionOptions = {},
 ): Promise<string> {
   const cwd = options.cwd ?? options.sandbox?.root ?? process.cwd();
+  if (options.resolveInputPath) {
+    return await options.resolveInputPath(raw, cwd);
+  }
   const preserved = await preserveAtPrefixedRelativePath(
     raw,
     cwd,

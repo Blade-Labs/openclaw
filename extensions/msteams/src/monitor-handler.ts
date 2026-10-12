@@ -2,6 +2,7 @@ import { normalizeOptionalLowercaseString } from "openclaw/plugin-sdk/string-coe
 import { serializeMSTeamsAdaptiveCardActionValue } from "./adaptive-card-submit.js";
 import { maybeHandleMSTeamsApprovalCardSubmit } from "./approval-card-submit.js";
 import { formatUnknownError } from "./errors.js";
+import { markMSTeamsSynthesizedInvokeMessage } from "./inbound.js";
 import type { MSTeamsMessageHandlerDeps } from "./monitor-handler.types.js";
 import { resolveMSTeamsSenderAccess } from "./monitor-handler/access.js";
 import { createMSTeamsMessageHandler } from "./monitor-handler/message-handler.js";
@@ -169,11 +170,11 @@ export function registerMSTeamsHandlers<T extends MSTeamsActivityHandler>(
           return await handleTeamsMessage(
             {
               ...ctx,
-              activity: {
+              activity: markMSTeamsSynthesizedInvokeMessage({
                 ...ctx.activity,
                 type: "message",
                 text,
-              },
+              }),
             },
             turnAdoptionLifecycle,
           );

@@ -19,6 +19,7 @@ import type { admitMSTeamsMessage } from "./access.js";
 import { resolveMSTeamsSenderAccess } from "./access.js";
 import type { prepareMSTeamsInboundContent } from "./inbound-content.js";
 import type { assembleMSTeamsInboundFacts } from "./inbound-facts.js";
+import { resolveMSTeamsInboundInputProvenance } from "./input-provenance.js";
 import type { prepareMSTeamsThreadRouting, resolveMSTeamsThreadContext } from "./thread-context.js";
 
 type MSTeamsInboundDispatchResult =
@@ -155,6 +156,13 @@ export async function dispatchMSTeamsInboundTurn(params: {
       inboundEventKind: "user_request",
     },
   });
+  // Set only after the transport-owned JWT fact and sender admission; core copies it into the run.
+  const inputProvenance = resolveMSTeamsInboundInputProvenance({
+    activity,
+    isDirectMessage,
+    senderAdmitted: boundIngress.senderAccess.decision === "allow",
+    batchEligible: facts.inputProvenanceBatchEligible,
+  });
   const ctxPayload = core.channel.inbound.buildContext({
     channelIngress: boundIngress.channelIngress,
     channel: "msteams",
@@ -235,6 +243,7 @@ export async function dispatchMSTeamsInboundTurn(params: {
     extra: {
       GroupSubject: !isDirectMessage ? conversationType : undefined,
       ReplyToIsQuote: quoteInfo ? true : undefined,
+      ...(inputProvenance ? { InputProvenance: inputProvenance } : {}),
     },
   });
 

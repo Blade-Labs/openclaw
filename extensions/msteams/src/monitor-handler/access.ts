@@ -13,18 +13,18 @@ import {
   resolveDefaultGroupPolicy,
   type OpenClawConfig,
 } from "../../runtime-api.js";
-import { normalizeMSTeamsAadObjectId } from "../approval-requester.js";
 import type {
   StoredConversationReference,
   MSTeamsConversationStore,
 } from "../conversation-store.js";
 import { formatUnknownError } from "../errors.js";
-import { isMSTeamsReplayedActivity, normalizeMSTeamsConversationId } from "../inbound.js";
+import { normalizeMSTeamsConversationId } from "../inbound.js";
 import type { MSTeamsMonitorLogger } from "../monitor-types.js";
 import { resolveMSTeamsAllowlistMatch, resolveMSTeamsRouteConfig } from "../policy.js";
 import { looksLikeMSTeamsConversationId } from "../resolve-allowlist.js";
 import { getMSTeamsRuntime } from "../runtime.js";
 import type { MSTeamsTurnContext } from "../sdk-types.js";
+import { resolveMSTeamsActorKind } from "./input-provenance.js";
 
 const MSTEAMS_SENDER_NAME_KIND = "plugin:msteams-sender-name" as const;
 const MSTEAMS_CONVERSATION_ID_KIND = "plugin:msteams-conversation-id" as const;
@@ -164,13 +164,7 @@ export async function resolveMSTeamsSenderAccess(params: {
     channelId: "msteams",
     accountId: pairing.accountId,
     source: {
-      actorKind: isMSTeamsReplayedActivity(activity)
-        ? "unknown"
-        : activity.from?.role === "bot"
-          ? "bot"
-          : normalizeMSTeamsAadObjectId(activity.from?.aadObjectId)
-            ? "human"
-            : "unknown",
+      actorKind: resolveMSTeamsActorKind(activity),
       eventKind:
         activity.type === "messageUpdate"
           ? "edit"

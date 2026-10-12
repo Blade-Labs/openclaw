@@ -2,6 +2,7 @@
 import type { MSTeamsSdkCloudOptions } from "./cloud.js";
 import {
   extractMSTeamsConversationMessageId,
+  markMSTeamsAuthenticatedActivity,
   markMSTeamsReplayedActivity,
   normalizeMSTeamsConversationId,
 } from "./inbound.js";
@@ -80,4 +81,32 @@ export function createMSTeamsReplayContext(
     },
     getTeamDetails: (teamId) => app.api.teams.getById(teamId),
   };
+}
+
+/**
+ * Pick the transport surface for a drained ingress row. The journaled activity is always the
+ * payload; a live context only exists when an SDK callback accepted the request. The activity is
+ * marked as authenticated transport input only when that App enforces Bot Framework JWT
+ * validation and the ingress owner proved the stored bytes are the ones that callback carried.
+ * Replays, and live contexts bound by id to an older retained row, are never marked.
+ */
+export function resolveMSTeamsIngressDispatchContext(params: {
+  activity: MSTeamsTurnContext["activity"];
+  liveContext?: MSTeamsTurnContext;
+  /** From the ingress owner: the claimed row holds exactly the bytes this callback accepted. */
+  payloadMatchesLiveCallback: boolean;
+  app: MSTeamsApp;
+  jwtEnforced: boolean;
+  serviceUrlBoundary: MSTeamsSdkCloudOptions;
+}): MSTeamsTurnContext {
+  const { activity, liveContext } = params;
+  if (!liveContext) {
+    return createMSTeamsReplayContext(activity, params.app, params.serviceUrlBoundary);
+  }
+  // A duplicate delivery's context must not swap in its own (possibly mutated) activity object.
+  liveContext.activity = activity;
+  if (params.jwtEnforced && params.payloadMatchesLiveCallback) {
+    markMSTeamsAuthenticatedActivity(activity);
+  }
+  return liveContext;
 }

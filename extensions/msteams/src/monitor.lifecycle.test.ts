@@ -125,6 +125,8 @@ vi.mock("./resolve-allowlist.js", async (importOriginal) => ({
 vi.mock("./sdk.js", () => ({
   loadMSTeamsSdkWithAuth: (creds?: unknown, options?: Record<string, unknown>) =>
     loadMSTeamsSdkWithAuth(creds, options),
+  // Lifecycle fixtures use a mocked SDK App, which never pins JWT validation.
+  isMSTeamsAppJwtEnforced: () => false,
   createMSTeamsTokenProvider: () => ({
     getAccessToken: vi.fn().mockResolvedValue("mock-token"),
   }),

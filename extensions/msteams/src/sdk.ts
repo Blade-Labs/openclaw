@@ -287,7 +287,12 @@ async function createMSTeamsApp(
           skipAuth: privateQaRuntime.skipAuth,
           token: privateQaRuntime.token,
         }
-      : {}),
+      : {
+          // Production pins Bot Framework JWT validation. Left undefined, the SDK reads the
+          // ambient DANGEROUSLY_ALLOW_UNAUTHENTICATED_REQUESTS env and can silently accept
+          // unauthenticated requests; an explicit option wins over that env.
+          dangerouslyAllowUnauthenticatedRequests: false,
+        }),
     ...(options?.httpServerAdapter ? { httpServerAdapter: options.httpServerAdapter } : {}),
     ...(options?.messagingEndpoint ? { messagingEndpoint: options.messagingEndpoint } : {}),
     cloud: cloudFromName(cloud),
@@ -297,16 +302,37 @@ async function createMSTeamsApp(
       : {}),
   };
 
-  if (creds.type === "federated") {
-    // Teams SDK otherwise lets ambient CLIENT_SECRET override both federated modes.
-    return await createFederatedApp(creds, App, { clientSecret: "", ...appOptions });
+  const app =
+    creds.type === "federated"
+      ? // Teams SDK otherwise lets ambient CLIENT_SECRET override both federated modes.
+        await createFederatedApp(creds, App, { clientSecret: "", ...appOptions })
+      : (new App({
+          clientId: creds.appId,
+          clientSecret: creds.appPassword,
+          tenantId: creds.tenantId,
+          ...appOptions,
+        } as ConstructorParameters<typeof App>[0]) as unknown as MSTeamsApp);
+  if (!privateQaRuntime && resolvedSdkAuthBypass(app) === false) {
+    jwtEnforcedApps.add(app);
   }
-  return new App({
-    clientId: creds.appId,
-    clientSecret: creds.appPassword,
-    tenantId: creds.tenantId,
-    ...appOptions,
-  } as ConstructorParameters<typeof App>[0]) as unknown as MSTeamsApp;
+  return app;
+}
+
+const jwtEnforcedApps = new WeakSet<object>();
+
+/** The SDK HttpServer's resolved bypass flag; undefined when the shape is not recognized. */
+function resolvedSdkAuthBypass(app: MSTeamsApp): boolean | undefined {
+  const server = (app as { server?: { dangerouslyAllowUnauthenticatedRequests?: unknown } }).server;
+  const flag = server?.dangerouslyAllowUnauthenticatedRequests;
+  return typeof flag === "boolean" ? flag : undefined;
+}
+
+/**
+ * True only for an App this module created with JWT validation pinned on and whose SDK
+ * server confirms it. Private QA, the ambient bypass, and unknown SDK shapes fail closed.
+ */
+export function isMSTeamsAppJwtEnforced(app: MSTeamsApp): boolean {
+  return jwtEnforcedApps.has(app) && resolvedSdkAuthBypass(app) === false;
 }
 
 async function createFederatedApp(

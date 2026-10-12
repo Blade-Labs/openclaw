@@ -31,6 +31,18 @@ export type MSTeamsIngressLifecycle = Omit<ChannelIngressMonitorLifecycle, "admi
 
 export type MSTeamsIngressDispatchResult = ChannelIngressMonitorDeliveryResult;
 
+/** Ingress-owned facts about how a live callback relates to the claimed durable row. */
+export type MSTeamsIngressLiveFacts = {
+  /**
+   * True only when the claimed row's stored bytes equal the activity this live callback
+   * accepted. A same-id redelivery can bind a live context to an older retained row whose
+   * bytes the callback never carried; that row keeps replay treatment.
+   */
+  payloadMatchesLiveCallback: boolean;
+};
+
+type MSTeamsLiveDelivery = { context: MSTeamsTurnContext; rawActivity: string };
+
 type MSTeamsIngressOptions = {
   accountId: string;
   runtime: Pick<RuntimeEnv, "error" | "log">;
@@ -38,6 +50,7 @@ type MSTeamsIngressOptions = {
     activity: MSTeamsIngressActivity,
     lifecycle: MSTeamsIngressLifecycle,
     liveContext?: MSTeamsTurnContext,
+    liveFacts?: MSTeamsIngressLiveFacts,
   ) => Promise<MSTeamsIngressDispatchResult | void> | MSTeamsIngressDispatchResult | void;
   queue?: ChannelIngressQueue<MSTeamsIngressPayload>;
 };
@@ -139,7 +152,7 @@ export function createMSTeamsIngress(options: MSTeamsIngressOptions): MSTeamsIng
     getMSTeamsRuntime().state.openChannelIngressQueue<MSTeamsIngressPayload>({
       accountId: options.accountId,
     });
-  const liveContexts = new Map<string, MSTeamsTurnContext>();
+  const liveContexts = new Map<string, MSTeamsLiveDelivery>();
   const monitor = createChannelIngressMonitor<
     MSTeamsIngressActivity,
     Omit<MSTeamsIngressPayload, "version">,
@@ -168,9 +181,14 @@ export function createMSTeamsIngress(options: MSTeamsIngressOptions): MSTeamsIng
         ),
     },
     deliver: (activity, lifecycle, claim) => {
-      const liveContext = liveContexts.get(claim.id);
+      const live = liveContexts.get(claim.id);
       liveContexts.delete(claim.id);
-      return options.dispatch(activity, lifecycle, liveContext);
+      if (!live) {
+        return options.dispatch(activity, lifecycle, undefined);
+      }
+      return options.dispatch(activity, lifecycle, live.context, {
+        payloadMatchesLiveCallback: claim.payload.rawActivity === live.rawActivity,
+      });
     },
     pollIntervalMs: MSTEAMS_INGRESS_DRAIN_INTERVAL_MS,
     retention: {
@@ -211,15 +229,19 @@ export function createMSTeamsIngress(options: MSTeamsIngressOptions): MSTeamsIng
       // entry the moment the insert commits; a set afterwards would leak. A
       // duplicate delivery must not clobber the first delivery's context.
       const installedLiveContext = Boolean(liveContext) && !liveContexts.has(facts.eventId);
-      if (liveContext && installedLiveContext) {
-        liveContexts.set(facts.eventId, liveContext);
+      const liveDelivery = liveContext
+        ? // Same serialization as the durable payload, taken before the append can commit.
+          { context: liveContext, rawActivity: JSON.stringify(activity) }
+        : undefined;
+      if (liveDelivery && installedLiveContext) {
+        liveContexts.set(facts.eventId, liveDelivery);
       }
       // Identity-guarded uninstall: only remove OUR context so a concurrent
       // redelivery's fresh install is never clobbered. A failed or
       // tombstoned-duplicate append leaves no claim to consume the entry, and
       // a later retry must not dispatch this request's stale context.
       const uninstallLiveContext = () => {
-        if (installedLiveContext && liveContexts.get(facts.eventId) === liveContext) {
+        if (installedLiveContext && liveContexts.get(facts.eventId) === liveDelivery) {
           liveContexts.delete(facts.eventId);
         }
       };

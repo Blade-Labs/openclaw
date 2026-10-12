@@ -11,6 +11,33 @@ export function isMSTeamsReplayedActivity(activity: object): boolean {
   return replayedActivities.has(activity);
 }
 
+const authenticatedActivities = new WeakSet<object>();
+
+/**
+ * Transport-owned fact: this exact activity object arrived on a live SDK callback whose App
+ * enforces Bot Framework JWT validation. Only the monitor's ingress dispatch may mark it;
+ * message content, journal rows, and replays cannot reach this set.
+ */
+export function markMSTeamsAuthenticatedActivity(activity: object): void {
+  authenticatedActivities.add(activity);
+}
+
+export function isMSTeamsAuthenticatedActivity(activity: object): boolean {
+  return authenticatedActivities.has(activity);
+}
+
+const synthesizedInvokeMessages = new WeakSet<object>();
+
+/** Card-action invokes are rewritten as message text; they are not typed user messages. */
+export function markMSTeamsSynthesizedInvokeMessage<T extends object>(activity: T): T {
+  synthesizedInvokeMessages.add(activity);
+  return activity;
+}
+
+export function isMSTeamsSynthesizedInvokeMessage(activity: object): boolean {
+  return synthesizedInvokeMessages.has(activity);
+}
+
 type MSTeamsQuoteInfo = {
   sender: string;
   body: string;

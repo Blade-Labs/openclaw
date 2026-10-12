@@ -24,6 +24,7 @@ import {
   prepareMSTeamsDebounceEntry,
   type MSTeamsDebounceEntry,
 } from "./inbound-facts.js";
+import { areMSTeamsBatchConstituentsExternalUser } from "./input-provenance.js";
 import { prepareMSTeamsThreadRouting, resolveMSTeamsThreadContext } from "./thread-context.js";
 
 export function createMSTeamsMessageHandler(deps: MSTeamsMessageHandlerDeps) {
@@ -345,6 +346,10 @@ export function createMSTeamsMessageHandler(deps: MSTeamsMessageHandlerDeps) {
                   wasMentioned,
                   implicitMentionKinds,
                   turnAdoptionLifecycle: admissionLifecycle,
+                  // Only the last context survives the merge; judge every constituent now.
+                  inputProvenanceBatchEligible: areMSTeamsBatchConstituentsExternalUser(
+                    entries.map((entry) => entry.context.activity),
+                  ),
                 });
               }
             }

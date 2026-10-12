@@ -38,7 +38,7 @@ import {
   type MSTeamsPollStore,
 } from "./polls.js";
 import { resolveMSTeamsPrivateQaRuntime } from "./qa/private-runtime.js";
-import { createMSTeamsReplayContext } from "./replay-context.js";
+import { resolveMSTeamsIngressDispatchContext } from "./replay-context.js";
 import {
   looksLikeMSTeamsConversationId,
   projectStableMSTeamsGroupAllowlist,
@@ -52,6 +52,7 @@ import type { MSTeamsTurnContext } from "./sdk-types.js";
 import {
   createMSTeamsExpressAdapter,
   createMSTeamsTokenProvider,
+  isMSTeamsAppJwtEnforced,
   loadMSTeamsSdkWithAuth,
   type MSTeamsApp,
   type MSTeamsCardActionResponse,
@@ -282,6 +283,14 @@ export async function monitorMSTeamsProvider(
     );
   }
 
+  // Resolved once from the App this module created: private QA and any SDK bypass are false.
+  const jwtEnforced = isMSTeamsAppJwtEnforced(app);
+  if (!jwtEnforced) {
+    log.warn?.(
+      "msteams Bot Framework JWT validation is not enforced; inbound turns carry no user provenance",
+    );
+  }
+
   // Build a token provider adapter for Graph API operations
   const tokenProvider = createMSTeamsTokenProvider(app);
 
@@ -318,16 +327,17 @@ export async function monitorMSTeamsProvider(
   const ingress = createMSTeamsIngress({
     accountId: appId,
     runtime,
-    dispatch: async (activity, lifecycle, liveContext) => {
+    dispatch: async (activity, lifecycle, liveContext, liveFacts) => {
       // The journaled activity is the dispatch payload; the live context only
-      // supplies the transport surface. A duplicate delivery's context must
-      // not swap in its own (possibly mutated) activity object.
-      if (liveContext) {
-        liveContext.activity = activity;
-      }
-      const context =
-        liveContext ??
-        createMSTeamsReplayContext(activity, app, resolveMSTeamsSdkCloudOptions(msteamsCfg));
+      // supplies the transport surface.
+      const context = resolveMSTeamsIngressDispatchContext({
+        activity,
+        liveContext,
+        payloadMatchesLiveCallback: liveFacts?.payloadMatchesLiveCallback === true,
+        app,
+        jwtEnforced,
+        serviceUrlBoundary: resolveMSTeamsSdkCloudOptions(msteamsCfg),
+      });
       return await handler.run!(context, lifecycle);
     },
   });

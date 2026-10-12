@@ -46,6 +46,8 @@ export type MSTeamsDebounceEntry = {
   wasMentioned: boolean;
   implicitMentionKinds: Array<"reply_to_bot">;
   turnAdoptionLifecycle?: MSTeamsIngressLifecycle;
+  /** Set on merged debounce entries; false withholds input provenance for the whole turn. */
+  inputProvenanceBatchEligible?: boolean;
 };
 
 export async function prepareMSTeamsDebounceEntry(params: {

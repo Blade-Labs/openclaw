@@ -178,12 +178,23 @@ async function notifyPluginApprovalResolution(
         signal.addEventListener("abort", onAbort, { once: true });
       }
     });
-    await Promise.race([
-      Promise.resolve().then(() =>
+    // Own the stop promise before the callback runs: a callback may abort the
+    // run synchronously (rejecting `stopped`) and then throw.
+    stopped.catch(() => {});
+    // Invoke inline so synchronous callbacks keep their synchronous contract
+    // (deferred-approval cancellation retires/replaces relays before teardown
+    // continues); authorization still awaits any returned promise.
+    let completion: Promise<unknown>;
+    try {
+      completion = Promise.resolve(
         receipt ? onResolution(resolution, receipt) : onResolution(resolution),
-      ),
-      stopped,
-    ]);
+      );
+    } catch (error) {
+      completion = Promise.reject(error);
+    }
+    // Late rejection after the race is decided must not surface as unhandled.
+    completion.catch(() => {});
+    await Promise.race([completion, stopped]);
     signal?.throwIfAborted();
     if (Date.now() >= deadlineMs) {
       throw new Error("approval timeout expired");

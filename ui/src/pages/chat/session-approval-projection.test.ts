@@ -47,6 +47,52 @@ describe("session approval projection", () => {
     ]);
   });
 
+  it("keeps exec decisions and bounds scoped plugin decisions to once/deny", () => {
+    const queue = projectSessionApprovalReplay(
+      {
+        sessionKey: "agent:main:host",
+        updatedAtMs: 2_000,
+        approvals: [
+          {
+            ...pendingPluginApproval,
+            id: "plugin:scoped",
+            presentation: {
+              ...pendingPluginApproval.presentation,
+              grantEligible: true,
+              grantScopeSummary: "Project 4 status field",
+              allowedDecisions: [
+                "allow-once",
+                "allow-15m",
+                "allow-session",
+                "allow-always",
+                "deny",
+              ],
+            },
+            urlPath: "/approve/plugin%3Ascoped",
+          },
+          {
+            ...pendingPluginApproval,
+            id: "exec:approval-1",
+            presentation: {
+              kind: "exec",
+              commandText: "pnpm test",
+              agentId: "main",
+              allowedDecisions: ["allow-once", "allow-always", "deny"],
+            },
+            urlPath: "/approve/exec%3Aapproval-1",
+          },
+        ],
+        truncated: false,
+      },
+      "agent:main:host",
+    );
+
+    expect(queue.map((item) => [item.id, item.request.allowedDecisions])).toEqual([
+      ["plugin:scoped", ["allow-once", "deny"]],
+      ["exec:approval-1", ["allow-once", "allow-always", "deny"]],
+    ]);
+  });
+
   it("ignores malformed replay and live events", () => {
     expect(projectSessionApprovalReplay({ approvals: [{}] }, "agent:main:host")).toEqual([]);
     expect(reconcileSessionApprovalEvent([], { sessionKey: "agent:main:host" })).toBeNull();

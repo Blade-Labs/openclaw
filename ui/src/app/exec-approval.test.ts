@@ -126,6 +126,25 @@ describe("parsePluginApprovalRequested", () => {
     expect(result?.expiresAtMs).toBe(120_000);
   });
 
+  it("bounds live scoped plugin decisions to once/deny and keeps legacy Always", () => {
+    const scoped = parsePluginApprovalRequested({
+      ...validPayload,
+      request: {
+        ...validPayload.request,
+        allowedDecisions: ["allow-once", "allow-15m", "allow-session", "allow-always", "deny"],
+      },
+    });
+    expect(scoped?.request.allowedDecisions).toEqual(["allow-once", "deny"]);
+    const legacy = parsePluginApprovalRequested({
+      ...validPayload,
+      request: {
+        ...validPayload.request,
+        allowedDecisions: ["allow-once", "allow-always", "deny"],
+      },
+    });
+    expect(legacy?.request.allowedDecisions).toEqual(["allow-once", "allow-always", "deny"]);
+  });
+
   it("returns null when title is missing from request", () => {
     const {
       request: { title: _, ...restRequest },

@@ -3146,6 +3146,8 @@ export const en: TranslationMap & {
     },
     decisions: {
       allowOnce: "Allow once",
+      allow15Min: "Allow 15 min",
+      allowSession: "Allow for this session",
       allowAlways: "Always allow",
       deny: "Deny",
     },
@@ -3154,6 +3156,7 @@ export const en: TranslationMap & {
       timeout: "Timed out",
       malformedVerdict: "Malformed verdict",
       noRoute: "No route",
+      requesterUnavailable: "Requester unavailable",
       runAborted: "Run aborted",
       gatewayRestart: "Gateway restart",
       storageCorrupt: "Storage corrupt",

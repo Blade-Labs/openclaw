@@ -142,6 +142,53 @@ describe("ApprovalsPage", () => {
     expect(page.querySelectorAll(".approval-history-table tbody tr")).toHaveLength(2);
   });
 
+  it("labels scoped plugin decisions and requester-unavailable denials", async () => {
+    const scopedPresentation = {
+      kind: "plugin" as const,
+      title: "Project write",
+      description: "Update one project field",
+      severity: "warning" as const,
+      grantEligible: true,
+      grantScopeSummary: "Project 4 status field",
+      allowedDecisions: ["allow-once", "allow-15m", "allow-session", "allow-always", "deny"] as [
+        "allow-once",
+        "allow-15m",
+        "allow-session",
+        "allow-always",
+        "deny",
+      ],
+    };
+    const items: ApprovalHistoryResult["items"] = [
+      {
+        ...terminal("scoped-15m", 3_000),
+        status: "allowed",
+        presentation: scopedPresentation,
+        decision: "allow-15m",
+        reason: "user",
+      },
+      {
+        ...terminal("scoped-session", 2_000),
+        status: "allowed",
+        presentation: scopedPresentation,
+        decision: "allow-session",
+        reason: "user",
+      },
+      { ...terminal("requester-gone", 1_000), reason: "requester-unavailable" },
+    ];
+    const request = vi.fn().mockResolvedValueOnce({ items });
+    const { page } = createPage(stubGrants(request));
+
+    await settle(page);
+
+    const rows = [...page.querySelectorAll(".approval-history-table tbody tr")].map(
+      (row) => row.textContent ?? "",
+    );
+    expect(rows).toHaveLength(3);
+    expect(rows[0]).toContain("Allow 15 min");
+    expect(rows[1]).toContain("Allow for this session");
+    expect(rows[2]).toContain("Requester unavailable");
+  });
+
   it("does not claim an empty history when the load failed", async () => {
     const request = vi.fn().mockRejectedValueOnce(new Error("boom"));
     const { page } = createPage(stubGrants(request));

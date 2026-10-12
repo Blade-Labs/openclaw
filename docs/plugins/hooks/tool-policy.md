@@ -38,6 +38,23 @@ contributions, and transcript persistence. Part of the [Plugin hooks](/plugins/h
   `senderIsOwner`, and provider-native `roleIds`. Missing fields are unproven,
   not false assurances; fail closed when policy requires them.
 
+For host-rooted runs on Linux, the context may also include
+`executionRootContainment: "operation-bound"` and `executionRoot`, the absolute
+root path. The host opens one root descriptor before the file-tool policy hook
+and binds built-in `read`, `ls`, `edit`, `write`, and `apply_patch` operations to
+it. Policy can require both fields before allowing a Workshop exception. The
+fields are absent for ordinary runs and sandbox bridges; absence does not prove
+containment. They do not grant authority to shell commands or plugin-owned file
+operations.
+
+The Linux implementation resolves components beneath held directory descriptors
+with `O_NOFOLLOW`, rejects lexical `..` and absolute escapes, and refuses
+multiply linked regular files. Writes replace directory entries rather than
+truncate existing inodes. This protects against pathname replacement with
+symlinks; it does not freeze directories against relocation by another process
+with permission to rename them. Concurrent hard-link creation and expected-inode
+compare-and-swap for rename/unlink are also outside this contract.
+
 It can return:
 
 ```typescript

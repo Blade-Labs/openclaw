@@ -4,6 +4,7 @@ import path from "node:path";
 import { openRootFile, type RootFileOpenResult } from "../infra/boundary-file-read.js";
 import { FsSafeError, root as fsRoot } from "../infra/fs-safe.js";
 import { captureAgentToolSourceExecutionGuard } from "./agent-tool-source-execution-guard.js";
+import type { ExecutionRootFiles } from "./execution-root-files.js";
 import { writeHostFile } from "./host-file-write.js";
 import {
   type MemoryWriteProvenanceObserver,
@@ -22,6 +23,7 @@ export type SandboxApplyPatchConfig = {
 };
 
 export type ApplyPatchFileOptions = {
+  executionRootFiles?: ExecutionRootFiles;
   signal?: AbortSignal;
   cwd: string;
   /** Containment boundary when relative paths resolve from a nested cwd. */
@@ -59,6 +61,18 @@ export async function createPatchTarget(params: {
 
 export async function resolvePatchFileOps(options: ApplyPatchFileOptions): Promise<PatchFileOps> {
   const assertCurrent = captureAgentToolSourceExecutionGuard(options.signal);
+  if (options.executionRootFiles) {
+    const rooted = options.executionRootFiles;
+    return withPatchMemoryWriteProvenance({
+      observer: options.memoryWriteProvenance,
+      operations: {
+        readFile: async (filePath) => decodeUtf8File(await rooted.readFile(filePath), filePath),
+        writeFile: rooted.writeFile,
+        createFileExclusive: rooted.createFileExclusive,
+        remove: rooted.remove,
+      },
+    });
+  }
   if (options.sandbox) {
     const { root, bridge } = options.sandbox;
     return withPatchMemoryWriteProvenance({

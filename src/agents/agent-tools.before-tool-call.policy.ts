@@ -147,6 +147,11 @@ export async function runBeforeToolCallHook(input: {
   let releaseArgumentChurnPolicyWait: (() => void) | undefined;
 
   try {
+    if (args.ctx?.prepareExecutionRootContainment) {
+      const containment = await args.ctx.prepareExecutionRootContainment();
+      args.signal?.throwIfAborted();
+      args = { ...args, ctx: { ...args.ctx, ...containment } };
+    }
     if (args.ctx?.sessionKey) {
       if (args.ctx.loopDetection?.enabled === true) {
         const { markDiagnosticArgumentChurnObservation } = await loadBeforeToolCallRuntime();
@@ -249,6 +254,12 @@ export async function runBeforeToolCallHook(input: {
     const buildToolContext = (identity: typeof toolIdentity) => ({
       toolName,
       ...identity,
+      ...(args.ctx?.executionRootContainment
+        ? {
+            executionRootContainment: args.ctx.executionRootContainment,
+            executionRoot: args.ctx.executionRoot,
+          }
+        : {}),
       ...(args.ctx?.agentId && { agentId: args.ctx.agentId }),
       ...(args.ctx?.sessionKey && { sessionKey: args.ctx.sessionKey }),
       ...(args.ctx?.sessionId && { sessionId: args.ctx.sessionId }),

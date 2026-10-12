@@ -19,12 +19,14 @@ import { getGlobalHookRunner, resetGlobalHookRunner } from "../plugins/hook-runn
 import type { HookRunner } from "../plugins/hooks.js";
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
-import { PluginApprovalResolutions } from "../plugins/types.js";
+import { type PluginApprovalResolution, PluginApprovalResolutions } from "../plugins/types.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { proposeUpdateSkill } from "../skills/workshop/service.js";
 import { resolveWorkshopSkillsDir } from "../skills/workshop/skills-root.js";
 import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import {
+  cancelDeferredPluginToolApproval,
+  requestDeferredPluginToolApproval,
   resolveBeforeToolCallApprovalOutcome,
   resolveSkillWorkshopApprovalForFinalParams,
 } from "./agent-tools.before-tool-call.approval.js";
@@ -1069,5 +1071,208 @@ describe("before_tool_call approval snapshots", () => {
         baseParams: values.baseParams,
       }),
     ).rejects.toThrow("before_tool_call mutable input isolation failed");
+  });
+});
+
+describe("before_tool_call resolution callback failures by transport", () => {
+  type CallbackMode = "resolve" | "throw" | "reject" | "timeout" | "abort";
+  const callbackModes = ["resolve", "throw", "reject", "timeout", "abort"] as const;
+
+  beforeEach(() => {
+    mockCallGatewayTool.mockReset();
+    agentToolsWarnSpy.mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    setEmbeddedPluginApprovalBroker(null);
+    setEmbeddedMode(false);
+  });
+
+  function createCallback(mode: CallbackMode, controller: AbortController) {
+    const entered = createDeferredCore();
+    const release = createDeferredCore();
+    const onResolution = vi.fn((_resolution: string, _receipt?: unknown) => {
+      entered.resolve();
+      if (mode === "throw") {
+        throw new Error("Synthetic policy failure");
+      }
+      if (mode === "reject") {
+        return Promise.reject(new Error("Synthetic policy failure"));
+      }
+      return release.promise;
+    });
+    const approval = {
+      pluginId: "synthetic-policy",
+      title: "Synthetic",
+      description: "Exact write",
+      timeoutMs: 1_000,
+      onResolution,
+    };
+    return { approval, entered, release, onResolution, controller };
+  }
+
+  async function driveCallback(
+    mode: CallbackMode,
+    callback: ReturnType<typeof createCallback>,
+    outcome: Promise<unknown>,
+  ) {
+    await callback.entered.promise;
+    await vi.advanceTimersByTimeAsync(0);
+    if (mode === "timeout") {
+      await vi.advanceTimersByTimeAsync(1_000);
+    } else if (mode === "abort") {
+      callback.controller.abort();
+    } else if (mode === "resolve") {
+      callback.release.resolve();
+    }
+    const result = await outcome;
+    if (mode === "resolve") {
+      expect(result).toMatchObject({
+        blocked: false,
+        params: { field: "status" },
+        approvalResolution: PluginApprovalResolutions.ALLOW_ONCE,
+      });
+    } else {
+      // No unblocked outcome means the wrapped tool never dispatches.
+      expect(result).toMatchObject({
+        blocked: true,
+        kind: "failure",
+        disposition: "blocked",
+        deniedReason: "plugin-approval",
+        reason: expect.stringContaining("resolution callback failed; tool call did not run"),
+      });
+      // Settlement after the gate closed cannot reopen it.
+      callback.release.resolve();
+      await callback.release.promise;
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    // A failed callback is not followed by a second (cancellation) notification.
+    expect(callback.onResolution).toHaveBeenCalledOnce();
+    expect(callback.onResolution.mock.calls[0]?.[0]).toBe(PluginApprovalResolutions.ALLOW_ONCE);
+  }
+
+  it.for(callbackModes)("gates embedded broker approvals on the callback (%s)", async (mode) => {
+    setEmbeddedMode(true);
+    const broker = new EmbeddedPluginApprovalBroker();
+    setEmbeddedPluginApprovalBroker(broker);
+    const parked = createDeferredCore();
+    const request = broker.request.bind(broker);
+    vi.spyOn(broker, "request").mockImplementation((args) => {
+      const pending = request(args);
+      parked.resolve();
+      return pending;
+    });
+    const callback = createCallback(mode, new AbortController());
+    // Virtual time proves the timeout bound without a real sleep.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const outcome = resolveBeforeToolCallApprovalOutcome({
+      result: { requireApproval: callback.approval },
+      approvalMode: "request",
+      toolName: "projects_write",
+      toolCallId: "call-embedded-callback",
+      signal: callback.controller.signal,
+      baseParams: { field: "status" },
+    });
+    try {
+      await parked.promise;
+      const pending = expectDefined(broker.listPending()[0], "embedded pending approval");
+      expect(broker.resolve(pending.id, "allow-once")).toBe(true);
+      await driveCallback(mode, callback, outcome);
+      expect(mockCallGatewayTool).not.toHaveBeenCalled();
+    } finally {
+      callback.release.resolve();
+      await outcome.catch(() => undefined);
+    }
+  });
+
+  it.for(callbackModes)("gates deferred gateway approvals on the callback (%s)", async (mode) => {
+    const callback = createCallback(mode, new AbortController());
+    const deferredOutcome = await resolveBeforeToolCallApprovalOutcome({
+      result: { requireApproval: callback.approval },
+      approvalMode: "defer",
+      toolName: "projects_write",
+      toolCallId: "call-deferred-callback",
+      baseParams: { field: "status" },
+    });
+    if (!deferredOutcome || deferredOutcome.blocked || !deferredOutcome.deferredApproval) {
+      throw new Error("expected deferred approval outcome");
+    }
+    expect(callback.onResolution).not.toHaveBeenCalled();
+    mockCallGatewayTool.mockImplementation(async (method) =>
+      method === "plugin.approval.request"
+        ? { id: "deferred-callback-id", status: "accepted" }
+        : { id: "deferred-callback-id", decision: "allow-once" },
+    );
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const outcome = requestDeferredPluginToolApproval({
+      deferredApproval: deferredOutcome.deferredApproval,
+      signal: callback.controller.signal,
+    });
+    try {
+      await driveCallback(mode, callback, outcome);
+      expect(mockCallGatewayTool.mock.calls.map(([method]) => method)).toEqual([
+        "plugin.approval.request",
+        "plugin.approval.waitDecision",
+      ]);
+    } finally {
+      callback.release.resolve();
+      await outcome.catch(() => undefined);
+    }
+  });
+
+  async function deferWith(
+    onResolution: (resolution: PluginApprovalResolution) => void | Promise<void>,
+  ) {
+    const outcome = await resolveBeforeToolCallApprovalOutcome({
+      result: {
+        requireApproval: {
+          pluginId: "synthetic-policy",
+          title: "Synthetic",
+          description: "Exact write",
+          onResolution,
+        },
+      },
+      approvalMode: "defer",
+      toolName: "projects_write",
+      baseParams: { field: "status" },
+    });
+    if (!outcome || outcome.blocked || !outcome.deferredApproval) {
+      throw new Error("expected deferred approval outcome");
+    }
+    return outcome.deferredApproval;
+  }
+
+  it("runs a synchronous deferred cancellation callback inline", async () => {
+    const order: string[] = [];
+    const deferred = await deferWith((resolution) => {
+      order.push(`callback:${resolution}`);
+    });
+    cancelDeferredPluginToolApproval(deferred);
+    order.push("after-cancel");
+    expect(order).toEqual(["callback:cancelled", "after-cancel"]);
+  });
+
+  it("contains deferred cancellation callback failures without delaying them", async () => {
+    const order: string[] = [];
+    const throwing = await deferWith(() => {
+      order.push("throwing");
+      throw new Error("Synthetic cancel throw");
+    });
+    const rejecting = await deferWith(() => {
+      order.push("rejecting");
+      return Promise.reject(new Error("Synthetic cancel reject"));
+    });
+    expect(() => cancelDeferredPluginToolApproval(throwing)).not.toThrow();
+    expect(() => cancelDeferredPluginToolApproval(rejecting)).not.toThrow();
+    expect(order).toEqual(["throwing", "rejecting"]);
+    await vi.waitFor(() => {
+      expect(agentToolsWarnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Synthetic cancel throw"),
+      );
+      expect(agentToolsWarnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Synthetic cancel reject"),
+      );
+    });
   });
 });

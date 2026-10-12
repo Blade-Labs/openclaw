@@ -195,9 +195,13 @@ async function notifyPluginApprovalResolution(
     // Late rejection after the race is decided must not surface as unhandled.
     completion.catch(() => {});
     await Promise.race([completion, stopped]);
-    signal?.throwIfAborted();
-    if (Date.now() >= deadlineMs) {
-      throw new Error("approval timeout expired");
+    // Only an authorizing callback must still be current after it settles; a
+    // terminal notification that completed in time leaves the closed outcome as is.
+    if (permitsDispatch) {
+      signal?.throwIfAborted();
+      if (Date.now() >= deadlineMs) {
+        throw new Error("approval timeout expired");
+      }
     }
   } catch (error) {
     throw new PluginApprovalResolutionError(formatErrorMessage(error), error);

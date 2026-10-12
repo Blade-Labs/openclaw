@@ -67,6 +67,31 @@ describe("exec approval card", () => {
     expect(card?.classList.contains(`exec-approval-card--severity-${expected}`)).toBe(true);
   });
 
+  it.each(["inline", "modal"] as const)(
+    "offers only Deny for a plugin request without a canonical choice (%s)",
+    (variant) => {
+      const request = parseApprovalRequestedEvent("plugin.approval.requested", {
+        id: "plugin-noncanonical",
+        request: {
+          title: "Scoped write",
+          description: "Update one project field",
+          allowedDecisions: ["allow-15m", "allow-session"],
+        },
+        createdAtMs: 1,
+        expiresAtMs: 61_000,
+      });
+      if (!request) {
+        throw new Error("Plugin approval event was not parsed");
+      }
+      const card = renderCard(request, variant);
+      const labels = [...(card?.querySelectorAll("button") ?? [])]
+        .map((button) => button.textContent?.trim() ?? "")
+        .filter((label) => /allow|deny/i.test(label));
+      expect(labels.length).toBeGreaterThan(0);
+      expect(labels.every((label) => /deny/i.test(label))).toBe(true);
+    },
+  );
+
   it("always gives exec approvals the warning accent", () => {
     const card = renderCard(
       approval({

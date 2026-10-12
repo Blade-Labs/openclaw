@@ -145,6 +145,19 @@ describe("parsePluginApprovalRequested", () => {
     expect(legacy?.request.allowedDecisions).toEqual(["allow-once", "allow-always", "deny"]);
   });
 
+  it.each([
+    ["only scoped choices", ["allow-15m", "allow-session"]],
+    ["unknown choices", ["approve", "yes"]],
+    ["an empty list", []],
+  ])("offers only deny when a plugin decision list has %s", (_name, allowedDecisions) => {
+    const parsed = parsePluginApprovalRequested({
+      ...validPayload,
+      request: { ...validPayload.request, allowedDecisions },
+    });
+    // A non-empty list keeps the card from substituting its exec defaults.
+    expect(parsed?.request.allowedDecisions).toEqual(["deny"]);
+  });
+
   it("returns null when title is missing from request", () => {
     const {
       request: { title: _, ...restRequest },

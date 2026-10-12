@@ -1240,6 +1240,61 @@ describe("before_tool_call resolution callback failures by transport", () => {
     }
   });
 
+  it.for(["deny", "timeout"] as const)(
+    "reports a terminal %s even when its callback settles past the deadline",
+    async (decision) => {
+      setEmbeddedMode(true);
+      const broker = new EmbeddedPluginApprovalBroker();
+      setEmbeddedPluginApprovalBroker(broker);
+      const parked = createDeferredCore();
+      const request = broker.request.bind(broker);
+      vi.spyOn(broker, "request").mockImplementation((args) => {
+        const pending = request(args);
+        parked.resolve();
+        return pending;
+      });
+      // Only the clock is virtual: the callback moves it past its deadline while
+      // the real bounding timer has not fired.
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const onResolution = vi.fn(async (_resolution: PluginApprovalResolution) => {
+        vi.setSystemTime(Date.now() + 120_000);
+      });
+      const outcome = resolveBeforeToolCallApprovalOutcome({
+        result: {
+          requireApproval: {
+            pluginId: "synthetic-policy",
+            title: "Synthetic",
+            description: "Exact write",
+            timeoutMs: decision === "timeout" ? 20 : 60_000,
+            onResolution,
+          },
+        },
+        approvalMode: "request",
+        toolName: "projects_write",
+        baseParams: { field: "status" },
+      });
+      await parked.promise;
+      if (decision === "deny") {
+        const pending = expectDefined(broker.listPending()[0], "embedded pending approval");
+        expect(broker.resolve(pending.id, "deny")).toBe(true);
+      }
+      const result = await outcome;
+      expect(onResolution).toHaveBeenCalledOnce();
+      expect(onResolution.mock.calls[0]?.[0]).toBe(
+        decision === "deny" ? PluginApprovalResolutions.DENY : PluginApprovalResolutions.TIMEOUT,
+      );
+      expect(result).toMatchObject({ blocked: true, deniedReason: "plugin-approval" });
+      expect(result).not.toMatchObject({
+        reason: expect.stringContaining("resolution callback failed"),
+      });
+      if (decision === "timeout") {
+        expect(result).toMatchObject({ disposition: "timed_out", reason: "Approval timed out" });
+      } else {
+        expect(result).toMatchObject({ reason: expect.stringMatching(/^Denied by user\./) });
+      }
+    },
+  );
+
   async function deferWith(
     onResolution: (resolution: PluginApprovalResolution) => void | Promise<void>,
   ) {

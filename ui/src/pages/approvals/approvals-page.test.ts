@@ -173,7 +173,12 @@ describe("ApprovalsPage", () => {
         decision: "allow-session",
         reason: "user",
       },
-      { ...terminal("requester-gone", 1_000), reason: "requester-unavailable" },
+      {
+        ...terminal("requester-gone", 1_000),
+        status: "denied",
+        decision: "deny",
+        reason: "requester-unavailable",
+      },
     ];
     const request = vi.fn().mockResolvedValueOnce({ items });
     const { page } = createPage(stubGrants(request));

@@ -22,6 +22,7 @@ import { resolveSessionEntryResetFreshness } from "../../config/sessions/entry-f
 import type { ConfigFileSnapshot } from "../../config/types.openclaw.js";
 import { createChannelRuntimeContextRegistry } from "../../plugins/runtime/channel-runtime-contexts.js";
 import { resolveAgentCatalogCreateTarget } from "../../plugins/runtime/runtime-agent-session-catalog.js";
+import { createRuntimeApprovalUX } from "../../plugins/runtime/runtime-approval-ux.js";
 import type { PluginRuntime } from "../../plugins/runtime/types.js";
 import {
   implicitMentionKindWhen,
@@ -481,6 +482,7 @@ export function createPluginRuntimeMock(overrides: PluginRuntimeMockOverrides = 
   const base: PluginRuntime = {
     version: "1.0.0-test",
     ...createPluginModelRuntimeMock({ provider: DEFAULT_PROVIDER, model: DEFAULT_MODEL }),
+    approvalUX: createRuntimeApprovalUX(),
     gateway: {
       isAvailable: vi.fn(async () => false),
       request: vi.fn(),

@@ -112,7 +112,9 @@ export function projectChatApprovalDecisions(value: unknown): ExecApprovalDecisi
     (decision): decision is ExecApprovalDecision =>
       decision === "allow-once" || decision === "deny" || (!scoped && decision === "allow-always"),
   );
-  return decisions.length > 0 ? decisions : undefined;
+  // A listed but non-canonical set must not fall back to the card's exec
+  // defaults (which include Always); the only safe choice left is to deny.
+  return decisions.length > 0 ? decisions : ["deny"];
 }
 
 function parseAllowedDecisions(value: unknown): ExecApprovalDecision[] | undefined {

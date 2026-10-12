@@ -322,10 +322,9 @@ describe("createPluginApprovalHandlers", () => {
           grantEligible: false,
           allowedDecisions: ["allow-once", "deny"],
         });
-        expect(broadcastCall(opts).payload.request.allowedDecisions).toEqual([
-          "allow-once",
-          "deny",
-        ]);
+        expect(
+          requireRecord(broadcastCall(opts).payload.request, "broadcast request").allowedDecisions,
+        ).toEqual(["allow-once", "deny"]);
         const reusable = createMockOptions("plugin.approval.resolve", {
           id,
           decision: "allow-always",

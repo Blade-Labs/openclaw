@@ -226,17 +226,24 @@ describe("runBeforeToolCallHook — embedded mode approvals", () => {
       },
       {
         agentId: undefined,
-        allowedDecisions: undefined,
+        // Ordinary (not grant-eligible) requests are bounded to once/deny.
+        allowedDecisions: ["allow-once", "deny"],
         description: "Test approval request",
+        grantEligible: false,
+        grantScopeSummary: undefined,
         sessionKey: undefined,
         severity: "info",
         timeoutMs: 120_000,
         title: "Needs approval",
         toolCallId: "call-1",
         toolName: "exec",
+        turnSourceAccountId: undefined,
+        turnSourceChannel: undefined,
+        turnSourceThreadId: undefined,
+        turnSourceTo: undefined,
         twoPhase: true,
       },
-      { expectFinal: false },
+      { expectFinal: false, signal: undefined },
     );
     expect(onResolution).toHaveBeenCalledTimes(1);
     expect(onResolution).toHaveBeenCalledWith(PluginApprovalResolutions.CANCELLED);
@@ -358,7 +365,19 @@ describe("runBeforeToolCallHook — embedded mode approvals", () => {
       reason: "Approval timed out",
       params: { command: "ls" },
     });
-    expect(onResolution).toHaveBeenCalledWith(PluginApprovalResolutions.TIMEOUT);
+    // The broker timeout records no resolver, resolution time or terminal reason;
+    // the closed gate is reported as failed before dispatch.
+    expect(onResolution).toHaveBeenCalledExactlyOnceWith(PluginApprovalResolutions.TIMEOUT, {
+      approvalId: expect.stringMatching(/^plugin:/),
+      decision: null,
+      createdAtMs: expect.any(Number),
+      expiresAtMs: expect.any(Number),
+      dispatch: "failed-before-dispatch",
+    });
+    const receipt = onResolution.mock.calls[0]?.[1] as
+      | { createdAtMs: number; expiresAtMs: number }
+      | undefined;
+    expect(receipt && receipt.expiresAtMs - receipt.createdAtMs).toBe(1);
     expect(mockCallGatewayTool).not.toHaveBeenCalled();
   });
 

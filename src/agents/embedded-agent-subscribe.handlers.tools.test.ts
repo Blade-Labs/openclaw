@@ -4615,7 +4615,7 @@ describe("after_tool_call observed execution receipts", () => {
         registry,
         pluginId: "synthetic-policy",
         hookName: "after_tool_call",
-        handler: (event) => {
+        handler: (event: PluginHookAfterToolCallEvent) => {
           seen.resolve(event);
         },
       });

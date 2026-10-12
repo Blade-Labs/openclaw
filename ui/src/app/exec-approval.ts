@@ -98,6 +98,23 @@ function parseCommandSpans(
   return spans.length > 0 ? spans : undefined;
 }
 
+/**
+ * Projects reviewer decisions onto the chat card's choices. Scoped plugin
+ * grants (15 min / session / scoped Always) need the grant summary shown on the
+ * approval page, so a request offering them is bounded to once/deny here.
+ */
+export function projectChatApprovalDecisions(value: unknown): ExecApprovalDecision[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const scoped = value.some((decision) => decision === "allow-15m" || decision === "allow-session");
+  const decisions = value.filter(
+    (decision): decision is ExecApprovalDecision =>
+      decision === "allow-once" || decision === "deny" || (!scoped && decision === "allow-always"),
+  );
+  return decisions.length > 0 ? decisions : undefined;
+}
+
 function parseAllowedDecisions(value: unknown): ExecApprovalDecision[] | undefined {
   if (!Array.isArray(value)) {
     return undefined;
@@ -250,7 +267,7 @@ function parsePluginApprovalRequested(payload: unknown): ExecApprovalRequest | n
       command: title,
       agentId: typeof request.agentId === "string" ? request.agentId : null,
       sessionKey: typeof request.sessionKey === "string" ? request.sessionKey : null,
-      allowedDecisions: parseAllowedDecisions(request.allowedDecisions),
+      allowedDecisions: projectChatApprovalDecisions(request.allowedDecisions),
     },
     pluginTitle: title,
     pluginDescription: description,

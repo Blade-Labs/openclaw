@@ -4,7 +4,7 @@ import {
   SessionApprovalEventSchema,
   SessionApprovalReplaySchema,
 } from "../../../../packages/gateway-protocol/src/index.js";
-import type { ExecApprovalRequest } from "../../app/exec-approval.ts";
+import { projectChatApprovalDecisions, type ExecApprovalRequest } from "../../app/exec-approval.ts";
 import {
   isUiGlobalSessionKey,
   normalizeAgentId,
@@ -40,7 +40,6 @@ function projectPendingApproval(
       command: presentation.kind === "exec" ? presentation.commandText : presentation.title,
       agentId: presentation.agentId ?? null,
       sessionKey,
-      allowedDecisions: presentation.allowedDecisions,
     },
     ...(sourceSessionKey && sourceSessionKey !== sessionKey ? { sourceSessionKey } : {}),
     createdAtMs: approval.createdAtMs,
@@ -53,6 +52,8 @@ function projectPendingApproval(
       request: {
         ...common.request,
         host: presentation.host ?? null,
+        // Exec presentations keep the narrow exec decision contract.
+        allowedDecisions: presentation.allowedDecisions,
       },
     };
   }
@@ -60,6 +61,10 @@ function projectPendingApproval(
     return {
       ...common,
       kind: "plugin",
+      request: {
+        ...common.request,
+        allowedDecisions: projectChatApprovalDecisions(presentation.allowedDecisions),
+      },
       pluginTitle: presentation.title,
       pluginDescription: presentation.description,
       pluginDetail: presentation.detail,
@@ -70,6 +75,7 @@ function projectPendingApproval(
   return {
     ...common,
     kind: "system-agent",
+    request: { ...common.request, allowedDecisions: presentation.allowedDecisions },
     pluginTitle: presentation.title,
     pluginDescription: presentation.description,
     proposalHash: presentation.proposalHash,

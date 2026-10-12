@@ -107,6 +107,10 @@ function decisionLabel(decision: ApprovalDecision | undefined): string {
   switch (decision) {
     case "allow-once":
       return t("approvalHistory.decisions.allowOnce");
+    case "allow-15m":
+      return t("approvalHistory.decisions.allow15Min");
+    case "allow-session":
+      return t("approvalHistory.decisions.allowSession");
     case "allow-always":
       return t("approvalHistory.decisions.allowAlways");
     case "deny":
@@ -127,6 +131,8 @@ function reasonLabel(reason: ApprovalTerminalReason): string {
       return t("approvalHistory.reasons.malformedVerdict");
     case "no-route":
       return t("approvalHistory.reasons.noRoute");
+    case "requester-unavailable":
+      return t("approvalHistory.reasons.requesterUnavailable");
     case "run-aborted":
       return t("approvalHistory.reasons.runAborted");
     case "gateway-restart":

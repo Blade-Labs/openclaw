@@ -64,6 +64,8 @@ export type OpenClawCodingToolsOptions = {
   workspaceDir?: string;
   /** Additional containment for a trusted scheduled workspace; never weakens configured policy. */
   requireWorkspaceOnly?: true;
+  /** Core-owned descriptor shared by a prepared rooted CLI run. */
+  executionRootFiles?: import("./execution-root-files.js").ExecutionRootFiles;
   sessionPermissionPolicy?: PreparedSessionPermissionPolicy;
   abortSignal?: AbortSignal;
   /** Disable hook-owned diagnostics when an outer runtime owns tool diagnostics. */

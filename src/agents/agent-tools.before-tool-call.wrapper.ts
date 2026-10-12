@@ -454,6 +454,7 @@ export function wrapToolWithBeforeToolCallHook(
       let outcome: HookOutcome;
       try {
         outcome = await runBeforeToolCallHook({
+          tool,
           toolName,
           params: hookParams,
           ...hookMetadata,

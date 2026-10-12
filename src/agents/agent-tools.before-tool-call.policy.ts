@@ -32,6 +32,7 @@ import {
   resolveClientVoiceRunBinding,
 } from "../talk/client-voice-session.js";
 import { isPlainObject } from "../utils.js";
+import { getAgentToolExecutionRoot } from "./agent-tool-metadata.js";
 import {
   mergeParamsWithApprovalOverrides,
   resolveBeforeToolCallApprovalOutcome,
@@ -106,6 +107,8 @@ export function consumeFinalClientVoiceToolConfirmation(args: {
 }
 
 export async function runBeforeToolCallHook(input: {
+  /** Selected host tool identity; containment is never inferred from context or name. */
+  tool?: object;
   toolName: string;
   params: unknown;
   toolKind?: PluginHookToolKind;
@@ -116,6 +119,7 @@ export async function runBeforeToolCallHook(input: {
   approvalMode?: "request" | "report" | "deny" | "defer";
 }): Promise<HookOutcome> {
   let args = input;
+  const rooted = input.tool ? getAgentToolExecutionRoot(input.tool) : undefined;
   const source = args.ctx?.readSource?.() ?? args.ctx?.source;
   if (source) {
     const binding = classifyApprovalRequester(source);
@@ -146,6 +150,9 @@ export async function runBeforeToolCallHook(input: {
   };
   let releaseArgumentChurnPolicyWait: (() => void) | undefined;
 
+  // Backend preflight failures are tool errors, not plugin policy failures.
+  const containment = await rooted?.files.prepareContainment();
+  args.signal?.throwIfAborted();
   try {
     if (args.ctx?.sessionKey) {
       if (args.ctx.loopDetection?.enabled === true) {
@@ -230,10 +237,11 @@ export async function runBeforeToolCallHook(input: {
       return withLoopWarning({ blocked: false, params });
     }
     const deriveOptions =
-      args.ctx?.cwd || args.ctx?.sandbox
+      rooted || args.ctx?.cwd || args.ctx?.sandbox
         ? {
-            ...(args.ctx.cwd ? { cwd: args.ctx.cwd } : {}),
-            ...(args.ctx.sandbox ? { sandbox: args.ctx.sandbox } : {}),
+            ...(args.ctx?.cwd ? { cwd: args.ctx.cwd } : {}),
+            ...(rooted ? { resolveInputPath: rooted.resolveInputPath } : {}),
+            ...(!rooted && args.ctx?.sandbox ? { sandbox: args.ctx.sandbox } : {}),
             ...(args.signal ? { signal: args.signal } : {}),
           }
         : undefined;
@@ -249,6 +257,7 @@ export async function runBeforeToolCallHook(input: {
     const buildToolContext = (identity: typeof toolIdentity) => ({
       toolName,
       ...identity,
+      ...containment,
       ...(args.ctx?.agentId && { agentId: args.ctx.agentId }),
       ...(args.ctx?.sessionKey && { sessionKey: args.ctx.sessionKey }),
       ...(args.ctx?.sessionId && { sessionId: args.ctx.sessionId }),

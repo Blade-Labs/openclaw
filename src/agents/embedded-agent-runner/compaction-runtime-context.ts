@@ -360,6 +360,7 @@ export function buildEmbeddedCompactionRuntimeContext(
     permissionMode: params.permissionMode,
     sessionRoot: params.sessionRoot,
     requireWorkspaceOnly: params.requireWorkspaceOnly,
+    executionRootFiles: params.executionRootFiles,
     requireWritableSandbox: params.requireWritableSandbox,
     agentDir: params.agentDir,
     config: params.config,

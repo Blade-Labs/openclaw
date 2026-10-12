@@ -370,8 +370,8 @@ async function startMcpLoopbackServer(
           const cliCaptureHandle = cliCaptureHandles[messageIndex];
           let response: object | null;
           try {
-            const handleRequest = async (signal: AbortSignal) =>
-              await handleMcpJsonRpc({
+            const handleRequest = async (signal: AbortSignal) => {
+              return await handleMcpJsonRpc({
                 message,
                 tools: scopedTools.tools,
                 toolSchema: scopedTools.toolSchema,
@@ -412,6 +412,7 @@ async function startMcpLoopbackServer(
                     }
                   : undefined,
               });
+            };
             const callerIdentity = boundClientGrant
               ? createAdmittedGatewayToolCallerIdentity({
                   admittedRunContext: boundClientGrant.admittedRunContext,

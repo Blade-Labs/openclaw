@@ -1428,7 +1428,10 @@ async function prepareCliRunContextWithinReadFence(
     bootstrapTruncationNotice,
     contextFiles,
   });
-  let cleanupPreparedResources: (() => Promise<void>) | undefined;
+  const rootedFiles = rootedExecution?.executionRootFiles;
+  let cleanupPreparedResources: (() => Promise<void>) | undefined = rootedFiles
+    ? () => rootedFiles.close()
+    : undefined;
   let preparedExecution: PrivateCliBackendPreparedExecution | undefined;
   try {
     const mcpClientGrant =
@@ -1543,15 +1546,19 @@ async function prepareCliRunContextWithinReadFence(
           })()
         : undefined;
     let mcpClientGrantRevoked = false;
-    const cleanupMcpClientGrant = mcpClientGrant
-      ? async () => {
-          if (mcpClientGrantRevoked) {
-            return;
+    const cleanupMcpClientGrant =
+      mcpClientGrant || rootedExecution?.executionRootFiles
+        ? async () => {
+            if (mcpClientGrantRevoked) {
+              return;
+            }
+            mcpClientGrantRevoked = true;
+            if (mcpClientGrant) {
+              prepareDeps.revokeMcpLoopbackClientGrant(mcpClientGrant.token);
+            }
+            await rootedExecution?.executionRootFiles?.close();
           }
-          mcpClientGrantRevoked = true;
-          prepareDeps.revokeMcpLoopbackClientGrant(mcpClientGrant.token);
-        }
-      : undefined;
+        : undefined;
     cleanupPreparedResources = cleanupMcpClientGrant;
     const rawLoopbackServerConfig = mcpLoopbackRuntime
       ? prepareDeps.createMcpLoopbackServerConfig(mcpLoopbackRuntime.port)

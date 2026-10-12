@@ -27,6 +27,7 @@ import {
 } from "../media/media-reference.js";
 import { sniffMimeFromBase64 } from "../media/sniff-mime-from-base64.js";
 import { clampNumber } from "../utils.js";
+import { copyAgentToolMetadata } from "./agent-tool-metadata.js";
 import { captureAgentToolSourceExecutionGuard } from "./agent-tool-source-execution-guard.js";
 import {
   REQUIRED_PARAM_GROUPS,
@@ -37,6 +38,7 @@ import {
   wrapToolParamValidation,
 } from "./agent-tools.params.js";
 import type { AnyAgentTool } from "./agent-tools.types.js";
+import type { ExecutionRootFiles } from "./execution-root-files.js";
 import { writeHostFile } from "./host-file-write.js";
 import type { ImageSanitizationLimits } from "./image-sanitization.js";
 import {
@@ -48,6 +50,7 @@ import type { AgentTool, AgentToolResult } from "./runtime/index.js";
 import { assertSandboxPath, normalizeFileReferencePrefix } from "./sandbox-paths.js";
 import { resolveSandboxFileMutationQueueKey } from "./sandbox/file-mutation-identity.js";
 import type { SandboxFsBridge } from "./sandbox/fs-bridge.js";
+import { withFileMutationQueueKeyResolution } from "./sessions/tools/file-mutation-queue.js";
 import {
   createEditTool,
   createReadTool,
@@ -88,6 +91,7 @@ const MAX_ADAPTIVE_READ_PAGES = 4;
 const ENV_FILE_PATH_RE = /(?:^|[/\\])(?:\.env(?:\.[^/\\]+)?|[^/\\]+\.env)$/i;
 
 type OpenClawReadToolOptions = {
+  executionRootFiles?: ExecutionRootFiles;
   modelContextWindowTokens?: number;
   imageSanitization?: ImageSanitizationLimits;
   cwd?: string;
@@ -659,6 +663,7 @@ function resolveToolPathAgainstWorkspaceRoot(params: {
 }
 
 type MemoryFlushAppendOnlyWriteOptions = {
+  executionRootFiles?: ExecutionRootFiles;
   root: string;
   relativePath: string;
   memoryWriteProvenance?: MemoryWriteProvenanceObserver;
@@ -670,6 +675,7 @@ type MemoryFlushAppendOnlyWriteOptions = {
 };
 
 async function readOptionalUtf8File(params: {
+  executionRootFiles?: ExecutionRootFiles;
   absolutePath: string;
   relativePath: string;
   sandbox?: MemoryFlushAppendOnlyWriteOptions["sandbox"];
@@ -692,6 +698,9 @@ async function readOptionalUtf8File(params: {
       });
       return buffer.toString("utf-8");
     }
+    if (params.executionRootFiles) {
+      return (await params.executionRootFiles.readFile(params.absolutePath)).toString("utf8");
+    }
     return await fs.readFile(params.absolutePath, "utf-8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
@@ -702,6 +711,7 @@ async function readOptionalUtf8File(params: {
 }
 
 async function appendMemoryFlushContent(params: {
+  executionRootFiles?: ExecutionRootFiles;
   absolutePath: string;
   root: string;
   relativePath: string;
@@ -710,6 +720,19 @@ async function appendMemoryFlushContent(params: {
   signal?: AbortSignal;
   assertCurrent: () => void;
 }) {
+  if (params.executionRootFiles) {
+    const existing = await readOptionalUtf8File(params);
+    const separator =
+      existing.length > 0 && !existing.endsWith("\n") && !params.content.startsWith("\n")
+        ? "\n"
+        : "";
+    params.assertCurrent();
+    await params.executionRootFiles.writeFile(
+      params.absolutePath,
+      `${existing}${separator}${params.content}`,
+    );
+    return;
+  }
   if (!params.sandbox) {
     const root = await fsRoot(params.root);
     params.assertCurrent();
@@ -755,20 +778,21 @@ export function wrapToolMemoryFlushAppendOnlyWrite(
   options: MemoryFlushAppendOnlyWriteOptions,
 ): AnyAgentTool {
   const allowedAbsolutePath = path.resolve(options.root, options.relativePath);
-  return {
+  const wrapped = copyAgentToolMetadata(tool, {
     ...tool,
     description: `${tool.description} During memory flush, this tool may only append to ${options.relativePath}.`,
     execute: async (toolCallId, args, signal, onUpdate) => {
       const assertCurrent = captureAgentToolSourceExecutionGuard(signal);
       const record = getToolParamsRecord(args);
-      const normalizedRecord = record
-        ? await normalizeFileToolPathParamsFromKeys(
-            record,
-            ["path"],
-            options.root,
-            options.sandbox?.bridge,
-          )
-        : undefined;
+      const normalizedRecord =
+        record && !options.executionRootFiles
+          ? await normalizeFileToolPathParamsFromKeys(
+              record,
+              ["path"],
+              options.root,
+              options.sandbox?.bridge,
+            )
+          : record;
       assertRequiredParams(normalizedRecord, REQUIRED_PARAM_GROUPS.write, tool.name);
       const filePath =
         typeof normalizedRecord?.path === "string" && normalizedRecord.path.trim()
@@ -779,57 +803,75 @@ export function wrapToolMemoryFlushAppendOnlyWrite(
         return tool.execute(toolCallId, args, signal, onUpdate);
       }
 
-      const resolvedPath = resolveToolPathAgainstWorkspaceRoot({
-        filePath,
-        root: options.root,
-        containerWorkdir: options.containerWorkdir,
-      });
+      const resolvedPath = options.executionRootFiles
+        ? options.executionRootFiles.resolve(filePath, options.root)
+        : resolveToolPathAgainstWorkspaceRoot({
+            filePath,
+            root: options.root,
+            containerWorkdir: options.containerWorkdir,
+          });
       if (filePath.startsWith("@") || resolvedPath !== allowedAbsolutePath) {
         throw new Error(
           `Memory flush writes are restricted to ${options.relativePath}; use that path only.`,
         );
       }
 
-      const contentBefore = await readOptionalUtf8File({
-        absolutePath: allowedAbsolutePath,
-        relativePath: options.relativePath,
-        sandbox: options.sandbox,
-        signal,
-      });
-      const separator =
-        contentBefore.length > 0 && !contentBefore.endsWith("\n") && !content.startsWith("\n")
-          ? "\n"
-          : "";
-      const commit = () =>
-        appendMemoryFlushContent({
+      const append = async (): Promise<AgentToolResult<unknown>> => {
+        const contentBefore = await readOptionalUtf8File({
+          executionRootFiles: options.executionRootFiles,
           absolutePath: allowedAbsolutePath,
-          root: options.root,
           relativePath: options.relativePath,
-          content,
           sandbox: options.sandbox,
           signal,
-          assertCurrent,
         });
-      const memoryWriteProvenance = options.memoryWriteProvenance;
-      if (memoryWriteProvenance && (await memoryWriteProvenance.classifies(allowedAbsolutePath))) {
-        await memoryWriteProvenance.write({
-          absolutePath: allowedAbsolutePath,
-          contentBefore,
-          contentAfter: `${contentBefore}${separator}${content}`,
-          commit,
-        });
-      } else {
-        await commit();
-      }
-      assertCurrent();
-      // This wrapper inherits the write tool's output schema, so report only
-      // the authoritative `changed`; deriving `created` before append is racy.
-      return {
-        content: [{ type: "text", text: `Appended content to ${options.relativePath}.` }],
-        details: { changed: true },
+        const separator =
+          contentBefore.length > 0 && !contentBefore.endsWith("\n") && !content.startsWith("\n")
+            ? "\n"
+            : "";
+        const commit = () =>
+          appendMemoryFlushContent({
+            executionRootFiles: options.executionRootFiles,
+            absolutePath: allowedAbsolutePath,
+            root: options.root,
+            relativePath: options.relativePath,
+            content,
+            sandbox: options.sandbox,
+            signal,
+            assertCurrent,
+          });
+        const memoryWriteProvenance = options.memoryWriteProvenance;
+        if (
+          memoryWriteProvenance &&
+          (await memoryWriteProvenance.classifies(allowedAbsolutePath))
+        ) {
+          await memoryWriteProvenance.write({
+            absolutePath: allowedAbsolutePath,
+            contentBefore,
+            contentAfter: `${contentBefore}${separator}${content}`,
+            commit,
+          });
+        } else {
+          await commit();
+        }
+        assertCurrent();
+        // This wrapper inherits the write tool's output schema, so report only
+        // the authoritative `changed`; deriving `created` before append is racy.
+        return {
+          content: [{ type: "text", text: `Appended content to ${options.relativePath}.` }],
+          details: { changed: true },
+        };
       };
+      return options.executionRootFiles
+        ? withFileMutationQueueKeyResolution(
+            Promise.resolve(options.executionRootFiles.queueKey(allowedAbsolutePath)),
+            append,
+          )
+        : append();
     },
-  };
+  });
+  return options.executionRootFiles
+    ? options.executionRootFiles.bind(wrapped, options.root)
+    : wrapped;
 }
 
 function isSandboxRootEscapeError(error: unknown): error is Error {
@@ -1108,14 +1150,24 @@ export function createOpenClawReadTool(
     ...base,
     execute: async (toolCallId, params, signal) => {
       const record = getToolParamsRecord(params);
-      const normalizedRecord = record
-        ? await normalizeFileToolPathParamsFromKeys(record, ["path"], options?.cwd, options?.bridge)
-        : undefined;
+      const normalizedRecord =
+        record && !options?.executionRootFiles
+          ? await normalizeFileToolPathParamsFromKeys(
+              record,
+              ["path"],
+              options?.cwd,
+              options?.bridge,
+            )
+          : record;
       assertRequiredParams(normalizedRecord, REQUIRED_PARAM_GROUPS.read, base.name);
       const filePath =
         typeof normalizedRecord?.path === "string" ? normalizedRecord.path : "<unknown>";
+      const relativeFilePath =
+        options?.executionRootFiles && path.isAbsolute(filePath)
+          ? path.relative(options.cwd ?? options.executionRootFiles.root, filePath)
+          : filePath;
       const dailyMemoryPath =
-        process.platform === "win32" ? filePath.replace(/\\/g, "/") : filePath;
+        process.platform === "win32" ? relativeFilePath.replace(/\\/g, "/") : relativeFilePath;
       // Daily journals may not exist yet; let the concrete reader own filesystem errors.
       const implicitlyOptional =
         normalizedRecord?.optional === undefined &&

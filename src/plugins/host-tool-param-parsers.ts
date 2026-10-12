@@ -31,6 +31,20 @@ export async function deriveToolParams(
   params: unknown,
   options?: HostToolDerivationOptions,
 ): Promise<HostToolDerivedParams> {
+  if (options?.resolveInputPath && ["read", "ls", "edit", "write"].includes(toolName)) {
+    const record =
+      params !== null && typeof params === "object"
+        ? (params as Record<string, unknown>)
+        : undefined;
+    const input = record?.path ?? (toolName === "ls" ? "." : undefined);
+    if (typeof input !== "string") return {};
+    try {
+      return { derivedPaths: Object.freeze([await options.resolveInputPath(input, options.cwd)]) };
+    } catch {
+      options.signal?.throwIfAborted();
+      return {};
+    }
+  }
   if (toolName !== "apply_patch") {
     return {};
   }

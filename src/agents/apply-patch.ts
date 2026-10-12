@@ -20,6 +20,7 @@ import {
 } from "./apply-patch-file-ops.js";
 import { resolveApplyPatchInputPath, toDisplayPath } from "./apply-patch-paths.js";
 import { applyUpdateHunk } from "./apply-patch-update.js";
+import type { ExecutionRootFiles } from "./execution-root-files.js";
 import type { MemoryWriteProvenanceObserver } from "./memory-write-provenance.js";
 import {
   preserveAtPrefixedRelativePath,
@@ -124,6 +125,7 @@ const ApplyPatchToolOutputSchema = Type.Object(
 /** Create the agent tool wrapper for applying patch-envelope input. */
 export function createApplyPatchTool(
   options: {
+    executionRootFiles?: ExecutionRootFiles;
     cwd?: string;
     root?: string;
     sandbox?: SandboxApplyPatchConfig;
@@ -162,6 +164,7 @@ export function createApplyPatchTool(
         result = await applyPatch(input, {
           cwd,
           root,
+          executionRootFiles: options.executionRootFiles,
           sandbox,
           workspaceOnly,
           memoryWriteProvenance: options.memoryWriteProvenance,
@@ -191,6 +194,14 @@ async function applyPatch(input: string, options: ApplyPatchOptions): Promise<Ap
     throw new Error("No files were modified.");
   }
 
+  if (options.executionRootFiles) {
+    for (const hunk of parsed.hunks) {
+      options.executionRootFiles.resolve(hunk.path, options.cwd);
+      if (hunk.kind === "update" && hunk.movePath) {
+        options.executionRootFiles.resolve(hunk.movePath, options.cwd);
+      }
+    }
+  }
   const patchOptions = {
     ...options,
     patchInputPaths: await resolvePatchInputPaths(parsed.hunks, options),
@@ -344,9 +355,11 @@ async function resolvePatchInputPaths(
     // Resolving after an earlier hunk mutates state can silently retarget later hunks.
     resolved.set(
       rawPath,
-      options.sandbox
-        ? await resolveApplyPatchInputPath(rawPath, options)
-        : preserveAtPrefixedRelativePath(rawPath, options.cwd),
+      options.executionRootFiles
+        ? await options.executionRootFiles.resolveInput(rawPath, options.cwd)
+        : options.sandbox
+          ? await resolveApplyPatchInputPath(rawPath, options)
+          : preserveAtPrefixedRelativePath(rawPath, options.cwd),
     );
   }
   return resolved;
@@ -440,6 +453,17 @@ async function resolvePatchPath(
         signal: options.signal,
       }),
       display: resolved.relativePath || resolved.containerPath,
+    };
+  }
+
+  if (options.executionRootFiles) {
+    const resolved =
+      options.patchInputPaths?.get(rawFilePath) ??
+      (await options.executionRootFiles.resolveInput(rawFilePath, options.cwd));
+    return {
+      resolved,
+      queueKey: options.executionRootFiles.queueKey(resolved),
+      display: toDisplayPath(resolved, options.cwd),
     };
   }
 

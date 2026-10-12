@@ -211,6 +211,7 @@ describe("runCliAgent before_agent_reply seam", () => {
     async (kind) => {
       hasHooksMock.mockImplementation((hookName) => hookName === "before_agent_run");
       runBeforeAgentRunMock.mockResolvedValueOnce({
+        pluginId: "synthetic-policy",
         decision: { outcome: "block", reason: "synthetic hook stop" },
       });
       const inputProvenance = { kind, sourceTool: "synthetic-handoff" };

@@ -300,13 +300,13 @@ describe("MCP HTTP approval authority", () => {
         createGatewayMethodRegistry([
           {
             name: "plugin.approval.request",
-            owner: { kind: "core" },
+            owner: { kind: "core", area: "gateway" },
             scope: "operator.approvals",
             handler: requestApproval,
           },
           {
             name: "plugin.approval.waitDecision",
-            owner: { kind: "core" },
+            owner: { kind: "core", area: "gateway" },
             scope: "operator.approvals",
             handler: waitApproval,
           },
@@ -427,7 +427,7 @@ describe("MCP HTTP approval authority", () => {
         expect(observed, approvalWarnings.join("\n")).toBe("requested");
         expect(execute).not.toHaveBeenCalled();
         expect(requestApproval).toHaveBeenCalledOnce();
-        expect(requestApproval.mock.calls[0][0].params).toMatchObject({
+        expect(requestApproval.mock.calls[0]?.[0].params).toMatchObject({
           sessionKey: "agent:main:scope-proof",
           turnSourceTo: "dm-proof",
         });

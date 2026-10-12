@@ -14,7 +14,7 @@ import { NonEmptyString } from "./primitives.js";
  */
 const MAX_PLUGIN_APPROVAL_TIMEOUT_MS = 600_000;
 const PLUGIN_APPROVAL_TITLE_MAX_LENGTH = 80;
-const PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH = 512;
+const PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH = 4_096;
 
 type SingleTypeSchema = TSchema & { type: string; enum?: readonly (string | null)[] };
 
@@ -59,12 +59,17 @@ export const PluginApprovalRequestParamsSchema = closedObject({
       tool: Type.String({ minLength: 1, pattern: "\\S" }),
     }),
   ),
+  grantEligible: Type.Optional(Type.Boolean()),
+  grantScopeSummary: Type.Optional(Type.String({ minLength: 1, maxLength: 4_096 })),
   allowedDecisions: Type.Optional(
     nullableMetadata(
-      Type.Array(Type.String({ enum: ["allow-once", "allow-always", "deny"] }), {
-        minItems: 1,
-        maxItems: 3,
-      }),
+      Type.Array(
+        Type.String({ enum: ["allow-once", "allow-15m", "allow-session", "allow-always", "deny"] }),
+        {
+          minItems: 1,
+          maxItems: 5,
+        },
+      ),
     ),
   ),
   agentId: Type.Optional(nullableMetadata(Type.String())),

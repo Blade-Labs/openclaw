@@ -10,6 +10,7 @@ import { isAutomationsToolName } from "../agents/tools/automations-tool-name.js"
 import {
   createAdmittedGatewayToolCallerIdentity,
   withGatewayToolCallerIdentity,
+  withoutGatewayToolCallerIdentity,
 } from "../agents/tools/gateway-caller-context.js";
 import { getRuntimeConfig } from "../config/io.js";
 import { resolveSessionEntryAccessTarget } from "../config/sessions/session-accessor.js";
@@ -21,6 +22,13 @@ import {
   sendHttpRequestRejection,
 } from "../infra/http-request-lifecycle.js";
 import { logDebug, logWarn } from "../logger.js";
+import {
+  getCanonicalGatewayContextResolver,
+  getGatewayContextResolver,
+  getPluginRuntimeGatewayRequestScope,
+  withPluginRuntimeGatewayContextResolver,
+  withPluginRuntimeGatewayRequestScope,
+} from "../plugins/runtime/gateway-request-scope.js";
 import { runOutsidePluginRuntimeGenerationScope } from "../plugins/runtime/generation-scope.js";
 import { runOutsideGatewayRootWorkAdmission } from "../process/gateway-work-admission.js";
 import {
@@ -158,11 +166,19 @@ async function startMcpLoopbackServer(
   port: number,
   work: AsyncWorkScope,
 ): Promise<() => Promise<void>> {
+  const resolveListenerGateway = getPluginRuntimeGatewayRequestScope()?.resolveGatewayContext;
+  const listenerGateway = resolveListenerGateway?.();
   // Shutdown preloads this module even when no MCP listener is needed.
   const [{ handleMcpJsonRpc }, { McpLoopbackToolCache }] = await Promise.all([
     import("./mcp-http.handlers.js"),
     import("./mcp-http.runtime.js"),
   ]);
+  if (
+    resolveListenerGateway &&
+    (!listenerGateway || resolveListenerGateway() !== listenerGateway)
+  ) {
+    throw new Error("The admitting Gateway is no longer available; no MCP listener was started.");
+  }
   const ownerToken = crypto.randomBytes(32).toString("hex");
   const nonOwnerToken = crypto.randomBytes(32).toString("hex");
   const toolCache = new McpLoopbackToolCache();
@@ -209,7 +225,37 @@ async function startMcpLoopbackServer(
     const cliCaptureKey = resolveMcpCliCaptureKey(req, auth);
     const cliRequestCaptureHandle = markMcpLoopbackRequestStarted(cliCaptureKey);
     const requestAbort = createHttpRequestAbortSignal(req, res);
-    void work.track(async () => {
+    const boundGrant = auth.boundClientGrant;
+    const resolveRequestGateway = boundGrant
+      ? getGatewayContextResolver(boundGrant.admittedRunContext)
+      : resolveListenerGateway;
+    let admittedGateway: ReturnType<NonNullable<typeof resolveRequestGateway>>;
+    try {
+      admittedGateway = resolveRequestGateway?.();
+    } catch {
+      requestAbort.cleanup();
+      markMcpLoopbackRequestFinished(cliRequestCaptureHandle);
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "unauthorized" }));
+      return;
+    }
+    const authorizeRequest = () => {
+      try {
+        return (
+          !work.isClosing &&
+          !requestAbort.signal.aborted &&
+          getActiveMcpLoopbackRuntime()?.ownerToken === ownerToken &&
+          (boundGrant?.isCurrent() ?? true) &&
+          (!resolveRequestGateway ||
+            (admittedGateway !== undefined && resolveRequestGateway() === admittedGateway)) &&
+          (!resolveListenerGateway ||
+            (resolveListenerGateway() === listenerGateway && admittedGateway === listenerGateway))
+        );
+      } catch {
+        return false;
+      }
+    };
+    const handleRequest = async () => {
       let parsed: unknown;
       let stopKeepalive: (() => void) | undefined;
       let cliCaptureHandles: Array<ReturnType<typeof markMcpLoopbackToolCallStarted>> = [];
@@ -258,10 +304,12 @@ async function startMcpLoopbackServer(
         }
         const cfg = getRuntimeConfig();
         const requestContext = resolveMcpRequestContext(req, cfg, auth);
-        const authorizeToolCall = () =>
-          !work.isClosing &&
-          getActiveMcpLoopbackRuntime()?.ownerToken === ownerToken &&
-          (boundClientGrant?.isCurrent() ?? true);
+        const authorizeToolCall = authorizeRequest;
+        if (!authorizeToolCall()) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "unauthorized" }));
+          return;
+        }
         const harnessEntry = isAgentHarnessSessionKey(requestContext.sessionKey)
           ? resolveSessionEntryAccessTarget({ cfg, sessionKey: requestContext.sessionKey }).entry
           : undefined;
@@ -323,7 +371,7 @@ async function startMcpLoopbackServer(
 
         // Discovery may outlive the requesting connection or grant.
         requestAbort.signal.throwIfAborted();
-        if (boundClientGrant && !boundClientGrant.isCurrent()) {
+        if (!authorizeToolCall()) {
           res.writeHead(401, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "unauthorized" }));
           return;
@@ -415,7 +463,8 @@ async function startMcpLoopbackServer(
             const callerIdentity = boundClientGrant
               ? createAdmittedGatewayToolCallerIdentity({
                   admittedRunContext: boundClientGrant.admittedRunContext,
-                  receiptAuthority: boundClientGrant.isCurrent,
+                  receiptAuthority: authorizeToolCall,
+                  approvalSignals: [requestAbort.signal],
                   cronAuthorityCheck: boundClientGrant.cronAuthorityCheck,
                   mintCronRequesterGrant: boundClientGrant.mintCronRequesterGrant,
                   agentId: scopedTools.agentId,
@@ -523,7 +572,16 @@ async function startMcpLoopbackServer(
         }
         markMcpLoopbackRequestFinished(cliRequestCaptureHandle);
       }
-    });
+    };
+    void withPluginRuntimeGatewayRequestScope(
+      {
+        resolveGatewayContext: resolveRequestGateway,
+        isWebchatConnect: () => false,
+        signal: requestAbort.signal,
+        hasCurrentClientAuthority: authorizeRequest,
+      },
+      () => work.track(handleRequest),
+    );
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -575,8 +633,23 @@ export async function ensureMcpLoopbackServer(port = 0): Promise<void> {
     // The listener owns its context until Gateway close; callers own only requests.
     // The first turn's work and plugin generation can retire before later requests.
     const work = new AsyncWorkScope();
-    activeMcpLoopbackServerPromise = runOutsidePluginRuntimeGenerationScope(() =>
-      runOutsideGatewayRootWorkAdmission(() => work.run(() => startMcpLoopbackServer(port, work))),
+    const creatorScope = getPluginRuntimeGatewayRequestScope();
+    const creatorResolver =
+      creatorScope?.resolveGatewayContext ?? creatorScope?.context?.resolveGatewayContext;
+    const ownedResolver = creatorResolver
+      ? getCanonicalGatewayContextResolver(creatorResolver)
+      : undefined;
+    activeMcpLoopbackServerPromise = withoutGatewayToolCallerIdentity(() =>
+      withPluginRuntimeGatewayContextResolver(
+        ownedResolver,
+        () =>
+          runOutsidePluginRuntimeGenerationScope(() =>
+            runOutsideGatewayRootWorkAdmission(() =>
+              work.run(() => startMcpLoopbackServer(port, work)),
+            ),
+          ),
+        { inheritRequestScope: false },
+      ),
     )
       .then((close) => {
         closeActiveMcpLoopbackServer = close;

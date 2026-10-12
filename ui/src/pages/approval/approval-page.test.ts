@@ -393,6 +393,27 @@ describe("ApprovalPage", () => {
     expect(page.querySelectorAll("[data-decision]")).toHaveLength(0);
   });
 
+  it("labels the server-offered scoped plugin decisions", async () => {
+    const approval: PendingApprovalSnapshot = {
+      ...pendingApproval(),
+      presentation: {
+        kind: "plugin",
+        title: "Scoped project fields",
+        description: "Known exact writes",
+        severity: "warning",
+        grantEligible: true,
+        grantScopeSummary: "Project 4 approved fields; later values may differ.",
+        allowedDecisions: ["allow-once", "allow-15m", "allow-session", "allow-always", "deny"],
+      },
+    };
+    const request = vi.fn(async () => ({ approval }));
+    const { page } = createPage({ client: { request } as unknown as GatewayBrowserClient });
+    await settle(page);
+    expect(
+      [...page.querySelectorAll("[data-decision]")].map((button) => button.textContent?.trim()),
+    ).toEqual(["Allow once", "Allow 15 min", "Allow for this session", "Always allow", "Deny"]);
+  });
+
   it("loads a durable approval and sends a kind-bound resolution", async () => {
     const pending = pendingApproval();
     const terminal = allowedApproval();

@@ -88,7 +88,13 @@ type ApprovalResolveParamsValidator<TParams extends ApprovalResolveParams> = ((
 };
 
 function isApprovalDecision(value: string): value is ExecApprovalDecision {
-  return value === "allow-once" || value === "allow-always" || value === "deny";
+  return (
+    value === "allow-once" ||
+    value === "allow-15m" ||
+    value === "allow-session" ||
+    value === "allow-always" ||
+    value === "deny"
+  );
 }
 
 /** Binds the current gateway client identity onto a newly-created approval record. */
@@ -253,7 +259,11 @@ export function resolveApprovalDecisionParams<TParams extends ApprovalResolvePar
   if (!assertValidParams(rawParams, params.validate, params.methodName, params.respond)) {
     return null;
   }
-  if (!isApprovalDecision(rawParams.decision)) {
+  if (
+    !isApprovalDecision(rawParams.decision) ||
+    (params.methodName !== "plugin.approval.resolve" &&
+      (rawParams.decision === "allow-15m" || rawParams.decision === "allow-session"))
+  ) {
     params.respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "invalid decision"));
     return null;
   }

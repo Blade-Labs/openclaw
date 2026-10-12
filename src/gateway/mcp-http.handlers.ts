@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import { ContentBlockSchema, type ContentBlock } from "@modelcontextprotocol/sdk/types.js";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { runBeforeToolCallHook, type HookContext } from "../agents/agent-tools.before-tool-call.js";
+import { redeemApprovalExecutions } from "../agents/approval-execution.js";
 import { extractToolErrorMessage } from "../agents/embedded-agent-tool-results.js";
 import { runAgentHarnessAfterToolCallHook } from "../agents/harness/hook-helpers.js";
 import { copyInternalToolResultState } from "../agents/runtime/internal-hooks.js";
@@ -170,6 +171,17 @@ export async function handleMcpJsonRpc(params: {
           // Observability callbacks must never alter the tool result returned to the MCP client.
         }
       };
+      const rejectExpiredAuthorization = () => {
+        reportToolCallResult(
+          { outcome: "blocked", deniedReason: "client-grant-revoked" },
+          undefined,
+          "Tool call authorization expired",
+        );
+        return jsonRpcResult(id, {
+          content: [{ type: "text", text: "Tool call authorization expired" }],
+          isError: true,
+        });
+      };
       try {
         const preparedToolArgs = tool.prepareBeforeToolCallParams
           ? await tool.prepareBeforeToolCallParams(toolArgs, {
@@ -179,6 +191,10 @@ export async function handleMcpJsonRpc(params: {
             })
           : toolArgs;
         executedToolArgs = preparedToolArgs as Record<string, unknown>;
+        params.signal?.throwIfAborted();
+        if (params.authorizeToolCall && !params.authorizeToolCall()) {
+          return rejectExpiredAuthorization();
+        }
         // Gateway before-tool hooks still run for loopback MCP calls so policy
         // and audit behavior matches native tool calls from normal chat runs.
         // Preserve prepared params so exec can restore private workdir/env state after hooks.
@@ -215,19 +231,16 @@ export async function handleMcpJsonRpc(params: {
         } catch {
           // Observability callbacks must never alter the tool result returned to the MCP client.
         }
+        const assertApprovalCurrent = await redeemApprovalExecutions(
+          hookResult.approvalExecutions ?? [],
+        );
+        params.signal?.throwIfAborted();
         if (params.authorizeToolCall && !params.authorizeToolCall()) {
-          reportToolCallResult(
-            { outcome: "blocked", deniedReason: "client-grant-revoked" },
-            undefined,
-            "Tool call authorization expired",
-          );
-          return jsonRpcResult(id, {
-            content: [{ type: "text", text: "Tool call authorization expired" }],
-            isError: true,
-          });
+          return rejectExpiredAuthorization();
         }
         let result: Awaited<ReturnType<typeof tool.execute>>;
         try {
+          assertApprovalCurrent();
           result = await tool.execute(toolCallId, finalizedToolArgs, params.signal);
         } catch (error) {
           throw tool.resultContentSource === "network"

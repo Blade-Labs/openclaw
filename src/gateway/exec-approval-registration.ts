@@ -93,7 +93,10 @@ export function prepareExecApprovalPresentation(
   const normalized: ExecApprovalDecision[] = [];
   for (const decision of decisions ?? ["allow-once", "allow-always", "deny"]) {
     if (
-      (decision === "allow-once" || decision === "allow-always" || decision === "deny") &&
+      (decision === "allow-once" ||
+        decision === "allow-always" ||
+        decision === "deny" ||
+        (kind === "plugin" && (decision === "allow-15m" || decision === "allow-session"))) &&
       !normalized.includes(decision)
     ) {
       normalized.push(decision);

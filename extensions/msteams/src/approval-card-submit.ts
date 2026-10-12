@@ -136,13 +136,6 @@ export async function maybeHandleMSTeamsApprovalCardSubmit(params: {
             accountId: DEFAULT_ACCOUNT_ID,
             senderId,
           });
-    const { editAdaptiveCardMSTeams } = await loadCardTransport();
-    await editAdaptiveCardMSTeams({
-      cfg: deps.cfg,
-      to: `conversation:${consumed.conversationId}`,
-      activityId: consumed.activityId,
-      card: buildMSTeamsCanonicalApprovalTerminalCard(result),
-    });
     return result;
   });
   if (outcome.kind !== "settled") {
@@ -164,5 +157,22 @@ export async function maybeHandleMSTeamsApprovalCardSubmit(params: {
     status: result.approval.status,
     senderId,
   });
+  try {
+    const { editAdaptiveCardMSTeams } = await loadCardTransport();
+    await editAdaptiveCardMSTeams({
+      cfg: deps.cfg,
+      to: `conversation:${consumed.conversationId}`,
+      activityId: consumed.activityId,
+      card: buildMSTeamsCanonicalApprovalTerminalCard(result),
+    });
+  } catch (error) {
+    deps.log.error("msteams approval resolved; display update failed", {
+      approvalId: consumed.approvalId,
+      approvalKind: consumed.approvalKind,
+      status: result.approval.status,
+      error: String(error),
+    });
+  }
+
   return true;
 }

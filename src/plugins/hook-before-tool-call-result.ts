@@ -1,7 +1,11 @@
+import type { ApprovalWaitDecisionResult } from "../infra/approval-requester-binding.js";
 import type { ApprovalScope } from "../infra/approval-scope.js";
+import type { ExecApprovalDecision } from "../infra/exec-approvals-core.js";
 
 export const PluginApprovalResolutions = {
   ALLOW_ONCE: "allow-once",
+  ALLOW_15M: "allow-15m",
+  ALLOW_SESSION: "allow-session",
   ALLOW_ALWAYS: "allow-always",
   DENY: "deny",
   TIMEOUT: "timeout",
@@ -10,6 +14,11 @@ export const PluginApprovalResolutions = {
 
 export type PluginApprovalResolution =
   (typeof PluginApprovalResolutions)[keyof typeof PluginApprovalResolutions];
+
+/** Host-provided decision evidence; does not prove the tool completed. */
+export type PluginApprovalReceipt = Omit<ApprovalWaitDecisionResult, "id" | "authorization"> & {
+  approvalId: string;
+};
 
 export type PluginHookBeforeToolCallResult = {
   params?: Record<string, unknown>;
@@ -28,8 +37,15 @@ export type PluginHookBeforeToolCallResult = {
     timeoutBehavior?: "allow" | "deny";
     /** Override timeout text and return the timeout as a blocked tool result. */
     timeoutReason?: string;
-    allowedDecisions?: Array<"allow-once" | "allow-always" | "deny">;
+    allowedDecisions?: ExecApprovalDecision[];
+    /** Policy owns creating and matching grants; the host only carries the chosen decision. */
+    grantEligible?: boolean;
+    /** Reviewer-safe description of the exact delegation and permitted future changes. */
+    grantScopeSummary?: string;
     pluginId?: string;
-    onResolution?: (decision: PluginApprovalResolution) => Promise<void> | void;
+    onResolution?: (
+      decision: PluginApprovalResolution,
+      receipt?: PluginApprovalReceipt,
+    ) => Promise<void> | void;
   };
 };

@@ -9794,6 +9794,8 @@ extension NodeAppModel {
 
     private static func execApprovalVerdict(for decision: ApprovalDecision) -> ExecApprovalTerminalVerdict {
         switch decision {
+        case .allow15m, .allowSession:
+            .resolvedUnknown
         case .allowOnce:
             .allowOnce
         case .allowAlways:

@@ -1,4 +1,5 @@
 import type { ExecApprovalDecision, ExecApprovalRequestPayload } from "../infra/exec-approvals.js";
+import { isScopedPluginGrantApproval } from "../infra/plugin-approvals.js";
 import { getAsyncWorkSignal } from "../shared/async-work-scope.js";
 import { isApprovalRequesterPolicyError } from "./approval-requester-policy.js";
 import {
@@ -100,7 +101,7 @@ export class ExecApprovalManager<
         this.approvalKind,
         record.request,
         record.authorization?.policy.requireResolverMatch
-          ? ["allow-once", "deny"]
+          ? record.authorization.policy.allowedDecisions
           : this.options.resolveAllowedDecisions?.(record.request),
       );
       const existing = this.pending.get(record.id);
@@ -673,7 +674,17 @@ export class ExecApprovalManager<
   ): Promise<boolean> {
     // Retirement preserves consumption only inside an already-owned genuine handoff.
     const entry = this.pending.get(recordId);
-    if (!this.canUseRetainedBinding() || !entry || entry.record.decision !== "allow-once") {
+    if (
+      !this.canUseRetainedBinding() ||
+      !entry ||
+      (entry.record.decision !== "allow-once" &&
+        !(
+          this.approvalKind === "plugin" &&
+          isScopedPluginGrantApproval(entry.record.request) &&
+          entry.record.decision &&
+          entry.record.decision !== "deny"
+        ))
+    ) {
       return false;
     }
     return this.trackMutation(

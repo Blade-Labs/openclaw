@@ -52,6 +52,10 @@ function decisionLabel(decision: ApprovalDecision): string {
   switch (decision) {
     case "allow-once":
       return t("execApproval.allowOnce");
+    case "allow-15m":
+      return t("execApproval.allow15Min");
+    case "allow-session":
+      return t("execApproval.allowSession");
     case "allow-always":
       return t("execApproval.alwaysAllow");
     case "deny":

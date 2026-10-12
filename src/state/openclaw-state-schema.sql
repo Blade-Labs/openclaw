@@ -439,7 +439,7 @@ CREATE TABLE IF NOT EXISTS operator_approvals (
   created_at_ms INTEGER NOT NULL,
   expires_at_ms INTEGER NOT NULL,
   updated_at_ms INTEGER NOT NULL,
-  decision TEXT CHECK (decision IN ('allow-once', 'allow-always', 'deny')),
+  decision TEXT CHECK (decision IN ('allow-once', 'allow-15m', 'allow-session', 'allow-always', 'deny')),
   terminal_reason TEXT CHECK (
     terminal_reason IN (
       'user',
@@ -463,6 +463,7 @@ CREATE TABLE IF NOT EXISTS operator_approvals (
   CHECK (consumed_at_ms IS NULL OR consumed_at_ms >= resolved_at_ms),
   CHECK (consumed_at_ms IS NULL OR consumed_at_ms <= updated_at_ms),
   CHECK (requested_by_device_token_auth IN (0, 1)),
+  CHECK (kind = 'plugin' OR decision NOT IN ('allow-15m', 'allow-session')),
   CHECK (
     (
       status = 'pending'
@@ -476,7 +477,7 @@ CREATE TABLE IF NOT EXISTS operator_approvals (
     )
     OR (
       status = 'allowed'
-      AND decision IN ('allow-once', 'allow-always')
+      AND decision IN ('allow-once', 'allow-15m', 'allow-session', 'allow-always')
       AND terminal_reason = 'user'
       AND resolved_at_ms IS NOT NULL
       AND resolver_kind IS NOT NULL
@@ -513,7 +514,7 @@ CREATE TABLE IF NOT EXISTS operator_approvals (
     (consumed_at_ms IS NULL AND consumed_by IS NULL)
     OR (
       status = 'allowed'
-      AND decision = 'allow-once'
+      AND (decision = 'allow-once' OR kind = 'plugin')
       AND consumed_at_ms IS NOT NULL
       AND consumed_by IS NOT NULL
     )

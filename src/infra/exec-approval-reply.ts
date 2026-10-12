@@ -148,6 +148,7 @@ type BuildExecApprovalActionDescriptorsParams = {
 function buildApprovalActionDescriptors(
   approvalCommandId: string,
   allowedDecisions: readonly ExecApprovalReplyDecision[],
+  approvalKind?: ChannelApprovalKind,
 ): ExecApprovalActionDescriptor[] {
   const descriptors: ExecApprovalActionDescriptor[] = [];
   const buildDescriptor = (descriptor: {
@@ -167,16 +168,24 @@ function buildApprovalActionDescriptors(
     descriptors.push(
       buildDescriptor({
         decision: "allow-once",
-        label: "Allow Once",
+        label: approvalKind === "plugin" ? "Allow once" : "Allow Once",
         style: "success",
       }),
     );
+  }
+  for (const [decision, label] of [
+    ["allow-15m", "Allow 15 min"],
+    ["allow-session", "Allow for this session"],
+  ] as const) {
+    if (allowedDecisions.includes(decision)) {
+      descriptors.push(buildDescriptor({ decision, label, style: "primary" }));
+    }
   }
   if (allowedDecisions.includes("allow-always")) {
     descriptors.push(
       buildDescriptor({
         decision: "allow-always",
-        label: "Allow Always",
+        label: approvalKind === "plugin" ? "Always" : "Allow Always",
         style: "primary",
       }),
     );
@@ -212,22 +221,24 @@ export function buildTypedApprovalActionDescriptors(
   if (!isWellFormedApprovalId(approvalId)) {
     return [];
   }
-  return buildApprovalActionDescriptors(approvalId, resolveAllowedDecisions(params)).map(
-    (descriptor) => {
-      return {
+  return buildApprovalActionDescriptors(
+    approvalId,
+    resolveAllowedDecisions(params),
+    params.approvalKind,
+  ).map((descriptor) => {
+    return {
+      decision: descriptor.decision,
+      label: descriptor.label,
+      style: descriptor.style,
+      command: descriptor.command,
+      action: {
+        type: "approval",
+        approvalId,
+        approvalKind: params.approvalKind,
         decision: descriptor.decision,
-        label: descriptor.label,
-        style: descriptor.style,
-        command: descriptor.command,
-        action: {
-          type: "approval",
-          approvalId,
-          approvalKind: params.approvalKind,
-          decision: descriptor.decision,
-        },
-      };
-    },
-  );
+      },
+    };
+  });
 }
 
 function buildApprovalPresentationButtons(
@@ -323,17 +334,23 @@ export function parseExecApprovalCommandText(
 ): { approvalId: string; decision: ExecApprovalReplyDecision } | null {
   const trimmed = raw.trim();
   const match = trimmed.match(
-    /^\/?approve(?:@[^\s]+)?\s+([A-Za-z0-9][A-Za-z0-9._:-]*)\s+(allow-once|allow-always|always|deny)\b/i,
+    /^\/?approve(?:@[^\s]+)?\s+([A-Za-z0-9][A-Za-z0-9._:-]*)\s+(allow-once|allow-15m|allow-session|allow-always|always|deny)\b/i,
   );
   if (!match) {
     return null;
   }
   const rawDecision = normalizeOptionalLowercaseString(match[2]) ?? "";
-  return {
-    approvalId: expectDefined(match[1], "exec approval reply regex capture 1"),
-    decision:
-      rawDecision === "always" ? "allow-always" : (rawDecision as ExecApprovalReplyDecision),
-  };
+  const decision = rawDecision === "always" ? "allow-always" : rawDecision;
+  if (
+    decision !== "allow-once" &&
+    decision !== "allow-15m" &&
+    decision !== "allow-session" &&
+    decision !== "allow-always" &&
+    decision !== "deny"
+  ) {
+    return null;
+  }
+  return { approvalId: expectDefined(match[1], "exec approval reply regex capture 1"), decision };
 }
 
 export function formatExecApprovalExpiresIn(expiresAtMs: number, nowMs: number): string {
@@ -379,7 +396,10 @@ export function getExecApprovalReplyMetadata(
   const allowedDecisions = Array.isArray(record.allowedDecisions)
     ? record.allowedDecisions.filter(
         (value): value is ExecApprovalReplyDecision =>
-          value === "allow-once" || value === "allow-always" || value === "deny",
+          value === "allow-once" ||
+          value === "allow-always" ||
+          value === "deny" ||
+          (approvalKind === "plugin" && (value === "allow-15m" || value === "allow-session")),
       )
     : undefined;
   const agentId = normalizeOptionalString(record.agentId);

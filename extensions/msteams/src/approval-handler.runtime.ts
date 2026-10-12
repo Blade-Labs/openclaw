@@ -116,13 +116,22 @@ export const msTeamsApprovalNativeRuntime = createChannelApprovalNativeRuntimeAd
         ...(requesterOnly ? { requesterOnly: true } : {}),
       };
     },
-    updateEntry: async ({ cfg, entry, payload }) => {
-      await editAdaptiveCardMSTeams({
-        cfg,
-        to: `conversation:${entry.conversationId}`,
-        activityId: entry.activityId,
-        card: payload,
-      });
+    updateEntry: async ({ cfg, entry, payload, phase, request }) => {
+      try {
+        await editAdaptiveCardMSTeams({
+          cfg,
+          to: `conversation:${entry.conversationId}`,
+          activityId: entry.activityId,
+          card: payload,
+        });
+      } catch (error) {
+        if (phase === "resolved") {
+          log.error(
+            `msteams approval ${request.id}: resolved; display update failed: ${String(error)}`,
+          );
+        }
+        throw error;
+      }
     },
   },
   interactions: {

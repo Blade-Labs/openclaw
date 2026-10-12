@@ -32,7 +32,11 @@ export function assertApprovalRequesterPolicy(
     );
   }
   if (
-    decision === "allow-always" ||
+    (decision !== "allow-once" &&
+      decision !== "deny" &&
+      !authorization?.policy.requireResolverMatch) ||
+    (authorization?.policy.requireResolverMatch &&
+      !authorization.policy.allowedDecisions.includes(decision)) ||
     actor?.kind !== "channel" ||
     actor.actorKind !== "human" ||
     actor.channel !== binding.channel ||

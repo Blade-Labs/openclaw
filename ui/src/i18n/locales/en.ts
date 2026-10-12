@@ -1786,6 +1786,8 @@ export const en: TranslationMap & {
     agentPendingOne: "{count} pending approval",
     agentPending: "{count} pending approvals",
     allowOnce: "Allow once",
+    allow15Min: "Allow 15 min",
+    allowSession: "Allow for this session",
     alwaysAllow: "Always allow",
     alwaysAllowHere: "Always allow here",
     allowAlwaysUnavailable: "Allow Always is unavailable for this command.",

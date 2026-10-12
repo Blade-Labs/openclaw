@@ -7,7 +7,6 @@ import {
   sanitizeExecApprovalDisplayText,
   sanitizeExecApprovalWarningText,
 } from "../infra/exec-approval-text-sanitize.js";
-import { resolveCanonicalPluginApprovalRequestAllowedDecisions } from "../infra/plugin-approval-canonical-decisions.js";
 import type { PluginApprovalRequestPayload } from "../infra/plugin-approvals.js";
 import { resolvePluginApprovalTimeoutMs } from "../infra/plugin-approvals.js";
 import type { OpenClawPluginNodeInvokePolicyContext } from "../plugins/types.js";
@@ -125,9 +124,10 @@ export function createPluginNodeInvokeApprovalRuntime(params: {
         ? prepared.authorization.policy.allowedDecisions
         : input.allowedDecisions === undefined
           ? undefined
-          : resolveCanonicalPluginApprovalRequestAllowedDecisions({
-              allowedDecisions: input.allowedDecisions,
-            });
+          : input.allowedDecisions.filter(
+              (decision) =>
+                decision === "allow-once" || decision === "allow-always" || decision === "deny",
+            );
       const scopedAuthority = params.placementGrantAuthority;
       const placementGrantOwner: NodeInvokePlacementGrantOwner | undefined = scopedAuthority
         ? {
@@ -278,7 +278,16 @@ export function createPluginNodeInvokeApprovalRuntime(params: {
       ) {
         return { id: record.id, decision: unavailableDecision() };
       }
-      return { id: record.id, decision };
+      return {
+        id: record.id,
+        decision:
+          decision === "allow-once" ||
+          decision === "allow-always" ||
+          decision === "deny" ||
+          decision === null
+            ? decision
+            : unavailableDecision(),
+      };
     },
   };
 }

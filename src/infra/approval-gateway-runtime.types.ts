@@ -46,7 +46,7 @@ export type ChannelApprovalResolutionRuntimeV2 = {
     request: {
       id: string;
       kind: ChannelApprovalKind;
-      decision: "allow-once" | "allow-always" | "deny";
+      decision: "allow-once" | "allow-15m" | "allow-session" | "allow-always" | "deny";
     },
     actor: AdmittedChannelActor,
   ) => Promise<import("../../packages/gateway-protocol/src/index.js").ApprovalResolveResult>;

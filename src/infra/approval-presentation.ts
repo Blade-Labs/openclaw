@@ -15,6 +15,7 @@ import {
   sanitizeExecApprovalWarningText,
 } from "./exec-approval-text-sanitize.js";
 import type { ExecApprovalRequestPayload } from "./exec-approvals.js";
+import { resolveCanonicalPluginApprovalRequestAllowedDecisions } from "./plugin-approval-canonical-decisions.js";
 import {
   PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH,
   PLUGIN_APPROVAL_TITLE_MAX_LENGTH,
@@ -92,7 +93,10 @@ function buildExecApprovalPresentation(params: {
     nodeId: sanitizeOptionalSingleLine(request.nodeId),
     agentId: sanitizeOptionalSingleLine(request.agentId),
     ...(scope ? { scope } : {}),
-    allowedDecisions: normalizeDecisionList(params.allowedDecisions),
+    allowedDecisions: normalizeDecisionList(params.allowedDecisions).filter(
+      (decision): decision is "allow-once" | "allow-always" | "deny" =>
+        decision === "allow-once" || decision === "allow-always" || decision === "deny",
+    ),
   };
 }
 
@@ -106,7 +110,11 @@ function buildPluginApprovalPresentation(params: {
   const request = params.request as PluginApprovalRequestPayload;
   const rawTitle = normalizeOptionalString(request.title);
   const rawDescription = normalizeOptionalString(request.description);
-  if (!rawTitle || !rawDescription) {
+  if (
+    !rawTitle ||
+    !rawDescription ||
+    exceedsApprovalTextLimit(rawDescription, PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH)
+  ) {
     return null;
   }
   // Plugin text crosses every reviewer surface. Apply the same redaction and
@@ -116,6 +124,25 @@ function buildPluginApprovalPresentation(params: {
   if (
     exceedsApprovalTextLimit(title, PLUGIN_APPROVAL_TITLE_MAX_LENGTH) ||
     exceedsApprovalTextLimit(description, PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH)
+  ) {
+    return null;
+  }
+  const rawGrantScope = request.grantEligible
+    ? normalizeOptionalString(request.grantScopeSummary)
+    : undefined;
+  if (
+    request.grantEligible &&
+    (!rawGrantScope ||
+      exceedsApprovalTextLimit(rawGrantScope, PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH))
+  ) {
+    return null;
+  }
+  const grantScopeSummary = rawGrantScope
+    ? sanitizeExecApprovalWarningText(rawGrantScope)
+    : undefined;
+  if (
+    grantScopeSummary &&
+    exceedsApprovalTextLimit(grantScopeSummary, PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH)
   ) {
     return null;
   }
@@ -138,13 +165,22 @@ function buildPluginApprovalPresentation(params: {
     kind: "plugin",
     title,
     description,
+    ...(request.grantEligible === false ? { grantEligible: false } : {}),
+    ...(request.grantEligible && request.grantScopeSummary
+      ? {
+          grantEligible: true,
+          grantScopeSummary: grantScopeSummary!,
+        }
+      : {}),
     ...(detail ? { detail } : {}),
     severity,
     pluginId: sanitizeOptionalSingleLine(request.pluginId),
     toolName: sanitizeOptionalSingleLine(request.toolName),
     agentId: sanitizeOptionalSingleLine(request.agentId),
     ...(scope ? { scope } : {}),
-    allowedDecisions: normalizeDecisionList(params.allowedDecisions),
+    allowedDecisions: normalizeDecisionList(params.allowedDecisions).filter((decision) =>
+      resolveCanonicalPluginApprovalRequestAllowedDecisions(request).includes(decision),
+    ),
     ...(externalResolution
       ? {
           externalResolution: {

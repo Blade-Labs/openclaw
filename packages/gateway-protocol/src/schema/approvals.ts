@@ -28,6 +28,8 @@ export const ApprovalKindSchema = Type.Union([
 /** Reviewer decisions accepted by the unified approval resolver. */
 export const ApprovalDecisionSchema = Type.Union([
   Type.Literal("allow-once"),
+  Type.Literal("allow-15m"),
+  Type.Literal("allow-session"),
   Type.Literal("allow-always"),
   Type.Literal("deny"),
 ]);
@@ -35,6 +37,8 @@ export const ApprovalDecisionSchema = Type.Union([
 /** Reviewer decisions that permit an operation to proceed. */
 export const ApprovalAllowDecisionSchema = Type.Union([
   Type.Literal("allow-once"),
+  Type.Literal("allow-15m"),
+  Type.Literal("allow-session"),
   Type.Literal("allow-always"),
 ]);
 
@@ -130,7 +134,7 @@ export const ApprovalScopeSchema = Type.Union([
 /** Reviewer-safe projection of a plugin-owned external verification choice. */
 export const PluginApprovalExternalResolutionSchema = closedObject({
   label: Type.String({ minLength: 1, maxLength: 80 }),
-  decisions: Type.Array(ApprovalAllowDecisionSchema, {
+  decisions: Type.Array(Type.Union([Type.Literal("allow-once"), Type.Literal("allow-always")]), {
     minItems: 1,
     maxItems: 2,
     uniqueItems: true,
@@ -139,7 +143,7 @@ export const PluginApprovalExternalResolutionSchema = closedObject({
 
 const ApprovalAllowedDecisionsSchema = Type.Array(ApprovalDecisionSchema, {
   minItems: 1,
-  maxItems: 3,
+  maxItems: 5,
   uniqueItems: true,
   contains: Type.Literal("deny"),
   description:
@@ -162,7 +166,10 @@ export const ExecApprovalPresentationSchema = Type.Object(
     nodeId: Type.Optional(Type.Union([NonEmptyString, Type.Null()])),
     agentId: Type.Optional(Type.Union([NonEmptyString, Type.Null()])),
     scope: Type.Optional(ApprovalScopeSchema),
-    allowedDecisions: ApprovalAllowedDecisionsSchema,
+    allowedDecisions: Type.Array(
+      Type.Union([Type.Literal("allow-once"), Type.Literal("allow-always"), Type.Literal("deny")]),
+      { minItems: 1, maxItems: 3, uniqueItems: true, contains: Type.Literal("deny") },
+    ),
   },
   {
     additionalProperties: false,
@@ -175,7 +182,9 @@ export const ExecApprovalPresentationSchema = Type.Object(
 export const PluginApprovalPresentationSchema = closedObject({
   kind: Type.Literal("plugin"),
   title: Type.String({ minLength: 1, maxLength: 80 }),
-  description: Type.String({ minLength: 1, maxLength: 512 }),
+  description: Type.String({ minLength: 1, maxLength: 4_096 }),
+  grantEligible: Type.Optional(Type.Boolean()),
+  grantScopeSummary: Type.Optional(Type.String({ minLength: 1, maxLength: 4_096 })),
   detail: Type.Optional(Type.String({ minLength: 1, maxLength: 16_384 })),
   severity: PluginApprovalSeveritySchema,
   pluginId: Type.Optional(Type.Union([NonEmptyString, Type.Null()])),

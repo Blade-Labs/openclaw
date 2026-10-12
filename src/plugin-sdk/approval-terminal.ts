@@ -9,6 +9,8 @@ type ApprovalTerminalOutcome =
 
 const TERMINAL_LABELS = {
   "allow-once": "Allowed once",
+  "allow-15m": "Allowed for 15 minutes",
+  "allow-session": "Allowed for this session",
   "allow-always": "Allowed always",
   deny: "Denied",
   cancelled: "Cancelled",

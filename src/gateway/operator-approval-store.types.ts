@@ -13,7 +13,12 @@ import type {
 
 export type OperatorApprovalKind = "exec" | "plugin" | "system-agent";
 export type OperatorApprovalStatus = "pending" | "allowed" | "denied" | "expired" | "cancelled";
-export type OperatorApprovalDecision = "allow-once" | "allow-always" | "deny";
+export type OperatorApprovalDecision =
+  | "allow-once"
+  | "allow-15m"
+  | "allow-session"
+  | "allow-always"
+  | "deny";
 export type OperatorApprovalTerminalReason =
   | "user"
   | "timeout"

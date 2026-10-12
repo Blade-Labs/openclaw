@@ -31,7 +31,14 @@ export function buildWaitResponse<TPayload>(
     ...(authorization ? { authorization } : {}),
     ...(snapshot.resolvedByActor ? { resolvedByActor: snapshot.resolvedByActor } : {}),
     ...(snapshot.resolvedAtMs !== undefined ? { resolvedAtMs: snapshot.resolvedAtMs } : {}),
-    decision: strict && decision !== "allow-once" ? "deny" : decision,
+    decision:
+      strict &&
+      !(
+        authorization?.policy.requireResolverMatch &&
+        authorization.policy.allowedDecisions.some((allowed) => allowed === decision)
+      )
+        ? "deny"
+        : decision,
     createdAtMs: snapshot.createdAtMs,
     expiresAtMs: snapshot.expiresAtMs,
     terminalReason: terminalReason ?? snapshot.terminalReason,

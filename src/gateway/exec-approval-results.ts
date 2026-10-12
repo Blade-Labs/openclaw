@@ -1,4 +1,5 @@
 import type { ExecApprovalDecision } from "../infra/exec-approvals.js";
+import { isScopedPluginGrantApproval } from "../infra/plugin-approvals.js";
 import { EXEC_APPROVAL_RESOLVED_ENTRY_GRACE_MS } from "./exec-approval-lifecycle.js";
 import type {
   ExecApprovalForceDenyResult,
@@ -19,7 +20,9 @@ export function prepareExecApprovalStandingGrant<TPayload>(params: {
   grantExpiresAtMs: number | null | undefined;
 }) {
   let standingGrantSpec =
-    params.decision === "allow-always" && params.record
+    params.decision === "allow-always" &&
+    params.record &&
+    !isScopedPluginGrantApproval(params.record.request)
       ? (params.options.resolveStandingGrantMint?.(params.record.request) ?? undefined)
       : undefined;
   if (standingGrantSpec?.kind === "mcp-tool" && params.record?.mcpToolApprovalActive?.() !== true) {
@@ -41,13 +44,20 @@ export function prepareExecApprovalRedemptionWindow(
   record: ExecApprovalRecord<unknown>,
   graceAnchorMs: number | null,
   nowMs: number,
+  kind: import("./operator-approval-store.js").OperatorApprovalKind,
 ): number | null {
   const resolvedAtMs = record.resolvedAtMs;
   if (
     resolvedAtMs === undefined ||
     graceAnchorMs === null ||
     nowMs - graceAnchorMs >= EXEC_APPROVAL_RESOLVED_ENTRY_GRACE_MS ||
-    record.decision !== "allow-once" ||
+    (record.decision !== "allow-once" &&
+      !(
+        kind === "plugin" &&
+        isScopedPluginGrantApproval(record.request) &&
+        record.decision &&
+        record.decision !== "deny"
+      )) ||
     record.consumedDecision
   ) {
     return null;

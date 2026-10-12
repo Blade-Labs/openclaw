@@ -27,7 +27,12 @@ export function projectExecApprovalRequesterDecision<T>(params: {
     record?.resolvedByActor,
     decision ?? "deny",
   );
-  if (decision !== "allow-once" && decision !== "allow-always") {
+  if (
+    decision !== "allow-once" &&
+    decision !== "allow-always" &&
+    decision !== "allow-15m" &&
+    decision !== "allow-session"
+  ) {
     return decision ?? (guard.requireResolverMatch ? "deny" : null);
   }
   if (!params.retained || !record) {

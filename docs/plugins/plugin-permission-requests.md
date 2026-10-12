@@ -59,9 +59,7 @@ export default definePluginEntry({
           description: `Deploy service to ${environment}.`,
           severity: environment === "production" ? "critical" : "warning",
           allowedDecisions:
-            environment === "production"
-              ? ["allow-once", "deny"]
-              : ["allow-once", "allow-always", "deny"],
+            environment === "production" ? ["allow-once", "deny"] : ["allow-once", "deny"],
           timeoutMs: 120_000,
           onResolution(decision) {
             console.log(`deploy approval resolved: ${decision}`);
@@ -76,15 +74,12 @@ export default definePluginEntry({
 Write prompt text for the person who will approve the action:
 
 - Keep `title` short and action-focused. The Gateway caps it at 80 characters.
-- Keep `description` specific and bounded. The Gateway caps it at 512
-  characters.
+- Keep `description` specific and bounded. The Gateway caps the sanitized description at 4,096 Unicode code points and rejects overflow rather than truncating it.
 - Include the action, target, and risk. Do not include secrets, tokens, or
   private payloads that should not appear in chat approval surfaces.
 - `severity` defaults to `"warning"` when omitted. Use `"critical"` only for
   actions where the wrong decision could cause production damage or data loss.
-- `allowedDecisions` defaults to `["allow-once", "allow-always", "deny"]` when
-  omitted. Pass `["allow-once", "deny"]` when persistent trust is unsafe for
-  that action.
+- Ordinary plugin requests offer `allow-once` and `deny`. A trusted plugin may mark an exact delegation with `grantEligible: true` and `grantScopeSummary`; only then does the host offer all five choices described below.
 - `timeoutMs` defaults to 120000 (2 minutes) and is capped at 600000 (10
   minutes) regardless of the requested value.
 
@@ -161,14 +156,13 @@ available approval surfaces, and waits for a decision.
 | Cancellation      | The call is blocked when the run is aborted.                              |
 | No approval route | The call is blocked because no connected approval surface can resolve it. |
 
-Only the exact `allow-once` and `allow-always` decisions permitted by the
-request allow execution. Unknown, malformed, mismatched, missing, and timed-out
+Only an exact offered allow decision permits execution. Unknown, malformed, mismatched, missing, and timed-out
 decisions fail closed. The legacy `timeoutBehavior` field remains accepted for
 plugin compatibility but is deprecated and ignored. Do not set it in new hooks.
 
 `allow-always` is only durable when the requesting plugin or runtime implements
 that persistence. For ordinary `before_tool_call.requireApproval` hooks,
-OpenClaw treats `allow-once` and `allow-always` as approval decisions for the
+OpenClaw treats the offered allow choices as approval decisions for the
 current call and passes the resolved value to `onResolution`. If your plugin
 offers `allow-always`, document and implement exactly what future calls it
 trusts.
@@ -180,6 +174,46 @@ rewrite the parameters covered by the pending approval.
 
 `allowedDecisions` limits the buttons and commands shown to the user. The
 Gateway rejects a resolve attempt for any decision the request did not offer.
+
+## Scoped decisions and receipts
+
+For a request eligible for plugin-owned grants, set `grantEligible: true` and
+`grantScopeSummary` on `requireApproval`. The summary describes the exact scope
+and tells the reviewer whether later values may differ. These fields come from
+the registered hook, never model parameters. Public Gateway requests cannot
+mark a request eligible without the signed plugin owner.
+
+Eligible requests offer `allow-once`, `allow-15m`, `allow-session`, `allow-always`,
+and `deny`. The host carries the chosen decision through storage, resolution,
+and one-use execution redemption. The plugin owns creating, matching, expiring,
+and revoking any reusable grant. Scoped decisions never mint a generic MCP
+grant. Native MCP and placement approvals keep their separate bound contracts.
+Existing native permission callback requests that explicitly list the three legacy
+choices and omit `grantEligible` retain that contract. Ordinary
+`before_tool_call.requireApproval` hooks now send `grantEligible: false` by default,
+so this compatibility path cannot add reusable choices to an ineligible hook.
+Native owners should retain their current matching and removal lifecycle; new
+plugin delegations use the scoped contract above.
+Requester matching, approver rosters, and live run authority remain required.
+
+`onResolution(decision, receipt)` keeps the existing first argument. The optional
+second argument contains host evidence:
+
+```typescript
+{
+  approvalId: string;
+  decision: "allow-once" | "allow-15m" | "allow-session" | "allow-always" | "deny" | null;
+  createdAtMs: number;
+  expiresAtMs: number;
+  resolvedAtMs?: number;
+  resolvedByActor?: ApprovalResolvingActor | null;
+  terminalReason?: ApprovalTerminalReason | null;
+}
+```
+
+The host copies these facts from the matching request/wait response. A failure before a request ID exists has no receipt. A known no-route record
+retains its ID and available timestamps without inventing a resolver or success. A receipt records consent; it does not prove that the
+tool completed. Existing one-argument callbacks continue to work.
 
 ## Route approval prompts
 

@@ -100,7 +100,7 @@ export type MessagePresentationAction =
       type: "approval";
       approvalId: string;
       approvalKind: ChannelApprovalKind;
-      decision: "allow-once" | "allow-always" | "deny";
+      decision: "allow-once" | "allow-15m" | "allow-session" | "allow-always" | "deny";
     }
   | QuestionPresentationAction
   | {
@@ -543,7 +543,11 @@ function normalizePresentationAction(raw: unknown): MessagePresentationAction | 
       typeof approvalId !== "string" ||
       !isWellFormedApprovalId(approvalId) ||
       (approvalKind !== "exec" && approvalKind !== "plugin" && approvalKind !== "system-agent") ||
-      (decision !== "allow-once" && decision !== "allow-always" && decision !== "deny")
+      (decision !== "allow-once" &&
+        decision !== "allow-15m" &&
+        decision !== "allow-session" &&
+        decision !== "allow-always" &&
+        decision !== "deny")
     ) {
       return undefined;
     }

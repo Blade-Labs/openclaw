@@ -30,6 +30,32 @@ Doctor completes recognized schema-1 databases that predate the audit ledger bef
 | 16      | Skill Workshop ownership moves from workspace/provenance columns to per-agent directory containment                                                                                                                                                                                                                             | Unreleased          |
 | 17      | Prepared worker lifecycle facts and one-use node workspace bindings                                                                                                                                                                                                                                                             | Unreleased          |
 | 18      | Original requesting authority retained with shared GitHub publication receipts                                                                                                                                                                                                                                                  | Unreleased          |
+| 19      | Scoped plugin approval decisions with one-use redemption                                                                                                                                                                                                                                                                        | Unreleased          |
+
+### State schema 19
+
+Schema 19 extends the existing `operator_approvals` decision constraint with
+`allow-15m` and `allow-session`. Only plugin approvals can carry these decisions.
+The Gateway records the selected decision and redeems each approved scoped plugin
+request once, including `allow-always`; the plugin owns any resulting scoped
+grant. Exec and system-agent approvals retain their existing decision and
+consumption contracts. Migration creates no grant.
+
+Startup and `openclaw doctor --fix` rebuild the approval table in the existing
+schema transaction, preserving approval rows, requester and resolver facts,
+resolution references, and dependent execution identities and standing grants.
+Recognized historical two-kind tables retain their Doctor repair path. Unknown
+constraints refuse migration without changing the database. Retention, expiry,
+live authority checks, and grant matching remain with their existing owners.
+
+The table rebuild and schema version commit together. The existing
+[older-updater publication deferral](/reference/database-schemas/versioning#schema-bumps-and-older-updaters)
+applies to the state-only migration: a 2026.9.2 driver can finish its trailing
+ledger reads while the candidate records applied content version 19, and
+reopening does not repeat the rebuild. Older readers cannot interpret the new
+decisions or consumption rules and refuse published schema 19. Keep a verified,
+WAL-aware backup before upgrading; rollback requires a compatible build and the
+pre-upgrade backup in a separate state directory. Do not lower schema markers.
 
 ### State schema 18
 

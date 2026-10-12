@@ -428,6 +428,49 @@ describe("msTeamsApprovalNativeRuntime", () => {
     }
   });
 
+  it("retires controls after a failed terminal edit and ignores duplicate resolution events", async () => {
+    vi.useFakeTimers();
+    const request = createRequest(createExecPendingView());
+    const handler = await createChannelApprovalHandlerFromCapability({
+      label: "msteams/test-terminal-edit",
+      clientDisplayName: "Test",
+      channel: "msteams",
+      channelLabel: "Microsoft Teams",
+      accountId: "default",
+      cfg,
+      capability: {
+        native: msTeamsApprovalCapability.native,
+        nativeRuntime: msTeamsApprovalCapability.nativeRuntime,
+      },
+    });
+    if (!handler) {
+      throw new Error("Expected registered approval handler");
+    }
+    try {
+      await handler.start();
+      await handler.handleRequested(request);
+      const tokens = Array.from(msTeamsApprovalControls.values())
+        .filter((binding) => binding.approvalId === request.id)
+        .map((binding) => binding.token);
+      expect(tokens.length).toBeGreaterThan(0);
+      editAdaptiveCardMSTeams.mockRejectedValueOnce(new Error("HTTP 429 exhausted"));
+      const resolved = { id: request.id, decision: "allow-once" as const, ts: Date.now() };
+      await handler.handleResolved(resolved);
+      for (const token of tokens) {
+        expect(msTeamsApprovalControls.get(token)).toBeNull();
+      }
+      expect(blockedLog).toHaveBeenCalledWith(
+        expect.stringContaining("resolved; display update failed"),
+      );
+      await handler.handleResolved(resolved);
+      expect(editAdaptiveCardMSTeams).toHaveBeenCalledTimes(1);
+      expect(sendAdaptiveCardMSTeams).toHaveBeenCalledTimes(1);
+    } finally {
+      await handler.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it.each(["unknown", ""])(
     "rejects an unaddressable approval activity id: %s",
     async (messageId) => {

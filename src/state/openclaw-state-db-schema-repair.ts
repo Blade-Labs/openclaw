@@ -436,6 +436,14 @@ export function detectOpenClawStateDatabaseSchemaMigrationsFromDatabase(
   if (!hasCanonicalAgentDatabasesPrimaryKey(db)) {
     migrations.push({ kind: "agent-databases-composite-primary-key", path: pathname });
   }
+  if (userVersion < 19 && tableExists(db, "operator_approvals")) {
+    const sql = db
+      .prepare("SELECT sql FROM sqlite_schema WHERE name = 'operator_approvals'")
+      .get()?.sql;
+    if (typeof sql === "string" && !sql.includes("'allow-15m'")) {
+      migrations.push({ kind: "plugin-approval-decisions-v19", path: pathname });
+    }
+  }
   if (!hasCanonicalAuditEventsSchema(db)) {
     migrations.push({ kind: "audit-events-v2", path: pathname });
   }

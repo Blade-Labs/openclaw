@@ -28,7 +28,12 @@ export function projectOperatorApprovalSnapshot(
     reason: record.terminalReason,
   };
   if (record.status === "allowed") {
-    if (record.decision !== "allow-once" && record.decision !== "allow-always") {
+    if (
+      record.decision !== "allow-once" &&
+      record.decision !== "allow-always" &&
+      record.decision !== "allow-15m" &&
+      record.decision !== "allow-session"
+    ) {
       return null;
     }
     return { ...terminal, decision: record.decision } as ApprovalSnapshot;

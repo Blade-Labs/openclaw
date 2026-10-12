@@ -2,7 +2,8 @@
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../runtime-api.js";
 import { teamsQuotedTableReply } from "./format.test-fixtures.js";
 import {
@@ -728,6 +729,142 @@ describe("editMessageMSTeams", () => {
       },
       { serviceUrlBoundary: { cloud: "Public" } },
     );
+  });
+});
+
+describe("Teams terminal card edit retries", () => {
+  const conversationId = "a:approval-retry-chat";
+  const params = {
+    cfg: {},
+    to: `conversation:${conversationId}`,
+    activityId: "approval-card",
+    card: { type: "AdaptiveCard", body: [{ type: "TextBlock", text: "Allowed once" }] },
+  };
+  const log = { debug: vi.fn(), info: vi.fn() };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-12T12:00:00Z"));
+    mockState.updateMSTeamsActivityWithReference.mockReset().mockResolvedValue({ id: "updated" });
+    mockState.resolveMSTeamsSendContext.mockReset().mockResolvedValue({
+      app: createMockApp(),
+      appId: "teams-app",
+      conversationId,
+      ref: { conversation: { id: conversationId }, serviceUrl: "https://service.example.com" },
+      log,
+      sdkCloudOptions: { cloud: "Public" },
+    });
+  });
+
+  afterEach(() => vi.useRealTimers());
+
+  it.each([
+    { name: "numeric", retryAfter: "2" },
+    { name: "date", retryAfter: "Mon, 12 Oct 2026 12:00:02 GMT" },
+  ])("honors $name Retry-After before retrying a 429 edit", async ({ retryAfter }) => {
+    mockState.updateMSTeamsActivityWithReference.mockRejectedValueOnce({
+      statusCode: 429,
+      response: { headers: { "Retry-After": retryAfter } },
+    });
+    const edit = editAdaptiveCardMSTeams(params).then(
+      (result) => ({ result }),
+      (error: unknown) => ({ error }),
+    );
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(mockState.updateMSTeamsActivityWithReference).toHaveBeenCalledTimes(1);
+    await vi.runAllTimersAsync();
+    await expect(edit).resolves.toEqual({ result: { conversationId } });
+    expect(mockState.updateMSTeamsActivityWithReference).toHaveBeenCalledTimes(2);
+    expect(mockState.updateMSTeamsActivityWithReference.mock.calls[1]).toEqual(
+      mockState.updateMSTeamsActivityWithReference.mock.calls[0],
+    );
+  });
+
+  it("stops after bounded 429 retries and preserves the original failure", async () => {
+    const error = Object.assign(new Error("throttled"), { statusCode: 429 });
+    mockState.updateMSTeamsActivityWithReference.mockRejectedValue(error);
+    const edit = editAdaptiveCardMSTeams(params);
+    const rejected = expect(edit).rejects.toMatchObject({ cause: error });
+    await vi.runAllTimersAsync();
+    await rejected;
+    expect(mockState.updateMSTeamsActivityWithReference).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([401, 403])("does not retry HTTP %s", async (statusCode) => {
+    mockState.updateMSTeamsActivityWithReference.mockRejectedValue({ statusCode });
+    await expect(editAdaptiveCardMSTeams(params)).rejects.toThrow(`HTTP ${statusCode}`);
+    expect(mockState.updateMSTeamsActivityWithReference).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not undercut a Retry-After outside the bounded edit budget", async () => {
+    mockState.updateMSTeamsActivityWithReference.mockRejectedValue({
+      statusCode: 429,
+      retryAfter: 120,
+    });
+    await expect(editAdaptiveCardMSTeams(params)).rejects.toThrow("HTTP 429");
+    expect(mockState.updateMSTeamsActivityWithReference).toHaveBeenCalledTimes(1);
+  });
+
+  it("coalesces concurrent identical edits to the same activity", async () => {
+    const pending = createDeferred<{ id: string }>();
+    mockState.updateMSTeamsActivityWithReference.mockReturnValueOnce(pending.promise);
+    const edits = [editAdaptiveCardMSTeams(params), editAdaptiveCardMSTeams(params)];
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mockState.updateMSTeamsActivityWithReference).toHaveBeenCalledTimes(1);
+    pending.resolve({ id: "updated" });
+    await Promise.all(edits);
+    expect(mockState.updateMSTeamsActivityWithReference).toHaveBeenCalledTimes(1);
+  });
+
+  it("shares the attempt budget across continuously superseding edits", async () => {
+    const pending = Array.from({ length: 3 }, () => createDeferred<{ id: string }>());
+    for (const attempt of pending) {
+      mockState.updateMSTeamsActivityWithReference.mockReturnValueOnce(attempt.promise);
+    }
+    const outcomes = [editAdaptiveCardMSTeams(params).catch((error: unknown) => error)];
+    for (let index = 0; index < 3; index += 1) {
+      await vi.advanceTimersByTimeAsync(0);
+      outcomes.push(
+        editAdaptiveCardMSTeams({
+          ...params,
+          card: { type: "AdaptiveCard", body: [{ type: "TextBlock", text: `Resolved ${index}` }] },
+        }).catch((error: unknown) => error),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      pending[index]!.resolve({ id: "updated" });
+    }
+    const errors = await Promise.all(outcomes);
+    for (const error of errors) {
+      expect(error).toBeInstanceOf(Error);
+      expect(error).toHaveProperty("message", expect.stringContaining("edit attempt budget"));
+    }
+    expect(mockState.updateMSTeamsActivityWithReference).toHaveBeenCalledTimes(3);
+    await expect(editAdaptiveCardMSTeams(params)).resolves.toEqual({ conversationId });
+    expect(mockState.updateMSTeamsActivityWithReference).toHaveBeenCalledTimes(4);
+  });
+
+  it("uses the newest concurrent payload when a throttled edit retries", async () => {
+    mockState.updateMSTeamsActivityWithReference.mockRejectedValueOnce({ statusCode: 429 });
+    const first = editAdaptiveCardMSTeams(params).then(
+      (result) => ({ result }),
+      (error: unknown) => ({ error }),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    const card = { type: "AdaptiveCard", body: [{ type: "TextBlock", text: "Denied" }] };
+    const second = editAdaptiveCardMSTeams({ ...params, card }).then(
+      (result) => ({ result }),
+      (error: unknown) => ({ error }),
+    );
+    await vi.runAllTimersAsync();
+    expect(await Promise.all([first, second])).toEqual([
+      { result: { conversationId } },
+      { result: { conversationId } },
+    ]);
+    expect(mockState.updateMSTeamsActivityWithReference).toHaveBeenCalledTimes(2);
+    expect(mockState.updateMSTeamsActivityWithReference.mock.calls[1]?.[3]).toMatchObject({
+      attachments: [{ content: card }],
+    });
   });
 });
 

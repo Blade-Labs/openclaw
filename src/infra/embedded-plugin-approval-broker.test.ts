@@ -70,6 +70,30 @@ afterEach(() => {
 });
 
 describe("EmbeddedPluginApprovalBroker", () => {
+  it("enforces the sanitized Unicode description budget before emitting a card", async () => {
+    const broker = new EmbeddedPluginApprovalBroker();
+    const observer = vi.fn();
+    broker.subscribe(observer);
+    try {
+      for (const description of ["🚀".repeat(4_097), "\u200B".repeat(585) + "xx"]) {
+        await expect(
+          broker.request({ request: { ...requestPayload(), description }, timeoutMs: 5_000 }),
+        ).rejects.toThrow("display limit exceeded");
+      }
+      expect(observer).not.toHaveBeenCalled();
+      const description = "🚀".repeat(4_096);
+      const pending = broker.request({
+        request: { ...requestPayload(), description },
+        timeoutMs: 5_000,
+      });
+      const approval = expectDefined(broker.listPending()[0], "bounded Unicode approval");
+      expect(approval.request.description).toBe(description);
+      expect(broker.resolve(approval.id, "deny")).toBe(true);
+      await expect(pending).resolves.toMatchObject({ decision: "deny" });
+    } finally {
+      broker.stop();
+    }
+  });
   it("lists, emits, and resolves pending approvals", async () => {
     const broker = new EmbeddedPluginApprovalBroker();
     const events: Array<{ event: string; payload: unknown }> = [];
@@ -160,6 +184,8 @@ describe("EmbeddedPluginApprovalBroker", () => {
               request: {
                 ...requestPayload(),
                 allowedDecisions: ["allow-once", "allow-always", "deny"],
+                grantEligible: true,
+                grantScopeSummary: "Synthetic scoped delegation",
               },
               timeoutMs: 5_000,
             });
@@ -214,6 +240,14 @@ describe("EmbeddedPluginApprovalBroker", () => {
                 outcome.approvalExecutions?.[0],
                 "local execution custody",
               );
+              expect(outcome.receipt).toMatchObject({
+                approvalId: record.id,
+                decision: "allow-once",
+                createdAtMs: record.createdAtMs,
+                expiresAtMs: record.expiresAtMs,
+                resolvedAtMs: expect.any(Number),
+                resolvedByActor: { kind: "runtime", clientId: "tui:embedded" },
+              });
               expect(JSON.stringify(outcome)).toBe(
                 JSON.stringify({ id: record.id, decision: "allow-once" }),
               );

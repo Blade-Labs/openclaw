@@ -1,3 +1,4 @@
+import { isScopedPluginGrantApproval } from "../infra/plugin-approvals.js";
 import { EXEC_APPROVAL_RESOLVED_ENTRY_GRACE_MS } from "./exec-approval-lifecycle.js";
 import type { ExecApprovalManager } from "./exec-approval-manager.js";
 import type {
@@ -30,7 +31,7 @@ export async function consumeExecApprovalOnce<T>(params: {
     record,
     params.kind,
     record.resolvedByActor,
-    "allow-once",
+    record.decision ?? "deny",
   );
   requester.assertCurrent();
   if (!params.runtimeActive()) {
@@ -42,6 +43,7 @@ export async function consumeExecApprovalOnce<T>(params: {
     record,
     params.graceAnchorMs(),
     nowMs,
+    params.kind,
   );
   if (redemptionWindowMs === null) {
     return false;
@@ -76,7 +78,7 @@ export async function consumeExecApprovalOnce<T>(params: {
   if (!result || result.outcome !== "consumed" || !params.isCurrent()) {
     return false;
   }
-  record.consumedDecision = "allow-once";
+  record.consumedDecision = record.decision;
   record.consumedAtMs = result.record.consumedAtMs;
   record.consumedBy = result.record.consumedBy;
   return params.runtimeActive();
@@ -86,7 +88,7 @@ export async function consumeExecApprovalOnce<T>(params: {
 export function prepareExecApprovalOnceExecution<T>(
   manager: Pick<
     ExecApprovalManager<T>,
-    "getLiveSnapshot" | "projectDecisionIfActive" | "consumeAllowOnce"
+    "approvalKind" | "getLiveSnapshot" | "projectDecisionIfActive" | "consumeAllowOnce"
   >,
   recordId: string,
   consumerId: string,
@@ -96,12 +98,19 @@ export function prepareExecApprovalOnceExecution<T>(
   const assertCurrent = () => {
     if (
       !record ||
-      record.decision !== "allow-once" ||
+      (record.decision !== "allow-once" &&
+        !(
+          manager.approvalKind === "plugin" &&
+          isScopedPluginGrantApproval(record.request) &&
+          record.decision &&
+          record.decision !== "deny"
+        )) ||
       record.status !== "allowed" ||
       record.terminalReason !== "user" ||
       manager.getLiveSnapshot(recordId) !== record ||
-      manager.projectDecisionIfActive(recordId, "allow-once") !== "allow-once" ||
-      (redeemed && (record.consumedDecision !== "allow-once" || record.consumedBy !== consumerId))
+      manager.projectDecisionIfActive(recordId, record.decision) !== record.decision ||
+      (redeemed &&
+        (record.consumedDecision !== record.decision || record.consumedBy !== consumerId))
     ) {
       throw new Error("Approval execution authority is no longer active");
     }

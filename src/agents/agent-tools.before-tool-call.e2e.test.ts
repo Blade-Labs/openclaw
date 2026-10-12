@@ -3341,36 +3341,61 @@ describe("before_tool_call requireApproval handling", () => {
     expect(onResolution).toHaveBeenCalledWith("allow-once");
   });
 
-  it("allows allow-always decisions for tool approvals", async () => {
-    const onResolution = vi.fn();
-
-    hookRunner.runBeforeToolCall.mockResolvedValue({
-      requireApproval: {
-        title: "Needs durable approval",
-        description: "Check this durable approval",
-        onResolution,
-      },
-    });
-
-    mockCallGateway.mockResolvedValueOnce({ id: "server-id-allow-always", status: "accepted" });
-    mockCallGateway.mockResolvedValueOnce({
-      id: "server-id-allow-always",
-      decision: "allow-always",
-    });
-
-    const result = await runBeforeToolCallHook({
-      toolName: "bash",
-      params: { command: "echo ok" },
-      ctx: { agentId: "main", sessionKey: "main" },
-    });
-
-    expect(result).toEqual({
-      blocked: false,
-      params: { command: "echo ok" },
-      approvalResolution: "allow-always",
-    });
-    expect(onResolution).toHaveBeenCalledWith("allow-always");
-  });
+  it.each(["allow-once", "allow-15m", "allow-session", "allow-always", "deny"] as const)(
+    "round-trips scoped %s with the host receipt",
+    async (decision) => {
+      const onResolution = vi.fn();
+      hookRunner.runBeforeToolCall.mockResolvedValue({
+        requireApproval: {
+          title: "Scoped approval",
+          description: "Known project fields",
+          grantEligible: true,
+          grantScopeSummary: "Project 4 approved fields; future values may differ.",
+          onResolution,
+        },
+      });
+      const resolvedByActor = {
+        kind: "channel",
+        channel: "msteams",
+        accountId: "default",
+        senderId: "synthetic-owner",
+        actorKind: "human",
+      };
+      mockCallGateway.mockResolvedValueOnce({ id: "scoped-id", status: "accepted" });
+      mockCallGateway.mockResolvedValueOnce({
+        id: "scoped-id",
+        decision,
+        resolvedByActor,
+        createdAtMs: 1_000,
+        expiresAtMs: 121_000,
+        resolvedAtMs: 2_000,
+        terminalReason: "user",
+      });
+      const result = await runBeforeToolCallHook({
+        toolName: "projects_write",
+        params: { field: "status" },
+        ctx: { agentId: "main", sessionKey: "main" },
+      });
+      expect(result.blocked).toBe(decision === "deny");
+      if (decision !== "deny") {
+        expect(result).toMatchObject({ approvalResolution: decision });
+      }
+      expect(onResolution).toHaveBeenCalledWith(decision, {
+        approvalId: "scoped-id",
+        decision,
+        resolvedByActor,
+        createdAtMs: 1_000,
+        expiresAtMs: 121_000,
+        resolvedAtMs: 2_000,
+        terminalReason: "user",
+      });
+      expect(mockCallGateway.mock.calls[0]?.[2]).toMatchObject({
+        grantEligible: true,
+        grantScopeSummary: "Project 4 approved fields; future values may differ.",
+        allowedDecisions: ["allow-once", "allow-15m", "allow-session", "allow-always", "deny"],
+      });
+    },
+  );
 
   it("does not await onResolution before returning approval outcome", async () => {
     const onResolution = vi.fn(() => new Promise<void>(() => {}));
@@ -3439,6 +3464,44 @@ describe("before_tool_call requireApproval handling", () => {
     });
 
     expect(onResolution).toHaveBeenCalledWith("deny");
+  });
+
+  it("retains factual receipt for a known request that has no approval route", async () => {
+    const onResolution = vi.fn();
+    hookRunner.runBeforeToolCall.mockResolvedValue({
+      requireApproval: {
+        title: "Review request",
+        description: "Known route failure",
+        onResolution,
+      },
+    });
+    mockCallGateway.mockResolvedValueOnce({
+      id: "known-no-route",
+      decision: null,
+      createdAtMs: 1_000,
+      expiresAtMs: 2_000,
+      resolvedAtMs: 1_500,
+      terminalReason: "no-route",
+    });
+    const result = await runBeforeToolCallHook({
+      toolName: "projects_write",
+      params: {},
+      ctx: { agentId: "main", sessionKey: "main" },
+    });
+    expect(result.blocked).toBe(true);
+    expect(onResolution).toHaveBeenCalledWith("cancelled", {
+      approvalId: "known-no-route",
+      decision: null,
+      createdAtMs: 1_000,
+      expiresAtMs: 2_000,
+      resolvedAtMs: 1_500,
+      terminalReason: "no-route",
+    });
+    expect(mockCallGateway).toHaveBeenCalledTimes(1);
+    expect(mockCallGateway.mock.calls[0]?.[2]).toMatchObject({
+      grantEligible: false,
+      allowedDecisions: ["allow-once", "deny"],
+    });
   });
 
   it("calls onResolution with timeout when decision is null", async () => {

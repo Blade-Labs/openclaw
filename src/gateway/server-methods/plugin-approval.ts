@@ -107,6 +107,39 @@ export function createPluginApprovalHandlers(
         return;
       }
 
+      if (
+        p.grantEligible === true &&
+        (!trustedAgentRuntime?.approvalOwnerPluginId || !p.grantScopeSummary?.trim())
+      ) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            "scoped plugin grants require a signed plugin owner and scope summary",
+          ),
+        );
+        return;
+      }
+      const grantScopeSummary =
+        p.grantEligible === true
+          ? sanitizeExecApprovalWarningText(p.grantScopeSummary!)
+          : undefined;
+      if (
+        grantScopeSummary &&
+        exceedsApprovalTextLimit(grantScopeSummary, PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH)
+      ) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            "grant scope exceeds the display limit after sanitization",
+          ),
+        );
+        return;
+      }
+
       const normalizeTrimmedString = (value?: string | null): string | null =>
         normalizeOptionalString(value) || null;
 
@@ -166,6 +199,8 @@ export function createPluginApprovalHandlers(
         pluginId: trustedAgentRuntime?.approvalOwnerPluginId ?? sanitizeMeta(p.pluginId),
         title: sanitizedTitle,
         description: sanitizedDescription,
+        ...(p.grantEligible === false ? { grantEligible: false } : {}),
+        ...(grantScopeSummary ? { grantEligible: true, grantScopeSummary } : {}),
         scope: p.scope ? sanitizeApprovalScope(p.scope) : null,
         detail:
           rawDetail === null
@@ -179,6 +214,9 @@ export function createPluginApprovalHandlers(
           ? {
               allowedDecisions: resolveCanonicalPluginApprovalRequestAllowedDecisions({
                 allowedDecisions: p.allowedDecisions,
+                grantEligible: p.grantEligible,
+                ...(grantScopeSummary ? { grantEligible: true, grantScopeSummary } : {}),
+                ...(trustedAgentRuntime && p.mcpTool ? { mcpTool: p.mcpTool } : {}),
               }),
             }
           : {}),
@@ -200,6 +238,8 @@ export function createPluginApprovalHandlers(
           ? (trustedAgentRuntime.turnSourceThreadId ?? null)
           : (p.turnSourceThreadId ?? null),
       };
+
+      request.allowedDecisions = resolveCanonicalPluginApprovalRequestAllowedDecisions(request);
 
       // Always server-generate the ID — never accept plugin-provided IDs.
       // Kind-prefix so /approve routing can distinguish plugin vs exec IDs deterministically.

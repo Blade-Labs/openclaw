@@ -2,6 +2,8 @@
  * Public SDK type barrel for plugin hook contracts.
  */
 export type {
+  PluginApprovalReceipt,
+  PluginApprovalResolution,
   PluginHookAgentTrigger,
   PluginHookBeforeToolCallEvent,
   PluginHookBeforeToolCallResult,

@@ -6,6 +6,7 @@ import {
 } from "../../agents/admitted-run-context.js";
 import { validateAgentRunDelegatedAuthority } from "../../infra/agent-run-registry.js";
 import { createHostChannelTurnSource } from "../../infra/host-turn-source.js";
+import { SCOPED_PLUGIN_APPROVAL_DECISIONS } from "../../infra/plugin-approvals.js";
 import type { PluginApprovalRequestPayload } from "../../infra/plugin-approvals.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
@@ -120,8 +121,15 @@ describe("plugin approval signed agent runtime", () => {
     if (!authority) {
       throw new Error("Missing admitted test authority");
     }
+    const mintNativeGrant = vi.fn(() => ({
+      kind: "mcp-tool" as const,
+      agentId: "main",
+      server: "synthetic",
+      tool: "write",
+    }));
     const fixture = createTestApprovalFixture<PluginApprovalRequestPayload>(testContext, {
       approvalKind: "plugin",
+      resolveStandingGrantMint: mintNativeGrant,
       validateAgentRuntimeDelegatedAuthority: validateAgentRunDelegatedAuthority,
     });
     try {
@@ -179,6 +187,100 @@ describe("plugin approval signed agent runtime", () => {
           authorization: record.authorization,
           terminalReason: "requester-unavailable",
         });
+        let retainedExecution:
+          | ReturnType<typeof fixture.manager.prepareAllowOnceExecution>
+          | undefined;
+        for (const decision of SCOPED_PLUGIN_APPROVAL_DECISIONS) {
+          const request = {
+            title: "Synthetic scoped action",
+            description: "Exact field changes",
+            grantEligible: true,
+            grantScopeSummary: "Project 4 approved fields; future values may differ.",
+            twoPhase: true,
+          };
+          const deliveredScoped = createDeferredCore();
+          const scopedOpts = {
+            ...opts,
+            context: {
+              ...opts.context,
+              approvalEvents: {
+                ...opts.context.approvalEvents!,
+                deliverRequester: vi.fn(async () => {
+                  deliveredScoped.resolve();
+                  return true;
+                }),
+              },
+            },
+            params: request,
+            req: { ...opts.req, params: request },
+            respond: vi.fn(),
+          };
+          const pendingScoped = fixture.track(
+            Promise.resolve(requestHandler(fixture.manager)(scopedOpts)),
+          );
+          await deliveredScoped.promise;
+          const scoped = (await fixture.manager.listPendingRecords())[0];
+          if (!scoped) {
+            throw new Error("Expected scoped approval");
+          }
+          expect(scoped.authorization?.policy).toMatchObject({
+            requireResolverMatch: true,
+            allowedDecisions: SCOPED_PLUGIN_APPROVAL_DECISIONS,
+          });
+          const actor = {
+            kind: "channel",
+            channel: "test",
+            accountId: "default",
+            senderId: "synthetic-requester",
+            actorKind: "human",
+          } as const;
+          await expect(
+            fixture.manager.resolveDetailed(scoped.id, decision, {
+              kind: "channel",
+              id: "forged",
+              actor: { ...actor, senderId: "forged" },
+            }),
+          ).rejects.toThrow("Approval requester unavailable: ineligible");
+          expect(
+            (
+              await fixture.manager.resolveDetailed(scoped.id, decision, {
+                kind: "channel",
+                id: actor.senderId,
+                actor,
+              })
+            ).outcome,
+          ).toBe("resolved");
+          await pendingScoped;
+          const wait = createPluginApprovalHandlers(fixture.manager)[
+            "plugin.approval.waitDecision"
+          ]!;
+          const waitOpts = { ...scopedOpts, params: { id: scoped.id }, respond: vi.fn() };
+          await wait(waitOpts);
+          expect(waitOpts.respond).toHaveBeenCalledWith(
+            true,
+            expect.objectContaining({
+              id: scoped.id,
+              decision,
+              resolvedByActor: actor,
+              createdAtMs: scoped.createdAtMs,
+              expiresAtMs: scoped.expiresAtMs,
+              resolvedAtMs: expect.any(Number),
+            }),
+            undefined,
+          );
+          if (decision !== "deny") {
+            const execution = fixture.manager.prepareAllowOnceExecution(scoped.id);
+            retainedExecution = execution;
+            await execution.redeem();
+            expect((await fixture.manager.getSnapshot(scoped.id))?.consumedDecision).toBe(decision);
+            await expect(execution.redeem()).rejects.toThrow("already been consumed");
+          }
+        }
+        expect(mintNativeGrant).not.toHaveBeenCalled();
+        admission.close();
+        expect(() => retainedExecution!.assertCurrent()).toThrow(
+          "Approval execution authority is no longer active",
+        );
       });
     } finally {
       admission.close();

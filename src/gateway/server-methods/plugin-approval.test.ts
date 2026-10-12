@@ -242,7 +242,7 @@ const invalidRequestCases = [
   },
   {
     name: "description exceeding max length",
-    params: { title: "T", description: "x".repeat(513) },
+    params: { title: "T", description: "x".repeat(4_097) },
   },
   {
     name: "timeoutMs exceeding max",
@@ -282,6 +282,25 @@ describe("createPluginApprovalHandlers", () => {
   });
 
   describe("plugin.approval.request", () => {
+    it("rejects grant eligibility submitted without the signed plugin owner", async () => {
+      const opts = createMockOptions("plugin.approval.request", {
+        title: "Forged delegation",
+        description: "D",
+        grantEligible: true,
+        grantScopeSummary: "Synthetic scope",
+        twoPhase: true,
+      });
+      await createPluginApprovalHandlers(manager)["plugin.approval.request"]!(opts);
+      expect(opts.respond).toHaveBeenCalledWith(
+        false,
+        undefined,
+        expect.objectContaining({
+          message: "scoped plugin grants require a signed plugin owner and scope summary",
+        }),
+      );
+      expect(await manager.listPendingRecords()).toEqual([]);
+      expect(opts.context.broadcast).not.toHaveBeenCalled();
+    });
     it("creates and registers approval with twoPhase", async () => {
       const handlers = createPluginApprovalHandlers(manager);
       const { respond, accepted } = createApprovalRequestResponder();
@@ -1081,14 +1100,14 @@ describe("createPluginApprovalHandlers", () => {
 
       const opts = createMockOptions("plugin.approval.resolve", {
         id: "abcdef",
-        decision: "allow-always",
+        decision: "allow-once",
       });
       await expectDefined(
         handlers["plugin.approval.resolve"],
         'handlers["plugin.approval.resolve"] test invariant',
       )(opts);
       expect(opts.respond).toHaveBeenCalledWith(true, { ok: true }, undefined);
-      expect((await manager.getSnapshot(record.id))?.decision).toBe("allow-always");
+      expect((await manager.getSnapshot(record.id))?.decision).toBe("allow-once");
     });
 
     it("does not leak candidate ids when prefixes are ambiguous", async () => {

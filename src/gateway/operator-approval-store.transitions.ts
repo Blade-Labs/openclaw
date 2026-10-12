@@ -397,13 +397,22 @@ export function consumeOperatorApprovalAllowOnceInDatabase(
       denyCorruptPendingRow({ database, id, nowMs, createdAtMs: row.created_at_ms });
       return { outcome: "corrupt" };
     }
-    if (record.status !== "allowed" || record.decision !== "allow-once") {
+    if (
+      record.status !== "allowed" ||
+      (record.decision !== "allow-once" &&
+        !(
+          record.kind === "plugin" &&
+          record.presentation.kind === "plugin" &&
+          record.presentation.grantEligible === true &&
+          record.presentation.grantScopeSummary
+        ))
+    ) {
       return { outcome: "not-allow-once", record };
     }
     assertApprovalRequesterPolicy(
       record.authorization,
       record.resolvedByActor,
-      "allow-once",
+      record.decision!,
       params.requireResolverMatch,
     );
     if (record.consumedAtMs !== null) {
@@ -431,7 +440,7 @@ export function consumeOperatorApprovalAllowOnceInDatabase(
       })
       .where("approval_id", "=", id)
       .where("status", "=", "allowed")
-      .where("decision", "=", "allow-once")
+      .where("decision", "=", record.decision!)
       .where("consumed_at_ms", "is", null);
     if (redemptionThresholdMs !== undefined) {
       consumeQuery = consumeQuery.where("resolved_at_ms", ">", redemptionThresholdMs);

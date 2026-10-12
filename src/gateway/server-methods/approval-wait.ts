@@ -1,6 +1,7 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { ErrorCodes, errorShape } from "../../../packages/gateway-protocol/src/index.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { isScopedPluginGrantApproval } from "../../infra/plugin-approvals.js";
 import type { ExecApprovalManager, ExecApprovalRecord } from "../exec-approval-manager.js";
 import { ApprovalMutationRefusedError } from "../exec-approval-requester-guard.js";
 import {
@@ -115,8 +116,14 @@ export async function handleApprovalWaitDecision<TPayload>(params: {
       assertExecutionOwner();
       if (
         !authority ||
-        decision !== "allow-once" ||
-        snapshot.decision !== "allow-once" ||
+        !decision ||
+        decision === "deny" ||
+        snapshot.decision !== decision ||
+        (decision !== "allow-once" &&
+          !(
+            params.manager.approvalKind === "plugin" &&
+            isScopedPluginGrantApproval(snapshot.request)
+          )) ||
         snapshot.status !== "allowed" ||
         snapshot.terminalReason !== "user"
       ) {
@@ -132,7 +139,7 @@ export async function handleApprovalWaitDecision<TPayload>(params: {
       ]);
       if (
         validateConsumed
-          ? snapshot.consumedDecision !== "allow-once" || snapshot.consumedBy !== consumerId
+          ? snapshot.consumedDecision !== decision || snapshot.consumedBy !== consumerId
           : !(await params.manager.consumeAllowOnce(id, consumerId, {
               assertCurrent: assertExecutionOwner,
             }))
@@ -142,12 +149,12 @@ export async function handleApprovalWaitDecision<TPayload>(params: {
         );
       }
       assertExecutionOwner();
-      if (params.manager.projectDecisionIfActive(id, snapshot.decision) !== "allow-once") {
+      if (params.manager.projectDecisionIfActive(id, snapshot.decision) !== decision) {
         throw new ApprovalMutationRefusedError("approval execution authority is no longer active");
       }
       params.respond(
         true,
-        { ...buildWaitResponse(id, "allow-once", snapshot), consumed: true },
+        { ...buildWaitResponse(id, decision, snapshot), consumed: true },
         undefined,
       );
     } catch {

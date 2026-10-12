@@ -27,6 +27,7 @@ import {
 } from "../media/media-reference.js";
 import { sniffMimeFromBase64 } from "../media/sniff-mime-from-base64.js";
 import { clampNumber } from "../utils.js";
+import { copyAgentToolMetadata } from "./agent-tool-metadata.js";
 import { captureAgentToolSourceExecutionGuard } from "./agent-tool-source-execution-guard.js";
 import {
   REQUIRED_PARAM_GROUPS,
@@ -90,6 +91,7 @@ const MAX_ADAPTIVE_READ_PAGES = 4;
 const ENV_FILE_PATH_RE = /(?:^|[/\\])(?:\.env(?:\.[^/\\]+)?|[^/\\]+\.env)$/i;
 
 type OpenClawReadToolOptions = {
+  executionRootFiles?: ExecutionRootFiles;
   modelContextWindowTokens?: number;
   imageSanitization?: ImageSanitizationLimits;
   cwd?: string;
@@ -776,7 +778,7 @@ export function wrapToolMemoryFlushAppendOnlyWrite(
   options: MemoryFlushAppendOnlyWriteOptions,
 ): AnyAgentTool {
   const allowedAbsolutePath = path.resolve(options.root, options.relativePath);
-  return {
+  const wrapped = copyAgentToolMetadata(tool, {
     ...tool,
     description: `${tool.description} During memory flush, this tool may only append to ${options.relativePath}.`,
     execute: async (toolCallId, args, signal, onUpdate) => {
@@ -786,7 +788,7 @@ export function wrapToolMemoryFlushAppendOnlyWrite(
         ? await normalizeFileToolPathParamsFromKeys(
             record,
             ["path"],
-            options.root,
+            options.executionRootFiles ? undefined : options.root,
             options.sandbox?.bridge,
           )
         : undefined;
@@ -800,11 +802,13 @@ export function wrapToolMemoryFlushAppendOnlyWrite(
         return tool.execute(toolCallId, args, signal, onUpdate);
       }
 
-      const resolvedPath = resolveToolPathAgainstWorkspaceRoot({
-        filePath,
-        root: options.root,
-        containerWorkdir: options.containerWorkdir,
-      });
+      const resolvedPath = options.executionRootFiles
+        ? await options.executionRootFiles.resolveInput(filePath, options.root)
+        : resolveToolPathAgainstWorkspaceRoot({
+            filePath,
+            root: options.root,
+            containerWorkdir: options.containerWorkdir,
+          });
       if (filePath.startsWith("@") || resolvedPath !== allowedAbsolutePath) {
         throw new Error(
           `Memory flush writes are restricted to ${options.relativePath}; use that path only.`,
@@ -863,7 +867,10 @@ export function wrapToolMemoryFlushAppendOnlyWrite(
           )
         : append();
     },
-  };
+  });
+  return options.executionRootFiles
+    ? options.executionRootFiles.bind(wrapped, options.root)
+    : wrapped;
 }
 
 function isSandboxRootEscapeError(error: unknown): error is Error {
@@ -1143,13 +1150,22 @@ export function createOpenClawReadTool(
     execute: async (toolCallId, params, signal) => {
       const record = getToolParamsRecord(params);
       const normalizedRecord = record
-        ? await normalizeFileToolPathParamsFromKeys(record, ["path"], options?.cwd, options?.bridge)
+        ? await normalizeFileToolPathParamsFromKeys(
+            record,
+            ["path"],
+            options?.executionRootFiles ? undefined : options?.cwd,
+            options?.bridge,
+          )
         : undefined;
       assertRequiredParams(normalizedRecord, REQUIRED_PARAM_GROUPS.read, base.name);
       const filePath =
         typeof normalizedRecord?.path === "string" ? normalizedRecord.path : "<unknown>";
+      const relativeFilePath =
+        options?.executionRootFiles && path.isAbsolute(filePath)
+          ? path.relative(options.cwd ?? options.executionRootFiles.root, filePath)
+          : filePath;
       const dailyMemoryPath =
-        process.platform === "win32" ? filePath.replace(/\\/g, "/") : filePath;
+        process.platform === "win32" ? relativeFilePath.replace(/\\/g, "/") : relativeFilePath;
       // Daily journals may not exist yet; let the concrete reader own filesystem errors.
       const implicitlyOptional =
         normalizedRecord?.optional === undefined &&

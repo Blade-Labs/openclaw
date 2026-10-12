@@ -3,9 +3,12 @@ import { randomUUID } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
-import { copyAgentToolMetadata } from "./agent-tool-metadata.js";
+import { bindAgentToolExecutionRoot, copyAgentToolMetadata } from "./agent-tool-metadata.js";
 import { captureAgentToolSourceExecutionGuard } from "./agent-tool-source-execution-guard.js";
+import { normalizeFileToolPathParam } from "./agent-tools.params.js";
 import type { AnyAgentTool } from "./agent-tools.types.js";
+import { preserveAtPrefixedRelativePath } from "./path-policy.js";
+import { resolveToCwd } from "./sessions/tools/path-utils.js";
 
 const directoryFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const fileFlags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
@@ -15,6 +18,7 @@ const fdPath = (handle: FileHandle) => `/proc/self/fd/${handle.fd}`;
 export class ExecutionRootFiles {
   readonly root: string;
   private opening?: Promise<FileHandle>;
+  private checkingIdentity?: Promise<void>;
   private closed = false;
   private activeCalls = 0;
   private drained?: () => void;
@@ -43,7 +47,61 @@ export class ExecutionRootFiles {
     return absolute;
   }
 
-  queueKey = (absolute: string) => `execution-root:${this.resolve(absolute)}`;
+  // Admitted host paths contain no symlinks; their canonical identity is the
+  // same absolute path used by ordinary host queues. This key grants no access.
+  queueKey = (absolute: string) => this.resolve(absolute);
+
+  /** One input interpretation for tools and policy, with fd-relative @ probes. */
+  resolveInput = async (input: string, cwd = this.root): Promise<string> => {
+    // Validate before repair, reference/home expansion, or URL normalization.
+    this.resolve(input, cwd);
+    const repaired = normalizeFileToolPathParam(input);
+    const reference = repaired.startsWith("@") ? repaired.slice(1) : repaired;
+    this.resolve(reference, cwd);
+    if (/^file:\/\//i.test(reference)) {
+      this.resolve(decodeURIComponent(reference.slice(7)), cwd);
+    }
+    const preserved = await preserveAtPrefixedRelativePath(
+      repaired,
+      cwd,
+      undefined,
+      undefined,
+      this.exists,
+    );
+    return this.resolve(resolveToCwd(preserved, cwd));
+  };
+
+  private exists = async (absolute: string): Promise<boolean> => {
+    return this.operation(async () => {
+      if (this.resolve(absolute) === this.root) {
+        await this.ready();
+        return true;
+      }
+      try {
+        const parent = await this.parent(absolute);
+        try {
+          const stat = await fs.lstat(parent.target);
+          if (stat.isSymbolicLink())
+            throw new Error("Execution-root containment refuses symlinks.");
+          await this.ready();
+          return true;
+        } finally {
+          await parent.close();
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+    });
+  };
+
+  /** Canonical bookkeeping identity: validate existing ancestors through the held root. */
+  resolveIdentity = async (absolute: string): Promise<string> => {
+    const resolved = this.resolve(absolute);
+    let cursor = resolved;
+    while (!(await this.exists(cursor))) cursor = path.dirname(cursor);
+    return resolved;
+  };
 
   private assertActive() {
     this.signal?.throwIfAborted();
@@ -74,17 +132,25 @@ export class ExecutionRootFiles {
     }
 
     this.assertActive();
-    // No eager I/O during schema projection. The outer tool wrapper acquires
-    // this single root before policy hooks; all operations reuse it.
+    // No eager I/O during schema projection. Selected-tool policy preflight
+    // acquires this single root; all operations reuse it.
     const handle = await (this.opening ??= this.openRoot());
     this.assertActive();
-    const [held, named] = await Promise.all([
+    // Calls awaiting the same root share an in-flight identity observation. Separate
+    // stat completions can reorder otherwise synchronous file-queue admissions.
+    // No observation survives settlement, and cancellation stays invocation-owned.
+    await (this.checkingIdentity ??= Promise.all([
       handle.stat({ bigint: true }),
       fs.lstat(this.root, { bigint: true }),
-    ]);
-    if (!named.isDirectory() || named.dev !== held.dev || named.ino !== held.ino) {
-      throw new Error("Execution root was replaced; refusing file operations.");
-    }
+    ])
+      .then(([held, named]) => {
+        if (!named.isDirectory() || named.dev !== held.dev || named.ino !== held.ino) {
+          throw new Error("Execution root was replaced; refusing file operations.");
+        }
+      })
+      .finally(() => {
+        this.checkingIdentity = undefined;
+      }));
     this.assertActive();
     return handle;
   }
@@ -108,9 +174,9 @@ export class ExecutionRootFiles {
     await (await this.opening?.catch(() => undefined))?.close();
   }
 
-  /** Keep the acquisition outside before_tool_call so hooks attest an opened root. */
+  /** Hold the invocation and resolve inputs before descriptor-backed tool execution. */
   bind(tool: AnyAgentTool, cwd: string): AnyAgentTool {
-    return copyAgentToolMetadata(tool, {
+    const bound = copyAgentToolMetadata(tool, {
       ...tool,
       execute: async (id, params, signal, update) => {
         const combined =
@@ -120,13 +186,15 @@ export class ExecutionRootFiles {
             await this.ready();
             const record = params as { path?: unknown } | undefined;
             if (typeof record?.path === "string") {
-              this.resolve(record.path, cwd);
+              params = { ...record, path: await this.resolveInput(record.path, cwd) };
             }
             return await tool.execute(id, params, signal, update);
           }),
         );
       },
     });
+    bindAgentToolExecutionRoot(bound, this, cwd);
+    return bound;
   }
 
   private async operation<T>(run: () => Promise<T>): Promise<T> {

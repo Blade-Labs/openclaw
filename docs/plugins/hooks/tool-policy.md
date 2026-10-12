@@ -43,17 +43,25 @@ For host-rooted runs on Linux, the context may also include
 root path. The host opens one root descriptor before the file-tool policy hook
 and binds built-in `read`, `ls`, `edit`, `write`, and `apply_patch` operations to
 it. Policy can require both fields before allowing a Workshop exception. The
-fields are absent for ordinary runs and sandbox bridges; absence does not prove
-containment. They do not grant authority to shell commands or plugin-owned file
-operations.
+fields come from private metadata on the selected descriptor-backed tool,
+including through hook rebuilding and MCP dispatch. Both fields are absent for
+ordinary runs, sandbox bridges, shell/exec, separate image/media tools, and
+plugin tools, including plugins with file-tool names. Absence does not prove
+containment. Policy must also bind the exact live managed run, require the
+expected root from trusted configuration, and restrict capabilities to the
+five mediated file tools. Rooted input resolution uses descriptor-relative
+existence checks to distinguish literal `@` filenames from file references;
+reads, listings, mutations, patches, and host-derived paths use that same
+interpretation. Derived paths remain best-effort hints; Policy must validate
+arguments and the full patch grammar.
 
 The Linux implementation resolves components beneath held directory descriptors
 with `O_NOFOLLOW`, rejects lexical `..` and absolute escapes, and refuses
 multiply linked regular files. Writes replace directory entries rather than
 truncate existing inodes. This protects against pathname replacement with
-symlinks; it does not freeze directories against relocation by another process
-with permission to rename them. Concurrent hard-link creation and expected-inode
-compare-and-swap for rename/unlink are also outside this contract.
+symlinks; it does not freeze opened files or directories against relocation by
+a process with permission to rename them. Concurrent hard-link creation and
+expected-inode compare-and-swap for rename/unlink are also outside this contract.
 
 It can return:
 

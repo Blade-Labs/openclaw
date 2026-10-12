@@ -5,6 +5,7 @@ import { copyBeforeToolCallMetadata } from "./before-tool-call-metadata.js";
 import { copyChannelAgentToolMeta } from "./channel-tool-metadata.js";
 import { copyCodeModeControlToolIdentity } from "./code-mode-control-tools.js";
 import { copyCronScheduledToolProjection } from "./exec-tool-target-pinning.js";
+import type { ExecutionRootFiles } from "./execution-root-files.js";
 import { copyInternalToolExecutionPreparer } from "./runtime/internal-hooks.js";
 import { copyToolTerminalPresentation } from "./tool-terminal-presentation.js";
 
@@ -12,6 +13,30 @@ export type AgentToolActionDescriptor = Readonly<{
   family: "data" | "tool";
   operation: "filesystem" | "memory" | "openclaw" | "process";
 }>;
+
+// Only constructors that install descriptor-backed operations bind this fact.
+type ExecutionRootToolBinding = {
+  files: ExecutionRootFiles;
+  resolveInputPath: (input: string) => Promise<string>;
+};
+const executionRoots = new WeakMap<object, ExecutionRootToolBinding>();
+
+export function bindAgentToolExecutionRoot(
+  tool: AnyAgentTool,
+  files: ExecutionRootFiles,
+  cwd: string,
+): void {
+  executionRoots.set(tool, { files, resolveInputPath: (input) => files.resolveInput(input, cwd) });
+}
+
+export function getAgentToolExecutionRoot(tool: object): ExecutionRootToolBinding | undefined {
+  return executionRoots.get(tool);
+}
+
+function copyAgentToolExecutionRoot(source: AnyAgentTool, target: AnyAgentTool): void {
+  const files = executionRoots.get(source);
+  if (files) executionRoots.set(target, files);
+}
 
 const actionDescriptors = new WeakMap<AnyAgentTool, AgentToolActionDescriptor>();
 
@@ -45,6 +70,7 @@ export function copyBeforeToolCallWrapperMetadata(
   copyChannelAgentToolMeta(source as never, target as never);
   copyToolTerminalPresentation(source, target);
   copyAgentToolActionDescriptor(source, target);
+  copyAgentToolExecutionRoot(source, target);
   copyAgentToolAvailability(source, target);
 }
 
@@ -77,6 +103,7 @@ export function copyAgentToolMetadata<T extends AnyAgentTool>(source: AnyAgentTo
   copyCronScheduledToolProjection(source, target);
   copyInternalToolExecutionPreparer(source, target);
   copyAgentToolActionDescriptor(source, target);
+  copyAgentToolExecutionRoot(source, target);
   copyAgentToolAvailability(source, target);
   return target;
 }

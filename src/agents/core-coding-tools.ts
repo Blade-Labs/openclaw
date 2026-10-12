@@ -274,13 +274,15 @@ export function createCoreCodingTools(options: CoreCodingToolsOptions): AnyAgent
           : ls;
       // Resolve the default directory before the guard as well as execution.
       base.push(
-        sandboxRoot
-          ? wrapSandboxFileToolPath(guardedLs, {
-              root: sandboxRoot,
-              bridge: sandboxFsBridge!,
-              defaultPath: ".",
-            })
-          : guardedLs,
+        rooted
+          ? rooted.bind(guardedLs, options.codingRoot)
+          : sandboxRoot
+            ? wrapSandboxFileToolPath(guardedLs, {
+                root: sandboxRoot,
+                bridge: sandboxFsBridge!,
+                defaultPath: ".",
+              })
+            : guardedLs,
       );
     }
     const read = sandboxRoot
@@ -298,7 +300,7 @@ export function createCoreCodingTools(options: CoreCodingToolsOptions): AnyAgent
           ...(rooted
             ? {
                 operations: {
-                  resolvePath: (input: string, cwd: string) => rooted.resolve(input, cwd),
+                  resolvePath: rooted.resolveInput,
                   resolveQueueKey: rooted.queueKey,
                   readFile: rooted.readFile,
                   access: rooted.access,
@@ -333,10 +335,11 @@ export function createCoreCodingTools(options: CoreCodingToolsOptions): AnyAgent
           modelContextWindowTokens: options.modelContextWindowTokens,
           imageSanitization: options.imageSanitization,
           cwd: options.codingRoot,
+          executionRootFiles: rooted,
         });
     base.push(
       rooted
-        ? wrapped
+        ? rooted.bind(wrapped, options.codingRoot)
         : wrapReadToolWithSkillContent(
             sandboxRoot ? wrapped : wrapWorkspaceSkillRead(wrapped, skillReadResources, options),
             skillReadResources,
@@ -372,7 +375,13 @@ export function createCoreCodingTools(options: CoreCodingToolsOptions): AnyAgent
             memoryWriteProvenance: options.memoryWriteProvenance,
             abortSignal: options.abortSignal,
           });
-      base.push(options.workspaceOnly && !rooted ? guardHostWorkspaceTool(edit, options) : edit);
+      base.push(
+        rooted
+          ? rooted.bind(edit, options.codingRoot)
+          : options.workspaceOnly
+            ? guardHostWorkspaceTool(edit, options)
+            : edit,
+      );
       const write = rootedOperations
         ? createWriteTool(options.codingRoot, { operations: rootedOperations })
         : createHostWorkspaceWriteTool(options.codingRoot, {
@@ -381,7 +390,13 @@ export function createCoreCodingTools(options: CoreCodingToolsOptions): AnyAgent
             memoryWriteProvenance: options.memoryWriteProvenance,
             abortSignal: options.abortSignal,
           });
-      base.push(options.workspaceOnly && !rooted ? guardHostWorkspaceTool(write, options) : write);
+      base.push(
+        rooted
+          ? rooted.bind(write, options.codingRoot)
+          : options.workspaceOnly
+            ? guardHostWorkspaceTool(write, options)
+            : write,
+      );
     }
   }
 
@@ -421,25 +436,24 @@ export function createCoreCodingTools(options: CoreCodingToolsOptions): AnyAgent
     options.applyPatchEnabled &&
     (!sandboxRoot || allowWorkspaceWrites)
   ) {
-    shell.push(
-      createApplyPatchTool({
-        cwd: options.codingRoot,
-        root: options.containmentRoot,
-        executionRootFiles: rooted,
-        sandbox:
-          sandboxRoot && allowWorkspaceWrites
-            ? {
-                root: sandboxRoot,
-                bridge: sandboxFsBridge!,
-                workspaceMounts: sandboxWorkspaceMounts,
-              }
-            : undefined,
-        workspaceOnly: options.applyPatchWorkspaceOnly,
-        containmentSource: options.applyPatchContainmentSource,
-        memoryWriteProvenance: options.memoryWriteProvenance,
-        abortSignal: options.abortSignal,
-      }),
-    );
+    const patch = createApplyPatchTool({
+      cwd: options.codingRoot,
+      root: options.containmentRoot,
+      executionRootFiles: rooted,
+      sandbox:
+        sandboxRoot && allowWorkspaceWrites
+          ? {
+              root: sandboxRoot,
+              bridge: sandboxFsBridge!,
+              workspaceMounts: sandboxWorkspaceMounts,
+            }
+          : undefined,
+      workspaceOnly: options.applyPatchWorkspaceOnly,
+      containmentSource: options.applyPatchContainmentSource,
+      memoryWriteProvenance: options.memoryWriteProvenance,
+      abortSignal: options.abortSignal,
+    });
+    shell.push(rooted ? rooted.bind(patch, options.codingRoot) : patch);
   }
   if (options.shellTools === "full") {
     shell.push(
@@ -476,9 +490,5 @@ export function createCoreCodingTools(options: CoreCodingToolsOptions): AnyAgent
   shell.forEach((tool) =>
     bindAgentToolActionDescriptor(tool, { family: "tool", operation: "process" }),
   );
-  return [...base, ...shell].map((tool) =>
-    rooted && ["read", "ls", "edit", "write", "apply_patch"].includes(tool.name)
-      ? rooted.bind(tool, options.codingRoot)
-      : tool,
-  );
+  return [...base, ...shell];
 }

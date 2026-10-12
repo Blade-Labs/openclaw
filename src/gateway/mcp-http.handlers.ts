@@ -212,6 +212,7 @@ export async function handleMcpJsonRpc(params: {
         // and audit behavior matches native tool calls from normal chat runs.
         // Preserve prepared params so exec can restore private workdir/env state after hooks.
         const hookResult = await runBeforeToolCallHook({
+          tool,
           toolName,
           params: preparedToolArgs,
           toolCallId,

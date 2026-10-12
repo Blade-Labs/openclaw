@@ -418,19 +418,11 @@ async function startMcpLoopbackServer(
           let response: object | null;
           try {
             const handleRequest = async (signal: AbortSignal) => {
-              const rootedFiles = boundClientGrant?.rootedExecution?.executionRootFiles;
-              await rootedFiles?.ready();
               return await handleMcpJsonRpc({
                 message,
                 tools: scopedTools.tools,
                 toolSchema: scopedTools.toolSchema,
                 hookContext: {
-                  ...(rootedFiles
-                    ? {
-                        executionRootContainment: "operation-bound" as const,
-                        executionRoot: rootedFiles.root,
-                      }
-                    : {}),
                   agentId: scopedTools.agentId,
                   config: cfg,
                   ...(scopedTools.workspaceDir ? { workspaceDir: scopedTools.workspaceDir } : {}),

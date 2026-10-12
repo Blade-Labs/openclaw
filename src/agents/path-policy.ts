@@ -216,12 +216,14 @@ export function preserveAtPrefixedRelativePath(
   cwd: string,
   bridge: SandboxFsBridge | undefined,
   signal?: AbortSignal,
+  exists?: (absolute: string) => Promise<boolean>,
 ): string | Promise<string>;
 export function preserveAtPrefixedRelativePath(
   filePath: string,
   cwd: string,
   bridge?: SandboxFsBridge,
   signal?: AbortSignal,
+  exists?: (absolute: string) => Promise<boolean>,
 ): string | Promise<string> {
   if (!filePath.startsWith("@")) {
     return filePath;
@@ -250,6 +252,12 @@ export function preserveAtPrefixedRelativePath(
     literalAncestor = parent;
   }
   const ancestorPath = literalAncestor === filePath ? undefined : `./${literalAncestor}`;
+  if (exists) {
+    return Promise.all([
+      exists(path.resolve(cwd, literalPath)),
+      ancestorPath ? exists(path.resolve(cwd, ancestorPath)) : false,
+    ]).then(([literal, ancestor]) => (literal || ancestor ? literalPath : filePath));
+  }
   const mountedHostPath = bridge?.resolvePath({ filePath: literalPath, cwd }).hostPath;
   if (!bridge || mountedHostPath) {
     const hostPath = mountedHostPath ?? path.resolve(cwd, literalPath);

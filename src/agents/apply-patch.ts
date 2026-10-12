@@ -355,9 +355,11 @@ async function resolvePatchInputPaths(
     // Resolving after an earlier hunk mutates state can silently retarget later hunks.
     resolved.set(
       rawPath,
-      options.sandbox
-        ? await resolveApplyPatchInputPath(rawPath, options)
-        : preserveAtPrefixedRelativePath(rawPath, options.cwd),
+      options.executionRootFiles
+        ? await options.executionRootFiles.resolveInput(rawPath, options.cwd)
+        : options.sandbox
+          ? await resolveApplyPatchInputPath(rawPath, options)
+          : preserveAtPrefixedRelativePath(rawPath, options.cwd),
     );
   }
   return resolved;
@@ -455,10 +457,9 @@ async function resolvePatchPath(
   }
 
   if (options.executionRootFiles) {
-    const resolved = options.executionRootFiles.resolve(
-      options.patchInputPaths?.get(rawFilePath) ?? rawFilePath,
-      options.cwd,
-    );
+    const resolved =
+      options.patchInputPaths?.get(rawFilePath) ??
+      (await options.executionRootFiles.resolveInput(rawFilePath, options.cwd));
     return {
       resolved,
       queueKey: options.executionRootFiles.queueKey(resolved),

@@ -33,15 +33,6 @@ export type ToolOutcomeObservation = {
 export type ToolOutcomeObserver = (observation: ToolOutcomeObservation) => void;
 
 export type HookContext = {
-  /** Core accessor opens the root before policy; retained across harness wrapper rebuilds. */
-  prepareExecutionRootContainment?: () => Promise<{
-    executionRootContainment: "operation-bound";
-    executionRoot: string;
-  }>;
-  /** Host file tools use a held Linux root descriptor; absent for other backends. */
-  executionRootContainment?: "operation-bound";
-  /** Absolute execution root bound by the host; meaningful only with containment above. */
-  executionRoot?: string;
   source?: TurnSourceProvenance;
   /** Host accessor captures the current admitted source once per tool invocation. */
   readSource?: () => TurnSourceProvenance;

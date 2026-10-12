@@ -763,6 +763,9 @@ export type PluginHookBeforeToolCallEvent = {
   derivedPaths?: readonly string[];
 };
 
+/** Host-observed outcome; tool errors with uncertain effects have no receipt. */
+export type PluginHookExecutionReceipt = Readonly<{ outcome: "succeeded" | "failed" }>;
+
 export type PluginHookAfterToolCallEvent = {
   toolName: string;
   params: Record<string, unknown>;
@@ -771,6 +774,7 @@ export type PluginHookAfterToolCallEvent = {
   result?: unknown;
   error?: string;
   durationMs?: number;
+  executionReceipt?: PluginHookExecutionReceipt;
 };
 
 export type PluginHookToolResultPersistContext = {

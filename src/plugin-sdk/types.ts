@@ -7,6 +7,8 @@ export type {
   PluginHookAgentTrigger,
   PluginHookBeforeToolCallEvent,
   PluginHookBeforeToolCallResult,
+  PluginHookAfterToolCallEvent,
+  PluginHookExecutionReceipt,
   PluginHookSkillArtifact,
   PluginHookSkillBundleFile,
   PluginHookSkillBundleSnapshot,
@@ -23,3 +25,9 @@ export type {
   PluginHookToolResultPersistResult,
 } from "../plugins/hook-types.js";
 export type { TurnSourceProvenance } from "../infra/turn-source-provenance.js";
+export type {
+  PluginApprovalUX,
+  AuthenticatedApprovalIdentity,
+  ApprovalGitHubReadRequest,
+  ApprovalGitHubFacts,
+} from "../plugins/runtime/types-approval-ux.js";

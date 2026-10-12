@@ -224,12 +224,50 @@ second argument contains host evidence:
   resolvedAtMs?: number;
   resolvedByActor?: ApprovalResolvingActor | null;
   terminalReason?: ApprovalTerminalReason | null;
+  delivered?: boolean;
+  displayUpdate?: "succeeded" | "failed" | "rate-limited";
+  dispatch?: "failed-before-dispatch" | "dispatched";
 }
 ```
 
-The host copies these facts from the matching request/wait response. A failure before a request ID exists has no receipt. A known no-route record
-retains its ID and available timestamps without inventing a resolver or success. A receipt records consent; it does not prove that the
-tool completed. Existing one-argument callbacks continue to work.
+The host copies these facts from the matching request/wait response. A failure
+before a request ID exists has no receipt. A known no-route record retains its
+ID and timestamps without inventing a resolver or delivery. Closed gates record
+`dispatch: "failed-before-dispatch"`. Approval callbacks run before dispatch,
+so allow receipts omit dispatch and any unobserved delivery or display edit.
+
+The host awaits `onResolution` before approved dispatch. A thrown error, rejected
+promise, cancellation, or expired callback wait blocks the tool call. The decision
+wait and authorization callback share the existing approval timeout budget.
+Terminal notifications cannot authorize work and retain a bounded cleanup wait
+when the decision budget has expired. Existing one-argument callbacks work.
+A timed-out callback may still settle later, but cannot release the closed gate.
+
+`after_tool_call` includes optional `executionReceipt: { outcome: "succeeded" |
+"failed" }` only when the host's effect owner knows the outcome. An error after
+a possible write remains unknown and has no execution receipt.
+
+### Approval UX host port
+
+Plugins consume `api.runtime.approvalUX` through the public SDK. Its
+`awaitsResolution: true` and `scopedDecisions: true` flags qualify callback and
+scoped decision plumbing; they do not establish authenticated identity, display
+masking, or standing grant storage.
+
+The current host returns `null` from `identity(ctx)`: MCP configuration and
+connection resolvers expose no verified GitHub installation ID or effective
+access scope. Requested OAuth scope, URLs, credentials, and model parameters
+cannot substitute for those facts. `githubRead(request, ctx)` rejects without
+that verified connection binding. `maskDisplay(value, ctx)` rejects because the
+host has no Disclosure masking integration. No grant storage or file fallback is
+exposed. Standing approvals must remain disabled until these dependencies exist.
+
+A future qualified identity must bind authenticated human Teams DM provenance,
+configured owner identity, agent/session, GitHub installation and current access,
+and a boot ID. The host must not infer it from display names or caller-supplied
+context. The required synchronous storage callback also needs a worker-compatible
+execution contract and agent confinement: the existing asynchronous state API
+cannot atomically run an arbitrary caller closure in a SQLite worker.
 
 ## Route approval prompts
 

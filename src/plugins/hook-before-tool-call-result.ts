@@ -18,6 +18,10 @@ export type PluginApprovalResolution =
 /** Host-provided decision evidence; does not prove the tool completed. */
 export type PluginApprovalReceipt = Omit<ApprovalWaitDecisionResult, "id" | "authorization"> & {
   approvalId: string;
+  /** Only observed presentation facts; consent alone proves neither. */
+  delivered?: boolean;
+  displayUpdate?: "succeeded" | "failed" | "rate-limited";
+  dispatch?: "failed-before-dispatch" | "dispatched";
 };
 
 export type PluginHookBeforeToolCallResult = {
@@ -43,6 +47,7 @@ export type PluginHookBeforeToolCallResult = {
     /** Reviewer-safe description of the exact delegation and permitted future changes. */
     grantScopeSummary?: string;
     pluginId?: string;
+    /** Awaited before approved dispatch; failure or expiry blocks execution. */
     onResolution?: (
       decision: PluginApprovalResolution,
       receipt?: PluginApprovalReceipt,

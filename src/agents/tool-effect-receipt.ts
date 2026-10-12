@@ -1,3 +1,4 @@
+import type { PluginHookExecutionReceipt } from "../plugins/hook-types.js";
 import {
   attachInternalToolResultProvenance,
   getInternalToolResultProvenance,
@@ -83,4 +84,20 @@ export function buildToolEffectReceipt(params: {
     state:
       params.mutatingAction && params.outcome === "success" ? "mutation_committed" : "uncertain",
   };
+}
+
+/** Expose only settled host effect facts; a tool error alone can follow a commit. */
+export function projectToolExecutionReceipt(
+  receipt: ToolEffectReceipt | undefined,
+): PluginHookExecutionReceipt | undefined {
+  switch (receipt?.state) {
+    case "mutation_committed":
+    case "read_completed":
+      return { outcome: "succeeded" };
+    case "not_started":
+    case "failed_no_effect":
+      return { outcome: "failed" };
+    default:
+      return undefined;
+  }
 }

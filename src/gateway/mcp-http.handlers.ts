@@ -8,6 +8,8 @@ import { redeemApprovalExecutions } from "../agents/approval-execution.js";
 import { extractToolErrorMessage } from "../agents/embedded-agent-tool-results.js";
 import { runAgentHarnessAfterToolCallHook } from "../agents/harness/hook-helpers.js";
 import { copyInternalToolResultState } from "../agents/runtime/internal-hooks.js";
+import { buildToolEffectReceipt, readToolEffectReceipt } from "../agents/tool-effect-receipt.js";
+import { buildToolMutationState } from "../agents/tool-mutation.js";
 import {
   formatToolExecutionErrorMessage,
   protectNetworkToolExecutionError,
@@ -143,11 +145,21 @@ export async function handleMcpJsonRpc(params: {
       const toolCallId = `mcp-${crypto.randomUUID()}`;
       const startedAt = Date.now();
       let executedToolArgs = toolArgs;
+      let executionStarted = false;
       const reportToolCallResult = (
         outcome: McpLoopbackToolCallOutcome,
         result: unknown,
         error?: string,
       ) => {
+        const mutation = buildToolMutationState(toolName, executedToolArgs);
+        const effectReceipt =
+          readToolEffectReceipt(result) ??
+          buildToolEffectReceipt({
+            executionStarted,
+            mutatingAction: mutation.mutatingAction,
+            replaySafe: mutation.replaySafe,
+            outcome: outcome.outcome === "completed" ? "success" : "failure",
+          });
         void runAgentHarnessAfterToolCallHook({
           toolName,
           toolCallId,
@@ -159,6 +171,7 @@ export async function handleMcpJsonRpc(params: {
           startArgs: executedToolArgs,
           result,
           error,
+          effectReceipt,
           startedAt,
         }).catch(() => {});
         try {
@@ -241,6 +254,7 @@ export async function handleMcpJsonRpc(params: {
         let result: Awaited<ReturnType<typeof tool.execute>>;
         try {
           assertApprovalCurrent();
+          executionStarted = true;
           result = await tool.execute(toolCallId, finalizedToolArgs, params.signal);
         } catch (error) {
           throw tool.resultContentSource === "network"

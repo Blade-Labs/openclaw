@@ -129,24 +129,82 @@ function buildPluginApprovalReceipt(
   };
 }
 
-function notifyPluginApprovalResolution(
+class PluginApprovalResolutionError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(`Plugin approval resolution callback failed; tool call did not run: ${message}`, {
+      cause,
+    });
+    this.name = "PluginApprovalResolutionError";
+  }
+}
+
+async function notifyPluginApprovalResolution(
   approval: PluginApprovalRequest,
   resolution: PluginApprovalResolution,
   receipt?: PluginApprovalReceipt,
-): void {
+  deadlineMs = Date.now() + resolvePluginToolApprovalTimeoutMs(approval),
+  signal?: AbortSignal,
+): Promise<void> {
   const onResolution = approval.onResolution;
   if (typeof onResolution !== "function") {
     return;
   }
-  try {
-    void Promise.resolve(
-      receipt ? onResolution(resolution, receipt) : onResolution(resolution),
-    ).catch((err: unknown) => {
-      log.warn(`plugin onResolution callback failed: ${String(err)}`);
-    });
-  } catch (err) {
-    log.warn(`plugin onResolution callback failed: ${String(err)}`);
+  const permitsDispatch =
+    resolution === PluginApprovalResolutions.ALLOW_ONCE ||
+    resolution === PluginApprovalResolutions.ALLOW_15M ||
+    resolution === PluginApprovalResolutions.ALLOW_SESSION ||
+    resolution === PluginApprovalResolutions.ALLOW_ALWAYS;
+  if (!permitsDispatch) {
+    // The gate is already closed. Preserve terminal observations even when the
+    // decision wait spent the entire budget, without delaying a run indefinitely.
+    deadlineMs = Date.now() + resolvePluginToolApprovalTimeoutMs(approval);
+    receipt = receipt ? { ...receipt, dispatch: "failed-before-dispatch" } : undefined;
   }
+  // This callback commits policy authorization, so it is part of the approval
+  // budget, not best-effort telemetry. Late settlement cannot release this gate.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    signal?.throwIfAborted();
+    const remainingMs = deadlineMs - Date.now();
+    if (remainingMs <= 0) {
+      throw new Error("approval timeout expired");
+    }
+    const stopped = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("approval timeout expired")), remainingMs);
+      timer.unref?.();
+      if (signal) {
+        onAbort = () => reject(new Error("run aborted"));
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+    });
+    await Promise.race([
+      Promise.resolve().then(() =>
+        receipt ? onResolution(resolution, receipt) : onResolution(resolution),
+      ),
+      stopped,
+    ]);
+    signal?.throwIfAborted();
+    if (Date.now() >= deadlineMs) {
+      throw new Error("approval timeout expired");
+    }
+  } catch (error) {
+    throw new PluginApprovalResolutionError(formatErrorMessage(error), error);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+    if (onAbort) {
+      signal?.removeEventListener("abort", onAbort);
+    }
+  }
+}
+
+/** Terminal notifications cannot authorize dispatch; cleanup stays best effort. */
+function notifyCancelledPluginApproval(approval: PluginApprovalRequest): void {
+  void notifyPluginApprovalResolution(approval, PluginApprovalResolutions.CANCELLED).catch(
+    (error: unknown) => log.warn(formatErrorMessage(error)),
+  );
 }
 
 function resolvePermittedPluginApprovalResolution(
@@ -243,6 +301,7 @@ async function requestPluginToolApproval(params: {
   const approval = params.approval;
   const timeoutMs = resolvePluginToolApprovalTimeoutMs(approval);
   const gatewayTimeoutMs = resolvePluginToolApprovalGatewayTimeoutMs(timeoutMs);
+  const resolutionDeadlineMs = Date.now() + timeoutMs;
   const grantEligible = approval.grantEligible === true;
   const allowedDecisions = resolveCanonicalPluginApprovalRequestAllowedDecisions({
     ...approval,
@@ -276,7 +335,13 @@ async function requestPluginToolApproval(params: {
       });
       const decision = result.decision;
       const resolution = resolvePermittedPluginApprovalResolution(decision, allowedDecisions);
-      notifyPluginApprovalResolution(approval, resolution, result.receipt);
+      await notifyPluginApprovalResolution(
+        approval,
+        resolution,
+        result.receipt,
+        resolutionDeadlineMs,
+        params.signal,
+      );
       if (
         resolution === PluginApprovalResolutions.ALLOW_ONCE ||
         resolution === PluginApprovalResolutions.ALLOW_15M ||
@@ -317,7 +382,7 @@ async function requestPluginToolApproval(params: {
 
     const unavailableSurfaceReason = resolveUnavailablePluginApprovalSurfaceReason(params.ctx);
     if (unavailableSurfaceReason) {
-      notifyPluginApprovalResolution(approval, PluginApprovalResolutions.CANCELLED);
+      notifyCancelledPluginApproval(approval);
       return {
         blocked: true,
         kind: "failure",
@@ -371,7 +436,7 @@ async function requestPluginToolApproval(params: {
     gatewayApprovalPhase = "none";
     const id = requestResult?.id;
     if (!id) {
-      notifyPluginApprovalResolution(approval, PluginApprovalResolutions.CANCELLED);
+      notifyCancelledPluginApproval(approval);
       return {
         blocked: true,
         kind: "failure",
@@ -388,10 +453,11 @@ async function requestPluginToolApproval(params: {
     if (hasImmediateDecision) {
       decision = requestResult?.decision;
       if (decision === null) {
-        notifyPluginApprovalResolution(
+        await notifyPluginApprovalResolution(
           approval,
           PluginApprovalResolutions.CANCELLED,
           buildPluginApprovalReceipt(id, requestResult),
+          resolutionDeadlineMs,
         );
         return {
           blocked: true,
@@ -432,7 +498,13 @@ async function requestPluginToolApproval(params: {
     }
     const resolution = resolvePermittedPluginApprovalResolution(decision, allowedDecisions);
     const receipt = buildPluginApprovalReceipt(id, receiptData);
-    notifyPluginApprovalResolution(approval, resolution, receipt);
+    await notifyPluginApprovalResolution(
+      approval,
+      resolution,
+      receipt,
+      resolutionDeadlineMs,
+      params.signal,
+    );
     if (
       resolution === PluginApprovalResolutions.ALLOW_ONCE ||
       resolution === PluginApprovalResolutions.ALLOW_15M ||
@@ -476,7 +548,17 @@ async function requestPluginToolApproval(params: {
       params: params.baseParams,
     };
   } catch (err) {
-    notifyPluginApprovalResolution(approval, PluginApprovalResolutions.CANCELLED);
+    if (err instanceof PluginApprovalResolutionError) {
+      return {
+        blocked: true,
+        kind: "failure",
+        disposition: "blocked",
+        deniedReason: "plugin-approval",
+        reason: err.message,
+        params: params.baseParams,
+      };
+    }
+    notifyCancelledPluginApproval(approval);
     const signal = params.signal;
     const abortCancelled =
       signal?.aborted === true &&
@@ -546,7 +628,7 @@ export async function requestDeferredPluginToolApproval(params: {
 export function cancelDeferredPluginToolApproval(
   deferredApproval: DeferredPluginToolApproval,
 ): void {
-  notifyPluginApprovalResolution(deferredApproval.approval, PluginApprovalResolutions.CANCELLED);
+  notifyCancelledPluginApproval(deferredApproval.approval);
 }
 
 export async function resolveBeforeToolCallApprovalOutcome(params: {
@@ -585,7 +667,7 @@ export async function resolveBeforeToolCallApprovalOutcome(params: {
     };
   }
   if (params.approvalMode === "report") {
-    notifyPluginApprovalResolution(approval, PluginApprovalResolutions.CANCELLED);
+    notifyCancelledPluginApproval(approval);
     return {
       blocked: true,
       kind: "failure",
@@ -596,7 +678,9 @@ export async function resolveBeforeToolCallApprovalOutcome(params: {
     };
   }
   if (params.approvalMode === "deny") {
-    notifyPluginApprovalResolution(approval, PluginApprovalResolutions.DENY);
+    void notifyPluginApprovalResolution(approval, PluginApprovalResolutions.DENY).catch(
+      (error: unknown) => log.warn(formatErrorMessage(error)),
+    );
     return {
       blocked: true,
       kind: "veto",

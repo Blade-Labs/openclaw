@@ -216,6 +216,7 @@ export const createPluginRuntime: PluginRuntimeFactory = (
     },
     gateway: _options.gateway ?? createRuntimeGateway(),
     config: base.config,
+    approvalUX: base.approvalUX,
     agent,
     hooks: _options.hooks ?? {
       dispatchHookAgentTurn: async () => {

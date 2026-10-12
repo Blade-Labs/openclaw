@@ -93,6 +93,36 @@ describe("session approval projection", () => {
     ]);
   });
 
+  it("projects a replayed plugin approval with no once choice to deny only", () => {
+    const replay = (allowedDecisions: unknown[]) =>
+      projectSessionApprovalReplay(
+        {
+          sessionKey: "agent:main:host",
+          updatedAtMs: 2_000,
+          approvals: [
+            {
+              ...pendingPluginApproval,
+              presentation: { ...pendingPluginApproval.presentation, allowedDecisions },
+            },
+          ],
+          truncated: false,
+        },
+        "agent:main:host",
+      );
+
+    // Scoped grants without allow-once leave deny as the only chat choice.
+    expect(replay(["allow-15m", "allow-session", "deny"])).toEqual([
+      expect.objectContaining({
+        id: "plugin:approval-1",
+        request: expect.objectContaining({ allowedDecisions: ["deny"] }),
+      }),
+    ]);
+    // The replay contract always lists deny, so scoped-only or unknown lists
+    // are rejected before projection rather than widened to card defaults.
+    expect(replay(["allow-15m", "allow-session"])).toEqual([]);
+    expect(replay(["approve", "deny"])).toEqual([]);
+  });
+
   it("ignores malformed replay and live events", () => {
     expect(projectSessionApprovalReplay({ approvals: [{}] }, "agent:main:host")).toEqual([]);
     expect(reconcileSessionApprovalEvent([], { sessionKey: "agent:main:host" })).toBeNull();

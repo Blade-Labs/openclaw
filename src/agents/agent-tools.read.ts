@@ -784,14 +784,15 @@ export function wrapToolMemoryFlushAppendOnlyWrite(
     execute: async (toolCallId, args, signal, onUpdate) => {
       const assertCurrent = captureAgentToolSourceExecutionGuard(signal);
       const record = getToolParamsRecord(args);
-      const normalizedRecord = record
-        ? await normalizeFileToolPathParamsFromKeys(
-            record,
-            ["path"],
-            options.executionRootFiles ? undefined : options.root,
-            options.sandbox?.bridge,
-          )
-        : undefined;
+      const normalizedRecord =
+        record && !options.executionRootFiles
+          ? await normalizeFileToolPathParamsFromKeys(
+              record,
+              ["path"],
+              options.root,
+              options.sandbox?.bridge,
+            )
+          : record;
       assertRequiredParams(normalizedRecord, REQUIRED_PARAM_GROUPS.write, tool.name);
       const filePath =
         typeof normalizedRecord?.path === "string" && normalizedRecord.path.trim()
@@ -803,7 +804,7 @@ export function wrapToolMemoryFlushAppendOnlyWrite(
       }
 
       const resolvedPath = options.executionRootFiles
-        ? await options.executionRootFiles.resolveInput(filePath, options.root)
+        ? options.executionRootFiles.resolve(filePath, options.root)
         : resolveToolPathAgainstWorkspaceRoot({
             filePath,
             root: options.root,
@@ -1149,14 +1150,15 @@ export function createOpenClawReadTool(
     ...base,
     execute: async (toolCallId, params, signal) => {
       const record = getToolParamsRecord(params);
-      const normalizedRecord = record
-        ? await normalizeFileToolPathParamsFromKeys(
-            record,
-            ["path"],
-            options?.executionRootFiles ? undefined : options?.cwd,
-            options?.bridge,
-          )
-        : undefined;
+      const normalizedRecord =
+        record && !options?.executionRootFiles
+          ? await normalizeFileToolPathParamsFromKeys(
+              record,
+              ["path"],
+              options?.cwd,
+              options?.bridge,
+            )
+          : record;
       assertRequiredParams(normalizedRecord, REQUIRED_PARAM_GROUPS.read, base.name);
       const filePath =
         typeof normalizedRecord?.path === "string" ? normalizedRecord.path : "<unknown>";

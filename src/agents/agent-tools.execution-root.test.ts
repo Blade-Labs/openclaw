@@ -325,6 +325,115 @@ describe.runIf(process.platform === "linux")("execution-root file containment", 
     },
   );
 
+  it("keeps a URL-decoded Office suffix on the same hook/read/edit/write/patch path", async () => {
+    const { root, call } = await fixture();
+    const selected = path.join(root, "name.docodex");
+    const sibling = path.join(root, "name.docx");
+    const input = `file://${root}/name.doc%6Fdex`;
+    await fs.writeFile(selected, "selected original\n");
+    await fs.writeFile(sibling, "sibling original\n");
+    const policyPaths: unknown[] = [];
+    hook(async (event) => {
+      policyPaths.push(event.derivedPaths);
+    });
+    expect(JSON.stringify(await call("read", { path: input }))).toContain("selected original");
+    await call("edit", { path: input, edits: [{ oldText: "original", newText: "edited" }] });
+    expect(await fs.readFile(selected, "utf8")).toBe("selected edited\n");
+    await call("write", { path: input, content: "selected written\n" });
+    expect(await fs.readFile(selected, "utf8")).toBe("selected written\n");
+    await call(
+      "apply_patch",
+      patch(`*** Update File: ${input}\n@@\n-selected written\n+selected patched`),
+    );
+    expect(await fs.readFile(selected, "utf8")).toBe("selected patched\n");
+    expect(await fs.readFile(sibling, "utf8")).toBe("sibling original\n");
+    expect(policyPaths).toEqual(Array.from({ length: 4 }, () => [selected]));
+  });
+
+  it.each(["write", "edit"])(
+    "admits an @ write before a dependent plain-path %s while the path probe waits",
+    async (nextTool) => {
+      const { root, call } = await fixture(false, { wrapBeforeToolCallHook: false });
+      const file = path.join(root, "existing.md");
+      await fs.writeFile(file, "original");
+      const probing = createDeferredCore<void>();
+      const release = createDeferredCore<void>();
+      const nextAdmission = createDeferredCore<void>();
+      const lstat = fs.lstat;
+      vi.spyOn(fs, "lstat").mockImplementation(async (...args) => {
+        if (String(args[0]).endsWith("/@existing.md")) {
+          probing.resolve();
+          await release.promise;
+        }
+        return lstat(...args);
+      });
+      const queue = mutationQueue.withFileMutationQueueKeyResolution;
+      vi.spyOn(mutationQueue, "withFileMutationQueueKeyResolution").mockImplementation(
+        (key, run) => {
+          const pending = queue(key, run);
+          nextAdmission.resolve();
+          return pending;
+        },
+      );
+      const first = call("write", { path: "@existing.md", content: "first" });
+      await probing.promise;
+      const second = call(
+        nextTool,
+        nextTool === "write"
+          ? { path: "existing.md", content: "second" }
+          : { path: "existing.md", edits: [{ oldText: "first", newText: "second" }] },
+      );
+      const settled = Promise.allSettled([first, second]);
+      try {
+        await nextAdmission.promise;
+      } finally {
+        release.resolve();
+      }
+      const results = await settled;
+      expect(results.map((result) => result.status)).toEqual(["fulfilled", "fulfilled"]);
+      expect(await fs.readFile(file, "utf8")).toBe("second");
+    },
+  );
+
+  it("refuses to read a filename sibling when the canonical rooted path is missing", async () => {
+    const { root, call } = await fixture();
+    const canonical = path.join(root, "name\u2019s.md");
+    const sibling = path.join(root, "name's.md");
+    await fs.writeFile(sibling, "sibling original\n");
+    const policyPaths: unknown[] = [];
+    hook(async (event) => {
+      policyPaths.push(event.derivedPaths);
+    });
+    const input = `file://${root}/name%E2%80%99s.md`;
+    await expect(call("read", { path: input })).rejects.toMatchObject({ code: "ENOENT" });
+    await call("write", { path: input, content: "canonical written\n" });
+    expect(JSON.stringify(await call("read", { path: input }))).toContain("canonical written");
+    expect(await fs.readFile(sibling, "utf8")).toBe("sibling original\n");
+    expect(policyPaths).toEqual(Array.from({ length: 3 }, () => [canonical]));
+  });
+
+  it.each(["ls", "rejected-probe"])(
+    "releases admission after a rooted call without a queue: %s",
+    async (firstCall) => {
+      const { root, outside, call } = await fixture(false, { wrapBeforeToolCallHook: false });
+      await fs.symlink(path.join(outside, "skill.txt"), path.join(root, "@blocked.md"));
+      const results = await Promise.allSettled([
+        firstCall === "ls"
+          ? call("ls", { path: "." })
+          : call("write", { path: "@blocked.md", content: "blocked" }),
+        call("write", { path: "existing.md", content: "second" }),
+      ]);
+      expect(results.map((result) => result.status)).toEqual([
+        firstCall === "ls" ? "fulfilled" : "rejected",
+        "fulfilled",
+      ]);
+      expect(await fs.readFile(path.join(root, "existing.md"), "utf8")).toBe("second");
+      expect(await fs.readFile(path.join(outside, "skill.txt"), "utf8")).toBe(
+        "outside unchanged\n",
+      );
+    },
+  );
+
   it("shares @ directory and new descendant semantics with listing and patch policy", async () => {
     const { root, call } = await fixture();
     await fs.mkdir(path.join(root, "@literal"));

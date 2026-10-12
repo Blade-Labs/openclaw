@@ -338,7 +338,7 @@ async function startMcpLoopbackServer(
           return;
         }
         const yieldContext = resolveMcpLoopbackYieldContext(cliRequestCaptureHandle);
-        // Tools capture their creator at construction, not the later HTTP execution scope.
+        // Materialize tools with this request's final-effect authority. Only schemas are shared.
         const scopedTools = await withAgentQuestionAnswerAuthority(
           boundClientGrant?.questionAnswerAuthority,
           () =>
@@ -357,9 +357,8 @@ async function startMcpLoopbackServer(
                   }
                 : {}),
               ...(boundGrantToken ? { grantToken: boundGrantToken } : {}),
-              // Same liveness check `authorizeToolCall` applies after the hook,
-              // handed to run-contract tools so a revocation that lands while a
-              // call is in flight also fails the durable write.
+              // Retained factory assertions check this exact request after awaits
+              // and immediately before effects, including connection cancellation.
               isGrantCurrent: authorizeToolCall,
               yieldContextCacheKey: yieldContext?.cacheKey,
               onYield: yieldContext?.onYield,

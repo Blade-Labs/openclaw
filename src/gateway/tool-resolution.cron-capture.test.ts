@@ -40,7 +40,7 @@ describe("MCP automation creator capture", () => {
     vi.unstubAllEnvs();
   });
 
-  it("keeps cached standalone plugin tools fenced by their original live grant", async () => {
+  it("keeps request-bound plugin tools fenced by their original live grant", async () => {
     const root = tempDirs.make("openclaw-plugin-grant-");
     vi.stubEnv("OPENCLAW_STATE_DIR", root);
     const cfg: OpenClawConfig = { tools: { allow: ["probe"] }, plugins: { enabled: false } };
@@ -79,9 +79,10 @@ describe("MCP automation creator capture", () => {
     const second = await cache.resolve(input);
     const tool = expectDefined(
       second.tools.find((entry) => entry.name === "probe"),
-      "cached plugin tool",
+      "request-bound plugin tool",
     );
-    expect(second).toBe(first);
+    expect(second.toolSchema).toBe(first.toolSchema);
+    expect(second.tools[0]).not.toBe(first.tools[0]);
     await tool.execute("allowed", {});
     expect(effect).toHaveBeenCalledOnce();
     current = false;

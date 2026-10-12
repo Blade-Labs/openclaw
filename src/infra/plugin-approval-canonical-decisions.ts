@@ -9,6 +9,7 @@ export function resolveCanonicalPluginApprovalRequestAllowedDecisions(params?: {
   grantScopeSummary?: string;
   mcpTool?: { server: string; tool: string };
   placementGrant?: unknown;
+  nativeApproval?: true;
 }): readonly ExecApprovalDecision[] {
   const allowedDecisions = resolvePluginApprovalRequestAllowedDecisions(params);
   return allowedDecisions.includes("deny") ? allowedDecisions : [...allowedDecisions, "deny"];

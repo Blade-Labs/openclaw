@@ -34,6 +34,13 @@ export const ApprovalDecisionSchema = Type.Union([
   Type.Literal("deny"),
 ]);
 
+/** Exec approvals retain their narrower decision contract across native generators. */
+export const ExecApprovalDecisionSchema = Type.Union([
+  Type.Literal("allow-once"),
+  Type.Literal("allow-always"),
+  Type.Literal("deny"),
+]);
+
 /** Reviewer decisions that permit an operation to proceed. */
 export const ApprovalAllowDecisionSchema = Type.Union([
   Type.Literal("allow-once"),
@@ -166,10 +173,12 @@ export const ExecApprovalPresentationSchema = Type.Object(
     nodeId: Type.Optional(Type.Union([NonEmptyString, Type.Null()])),
     agentId: Type.Optional(Type.Union([NonEmptyString, Type.Null()])),
     scope: Type.Optional(ApprovalScopeSchema),
-    allowedDecisions: Type.Array(
-      Type.Union([Type.Literal("allow-once"), Type.Literal("allow-always"), Type.Literal("deny")]),
-      { minItems: 1, maxItems: 3, uniqueItems: true, contains: Type.Literal("deny") },
-    ),
+    allowedDecisions: Type.Array(ExecApprovalDecisionSchema, {
+      minItems: 1,
+      maxItems: 3,
+      uniqueItems: true,
+      contains: Type.Literal("deny"),
+    }),
   },
   {
     additionalProperties: false,

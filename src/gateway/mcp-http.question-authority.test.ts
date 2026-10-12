@@ -450,7 +450,7 @@ describe("CLI loopback question creator authority", () => {
         const cachedCount = fixture.resolutionCount();
         await fixture.list(owner.token);
         const old = await fixture.ask(owner.token);
-        expect(fixture.resolutionCount()).toBe(cachedCount);
+        expect(fixture.resolutionCount()).toBe(cachedCount + 2);
         await expect(fixture.answer({ ...caller, toolsAllow: [] })).rejects.toThrow(
           "caller policy",
         );
@@ -484,9 +484,9 @@ describe("CLI loopback question creator authority", () => {
         await old.response;
 
         await fixture.list(owner.token);
-        expect(fixture.resolutionCount()).toBe(cachedCount + 1);
+        expect(fixture.resolutionCount()).toBe(cachedCount + 3);
         const fresh = await fixture.ask(owner.token);
-        expect(fixture.resolutionCount()).toBe(cachedCount + 1);
+        expect(fixture.resolutionCount()).toBe(cachedCount + 4);
         await expect(fixture.answer()).resolves.toBe(true);
         expectAnswered(await fresh.response);
       });

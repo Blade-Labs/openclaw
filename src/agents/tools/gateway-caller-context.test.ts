@@ -146,6 +146,7 @@ describe("gateway caller context wrapper", () => {
 
   it("scopes nested approval ownership without replacing the native runtime owner", async () => {
     let nestedOwner: string | undefined;
+    let nestedContract: string | undefined;
     let restoredOwner: string | undefined;
 
     await withGatewayToolCallerIdentity(
@@ -154,16 +155,19 @@ describe("gateway caller context wrapper", () => {
         sessionKey: "agent:main:session-1",
         operationalRunInstance: { instanceId: "instance-1", runId: "run-1" },
         approvalOwnerPluginId: "codex",
+        approvalContract: "native-tool",
       },
       async () => {
         await withGatewayToolApprovalOwner("policy-plugin", async () => {
           nestedOwner = getGatewayToolCallerIdentity()?.approvalOwnerPluginId;
+          nestedContract = getGatewayToolCallerIdentity()?.approvalContract;
         });
         restoredOwner = getGatewayToolCallerIdentity()?.approvalOwnerPluginId;
       },
     );
 
     expect(nestedOwner).toBe("policy-plugin");
+    expect(nestedContract).toBeUndefined();
     expect(restoredOwner).toBe("codex");
   });
 

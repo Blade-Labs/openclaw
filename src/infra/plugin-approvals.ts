@@ -5,6 +5,7 @@ import type {
   ApprovalResolvingActor,
 } from "./approval-requester-binding.js";
 import { summarizeApprovalScope, type ApprovalScope } from "./approval-scope.js";
+import { sanitizeExecApprovalWarningText } from "./exec-approval-text-sanitize.js";
 import type { ExecApprovalDecision } from "./exec-approvals-core.js";
 
 // Plugin approval types and renderers mirror exec approval decisions while
@@ -49,6 +50,8 @@ export type PluginApprovalRequestPayload = {
   /** Exact MCP persistence intent; the host separately binds live tool-call proof. */
   mcpTool?: { server: string; tool: string };
   allowedDecisions?: readonly ExecApprovalDecision[] | null;
+  /** Host-authenticated native callback/MCP contract; never accepted from RPC input. */
+  nativeApproval?: true;
   /** Trusted Policy declaration; grant creation and matching remain plugin-owned. */
   grantEligible?: boolean;
   grantScopeSummary?: string;
@@ -179,20 +182,20 @@ export function resolvePluginApprovalRequestAllowedDecisions(params?: {
   grantScopeSummary?: string;
   mcpTool?: { server: string; tool: string };
   placementGrant?: unknown;
+  nativeApproval?: true;
 }): readonly ExecApprovalDecision[] {
   if (isScopedPluginGrantApproval(params)) {
     return SCOPED_PLUGIN_APPROVAL_DECISIONS;
   }
-  // Existing explicit native callbacks retain three choices. Ordinary hooks set false; scoped Policy grants set true.
+  // Only host-bound native callbacks, MCP invocations, and placement grants retain legacy Always.
   const legacyGrant =
-    params !== undefined &&
-    params.grantEligible === undefined &&
-    (Boolean(params.mcpTool || params.placementGrant) ||
-      (Array.isArray(params.allowedDecisions) &&
-        params.allowedDecisions.every(
-          (decision) =>
-            decision === "allow-once" || decision === "allow-always" || decision === "deny",
-        )));
+    params?.grantEligible === undefined &&
+    (params?.nativeApproval === true || Boolean(params?.placementGrant)) &&
+    (!Array.isArray(params?.allowedDecisions) ||
+      params.allowedDecisions.every(
+        (decision) =>
+          decision === "allow-once" || decision === "allow-always" || decision === "deny",
+      ));
   const explicit: ExecApprovalDecision[] = [];
   if (Array.isArray(params?.allowedDecisions)) {
     for (const decision of params.allowedDecisions) {
@@ -221,6 +224,9 @@ export function buildPluginApprovalRequestMessage(
   lines.push(`Title: ${request.request.title}`);
   // Reviewer-only detail stays off channel messages; channels receive the bounded description.
   lines.push(`Description: ${request.request.description}`);
+  if (isScopedPluginGrantApproval(request.request)) {
+    lines.push(`Delegation: ${sanitizeExecApprovalWarningText(request.request.grantScopeSummary)}`);
+  }
   if (request.request.scope) {
     lines.push(`Scope: ${summarizeApprovalScope(request.request.scope)}`);
   }

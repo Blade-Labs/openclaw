@@ -50,6 +50,7 @@ export type AgentRuntimeIdentity = {
   operationalRunInstance: OperationalRunInstanceRef;
   delegatedAuthority: AgentRuntimeDelegatedAuthority;
   approvalOwnerPluginId?: string;
+  approvalContract?: "native-tool";
   executionIdentity?: ExecutionIdentityAdmissionToken;
   turnSourceChannel?: string;
   /** Explicit admission fact; omission is unknown, never inferred from session routing. */
@@ -222,6 +223,7 @@ const agentRuntimeIdentityTokenPayloadSchema = z.object({
   operationalRunInstance: operationalRunInstanceSchema,
   delegatedAuthority: delegatedAuthoritySchema,
   approvalOwnerPluginId: z.string().optional().catch(undefined),
+  approvalContract: z.literal("native-tool").optional().catch(undefined),
   executionIdentity: z.unknown().optional(),
   turnSourceChannel: z.string().optional().catch(undefined),
   turnSourceLocal: z.literal(true).optional(),
@@ -411,6 +413,9 @@ function parsePayload(value: unknown, nowMs: number): AgentRuntimeIdentityTokenP
       operationalRunInstance,
       delegatedAuthority,
       ...(approvalOwnerPluginId ? { approvalOwnerPluginId } : {}),
+      ...(approvalOwnerPluginId && raw.approvalContract
+        ? { approvalContract: raw.approvalContract }
+        : {}),
       ...(turnSourceChannel ? { turnSourceChannel } : {}),
       ...(turnSourceLocal ? { turnSourceLocal } : {}),
       ...(turnSourceTo ? { turnSourceTo } : {}),
@@ -439,6 +444,7 @@ export type AgentRuntimeIdentityTokenParams = {
   sessionKey: string;
   operationalRunInstance: OperationalRunInstanceRef;
   approvalOwnerPluginId?: string;
+  approvalContract?: "native-tool";
   executionIdentityToken?: ExecutionIdentityAdmissionToken;
   turnSourceChannel?: string;
   turnSourceLocal?: true;
@@ -553,6 +559,9 @@ function prepareAgentRuntimeIdentityTokenPayload(
     ...(normalizeOptionalString(params.approvalOwnerPluginId)
       ? { approvalOwnerPluginId: normalizeOptionalString(params.approvalOwnerPluginId) }
       : {}),
+    ...(params.approvalOwnerPluginId && params.approvalContract
+      ? { approvalContract: params.approvalContract }
+      : {}),
     ...(turnSourceChannel ? { turnSourceChannel } : {}),
     ...(params.turnSourceLocal === true ? { turnSourceLocal: true } : {}),
     ...(turnSourceTo ? { turnSourceTo } : {}),
@@ -659,6 +668,7 @@ function resolveAgentRuntimeIdentityPayload(
     ...(payload.approvalOwnerPluginId
       ? { approvalOwnerPluginId: payload.approvalOwnerPluginId }
       : {}),
+    ...(payload.approvalContract ? { approvalContract: payload.approvalContract } : {}),
     ...(executionIdentity ? { executionIdentity } : {}),
     ...(payload.turnSourceChannel ? { turnSourceChannel: payload.turnSourceChannel } : {}),
     ...(payload.turnSourceLocal === true ? { turnSourceLocal: true } : {}),

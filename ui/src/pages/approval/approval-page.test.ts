@@ -393,7 +393,7 @@ describe("ApprovalPage", () => {
     expect(page.querySelectorAll("[data-decision]")).toHaveLength(0);
   });
 
-  it("labels the server-offered scoped plugin decisions", async () => {
+  it("shows the delegation summary with the server-offered scoped plugin decisions", async () => {
     const approval: PendingApprovalSnapshot = {
       ...pendingApproval(),
       presentation: {
@@ -412,6 +412,9 @@ describe("ApprovalPage", () => {
     expect(
       [...page.querySelectorAll("[data-decision]")].map((button) => button.textContent?.trim()),
     ).toEqual(["Allow once", "Allow 15 min", "Allow for this session", "Always allow", "Deny"]);
+    expect(page.querySelector("[data-grant-scope-summary]")?.textContent?.trim()).toBe(
+      "Project 4 approved fields; later values may differ.",
+    );
   });
 
   it("loads a durable approval and sends a kind-bound resolution", async () => {

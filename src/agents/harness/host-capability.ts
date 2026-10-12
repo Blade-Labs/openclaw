@@ -599,6 +599,7 @@ export function createAgentHarnessHostCapabilities(params: {
                   },
                   { expectFinal: false, requireAgentRuntimeIdentity: true, signal: request.signal },
                 ),
+              "native-tool",
             ),
           request.signal,
         );

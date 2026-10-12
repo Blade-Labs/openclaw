@@ -684,7 +684,7 @@ describe("gateway tool runtime identity", () => {
           const request = async () =>
             await callGatewayTool(method, {}, { title: "Approve test action" });
           return approvalOwnerPluginId
-            ? await withGatewayToolApprovalOwner(approvalOwnerPluginId, request)
+            ? await withGatewayToolApprovalOwner(approvalOwnerPluginId, request, "native-tool")
             : await request();
         },
       );
@@ -695,7 +695,9 @@ describe("gateway tool runtime identity", () => {
       expect(verified).toEqual(
         expect.objectContaining({
           operationalRunInstance,
-          ...(approvalOwnerPluginId ? { approvalOwnerPluginId } : {}),
+          ...(approvalOwnerPluginId
+            ? { approvalOwnerPluginId, approvalContract: "native-tool" }
+            : {}),
           ...(executionIdentityToken ? { executionIdentity: executionIdentityToken } : {}),
         }),
       );

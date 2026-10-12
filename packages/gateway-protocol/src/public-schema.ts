@@ -573,6 +573,7 @@ export {
   isWellFormedApprovalId,
   ApprovalKindSchema,
   ApprovalDecisionSchema,
+  ExecApprovalDecisionSchema,
   ApprovalAllowDecisionSchema,
   ApprovalTerminalReasonSchema,
   PluginApprovalSeveritySchema,

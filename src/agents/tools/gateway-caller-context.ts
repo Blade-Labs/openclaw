@@ -41,6 +41,8 @@ type GatewayToolCallerIdentity = {
   approvalAuthorityCheck?: () => boolean | void;
   /** Exact host-resolved owner of this individual approval request. */
   approvalOwnerPluginId?: string;
+  /** Host-owned native callback contract, signed alongside the exact approval owner. */
+  approvalContract?: "native-tool";
   /** Host-owned tool/turn lifetimes; every same-run wrapper preserves earlier fences. */
   approvalSignals?: readonly AbortSignal[];
   /** Opaque already-signed identity used only by isolated worker transports. */
@@ -318,6 +320,7 @@ export async function withGatewayToolCallerIdentity<T>(
         : inheritedOwner?.approvalOwnerPluginId
           ? { approvalOwnerPluginId: inheritedOwner.approvalOwnerPluginId }
           : {}),
+      ...(identity.approvalContract ? { approvalContract: identity.approvalContract } : {}),
       ...(signedAgentRuntimeIdentityToken ? { signedAgentRuntimeIdentityToken } : {}),
       ...(cronSelfManagementJobId ? { cronSelfManagementJobId } : {}),
       ...(cronToolsAllowCapture ? { cronToolsAllowCapture } : {}),
@@ -348,13 +351,17 @@ export async function withGatewayToolCallerIdentity<T>(
 export async function withGatewayToolApprovalOwner<T>(
   pluginId: string | undefined,
   run: () => Promise<T> | T,
+  contract?: "native-tool",
 ): Promise<T> {
   const identity = gatewayToolCallerStorage.getStore();
   const approvalOwnerPluginId = pluginId?.trim();
   if (!identity || !approvalOwnerPluginId) {
     return await run();
   }
-  return await withGatewayToolCallerIdentity({ ...identity, approvalOwnerPluginId }, run);
+  return await withGatewayToolCallerIdentity(
+    { ...identity, approvalOwnerPluginId, approvalContract: contract },
+    run,
+  );
 }
 
 export function wrapToolWithGatewayCallerIdentity(

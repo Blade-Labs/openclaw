@@ -301,6 +301,78 @@ describe("createPluginApprovalHandlers", () => {
       expect(await manager.listPendingRecords()).toEqual([]);
       expect(opts.context.broadcast).not.toHaveBeenCalled();
     });
+    it("keeps public legacy lists once/deny and rejects reusable resolution", async () => {
+      const handlers = createPluginApprovalHandlers(manager);
+      const { respond, accepted } = createApprovalRequestResponder();
+      const opts = createMockOptions(
+        "plugin.approval.request",
+        {
+          title: "Public consent",
+          description: "Exact synthetic action",
+          allowedDecisions: ["allow-once", "allow-always", "deny"],
+          mcpTool: { server: "synthetic", tool: "write" },
+          twoPhase: true,
+        },
+        { respond },
+      );
+      const pending = handlers["plugin.approval.request"]!(opts);
+      const id = await accepted;
+      try {
+        expect((await manager.getSnapshot(id))?.request).toMatchObject({
+          grantEligible: false,
+          allowedDecisions: ["allow-once", "deny"],
+        });
+        expect(broadcastCall(opts).payload.request.allowedDecisions).toEqual([
+          "allow-once",
+          "deny",
+        ]);
+        const reusable = createMockOptions("plugin.approval.resolve", {
+          id,
+          decision: "allow-always",
+        });
+        await handlers["plugin.approval.resolve"]!(reusable);
+        expect(expectResponseRejected(reusable.respond).message).toBe(
+          "allow-always is unavailable for this plugin approval",
+        );
+      } finally {
+        await handlers["plugin.approval.resolve"]!(
+          createMockOptions("plugin.approval.resolve", { id, decision: "deny" }),
+        );
+        await pending;
+      }
+    });
+
+    it.each(["description", "grantScopeSummary"] as const)(
+      "enforces the raw whitespace budget for public %s",
+      async (field) => {
+        const handlers = createPluginApprovalHandlers(manager);
+        for (const leading of [false, true]) {
+          for (const length of [4_096, 4_097]) {
+            const value = leading ? " " + "x".repeat(length - 1) : "x".repeat(length - 1) + " ";
+            const opts = createMockOptions("plugin.approval.request", {
+              title: "Raw budget",
+              description: "Synthetic action",
+              [field]: value,
+              twoPhase: true,
+            });
+            if (length === 4_097) {
+              await handlers["plugin.approval.request"]!(opts);
+              expectResponseRejected(opts.respond);
+            } else {
+              const { respond, accepted } = createApprovalRequestResponder();
+              opts.respond = respond;
+              const pending = handlers["plugin.approval.request"]!(opts);
+              const id = await accepted;
+              await handlers["plugin.approval.resolve"]!(
+                createMockOptions("plugin.approval.resolve", { id, decision: "deny" }),
+              );
+              await pending;
+            }
+          }
+        }
+      },
+    );
+
     it("creates and registers approval with twoPhase", async () => {
       const handlers = createPluginApprovalHandlers(manager);
       const { respond, accepted } = createApprovalRequestResponder();

@@ -119,6 +119,12 @@ public enum EnvironmentStatus: String, Codable, Sendable {
     case error = "error"
 }
 
+public enum ExecApprovalDecision: String, Codable, Sendable {
+    case allowOnce = "allow-once"
+    case allowAlways = "allow-always"
+    case deny = "deny"
+}
+
 public enum GitHubIdentityScope: String, Codable, Sendable {
     case system = "system"
     case agent = "agent"
@@ -7412,7 +7418,7 @@ public struct ExecApprovalPresentation: Codable, Sendable {
     public let nodeid: AnyCodable?
     public let agentid: AnyCodable?
     public let scope: ApprovalScope?
-    public let alloweddecisions: [AnyCodable]
+    public let alloweddecisions: [ExecApprovalDecision]
 
     public init(
         kind: String,
@@ -7423,7 +7429,7 @@ public struct ExecApprovalPresentation: Codable, Sendable {
         nodeid: AnyCodable? = nil,
         agentid: AnyCodable? = nil,
         scope: ApprovalScope? = nil,
-        alloweddecisions: [AnyCodable])
+        alloweddecisions: [ExecApprovalDecision])
     {
         self.kind = kind
         self.commandtext = commandtext

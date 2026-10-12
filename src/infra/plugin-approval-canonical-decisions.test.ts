@@ -26,12 +26,23 @@ describe("plugin approval decisions", () => {
     expect(
       resolveCanonicalPluginApprovalRequestAllowedDecisions({
         allowedDecisions: ["allow-once", "allow-always", "deny"],
-        mcpTool: { server: "synthetic", tool: "write" },
+        nativeApproval: true,
       }),
     ).toEqual(["allow-once", "allow-always", "deny"]);
   });
-  it("retains explicit legacy three-choice callbacks only when eligibility is unset", () => {
-    const native = { allowedDecisions: ["allow-once", "allow-always", "deny"] as const };
+  it("requires host native provenance for legacy three-choice callbacks", () => {
+    const explicit = { allowedDecisions: ["allow-once", "allow-always", "deny"] as const };
+    expect(resolveCanonicalPluginApprovalRequestAllowedDecisions(explicit)).toEqual([
+      "allow-once",
+      "deny",
+    ]);
+    expect(
+      resolveCanonicalPluginApprovalRequestAllowedDecisions({
+        ...explicit,
+        mcpTool: { server: "synthetic", tool: "write" },
+      }),
+    ).toEqual(["allow-once", "deny"]);
+    const native = { ...explicit, nativeApproval: true as const };
     expect(resolveCanonicalPluginApprovalRequestAllowedDecisions(native)).toEqual(
       native.allowedDecisions,
     );
@@ -48,7 +59,7 @@ describe("plugin approval decisions", () => {
       resolveCanonicalPluginApprovalRequestAllowedDecisions({
         ...native,
         grantEligible: true,
-        mcpTool: { server: "synthetic", tool: "write" },
+        nativeApproval: true,
       }),
     ).toEqual(["allow-once", "deny"]);
     expect(

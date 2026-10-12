@@ -195,11 +195,26 @@ export function createPluginApprovalHandlers(
         normalizeTrimmedString(value) === null
           ? null
           : sanitizeExecApprovalDisplayText(normalizeTrimmedString(value)!);
+      const mcpToolApprovalActive =
+        trustedAgentRuntime && p.mcpTool && p.toolCallId
+          ? takeMcpToolApprovalBinding({
+              authority: trustedAgentRuntime.delegatedAuthority,
+              agentId: trustedAgentRuntime.agentId,
+              toolCallId: p.toolCallId,
+              ...p.mcpTool,
+            })
+          : undefined;
+      const nativeApproval =
+        trustedAgentRuntime?.approvalContract === "native-tool" ||
+        mcpToolApprovalActive?.() === true;
+      // Public input cannot opt into the host's legacy native consent contract.
+      const grantEligible = p.grantEligible ?? (nativeApproval ? undefined : false);
       const request: PluginApprovalRequestPayload = {
         pluginId: trustedAgentRuntime?.approvalOwnerPluginId ?? sanitizeMeta(p.pluginId),
         title: sanitizedTitle,
         description: sanitizedDescription,
-        ...(p.grantEligible === false ? { grantEligible: false } : {}),
+        ...(grantEligible === false ? { grantEligible: false } : {}),
+        ...(nativeApproval ? { nativeApproval: true } : {}),
         ...(grantScopeSummary ? { grantEligible: true, grantScopeSummary } : {}),
         scope: p.scope ? sanitizeApprovalScope(p.scope) : null,
         detail:
@@ -214,7 +229,8 @@ export function createPluginApprovalHandlers(
           ? {
               allowedDecisions: resolveCanonicalPluginApprovalRequestAllowedDecisions({
                 allowedDecisions: p.allowedDecisions,
-                grantEligible: p.grantEligible,
+                grantEligible,
+                ...(nativeApproval ? { nativeApproval: true } : {}),
                 ...(grantScopeSummary ? { grantEligible: true, grantScopeSummary } : {}),
                 ...(trustedAgentRuntime && p.mcpTool ? { mcpTool: p.mcpTool } : {}),
               }),
@@ -246,13 +262,8 @@ export function createPluginApprovalHandlers(
       const record = manager.create(request, timeoutMs, `plugin:${randomUUID()}`);
       if (trustedAgentRuntime) {
         record.agentRuntimeDelegatedAuthority = trustedAgentRuntime.delegatedAuthority;
-        if (request.mcpTool && request.toolCallId) {
-          record.mcpToolApprovalActive = takeMcpToolApprovalBinding({
-            authority: trustedAgentRuntime.delegatedAuthority,
-            agentId: trustedAgentRuntime.agentId,
-            toolCallId: request.toolCallId,
-            ...request.mcpTool,
-          });
+        if (mcpToolApprovalActive) {
+          record.mcpToolApprovalActive = mcpToolApprovalActive;
         }
       }
       if (

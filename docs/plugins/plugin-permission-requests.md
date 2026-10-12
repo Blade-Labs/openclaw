@@ -184,17 +184,33 @@ the registered hook, never model parameters. Public Gateway requests cannot
 mark a request eligible without the signed plugin owner.
 
 Eligible requests offer `allow-once`, `allow-15m`, `allow-session`, `allow-always`,
-and `deny`. The host carries the chosen decision through storage, resolution,
+and `deny`. Every surface offering reusable consent displays the sanitized
+`grantScopeSummary` alongside the current operation. The host carries the chosen decision through storage, resolution,
 and one-use execution redemption. The plugin owns creating, matching, expiring,
 and revoking any reusable grant. Scoped decisions never mint a generic MCP
 grant. Native MCP and placement approvals keep their separate bound contracts.
-Existing native permission callback requests that explicitly list the three legacy
-choices and omit `grantEligible` retain that contract. Ordinary
-`before_tool_call.requireApproval` hooks now send `grantEligible: false` by default,
-so this compatibility path cannot add reusable choices to an ineligible hook.
+The legacy three-choice exception requires a host-authenticated native permission
+callback, live MCP binding, or placement binding. Merely listing the three legacy
+choices or omitting `grantEligible` does not establish that contract. Public
+Gateway RPC requests and ordinary plugin requests offer only `allow-once` and
+`deny`; ordinary `before_tool_call.requireApproval` hooks send `grantEligible: false`
+by default.
 Native owners should retain their current matching and removal lifecycle; new
 plugin delegations use the scoped contract above.
 Requester matching, approver rosters, and live run authority remain required.
+
+Native CLI shell callbacks retain their 512-code-point escaped summary limit and
+never offer Always for Bash; the larger plugin description budget does not widen
+native shell approval policy.
+
+The iOS native plugin prompt accepts five-choice snapshots and displays their
+delegation summary, but offers only **Allow Once** and **Deny**. When reusable
+choices are available, it explains this limit and offers **Review in Dashboard**
+under the current operator authority. The Dashboard owns the full five-choice
+review. Native plugin actions cannot submit reusable decisions, including from
+restored prompts or notification actions. A decision recorded on another surface
+still closes the native prompt and reports its recorded outcome. Exec approvals
+retain their separate three-choice native contract.
 
 `onResolution(decision, receipt)` keeps the existing first argument. The optional
 second argument contains host evidence:

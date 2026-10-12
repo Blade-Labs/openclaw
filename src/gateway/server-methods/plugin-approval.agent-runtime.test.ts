@@ -86,6 +86,92 @@ afterEach(() => {
 });
 
 describe("plugin approval signed agent runtime", () => {
+  it.for([false, true])(
+    "retains legacy Always only for a host native contract (native=%s)",
+    async (native, testContext) => {
+      const fixture = createTestApprovalFixture<PluginApprovalRequestPayload>(testContext, {
+        approvalKind: "plugin",
+        validateAgentRuntimeDelegatedAuthority: () => true,
+      });
+      await fixture.run(async () => {
+        const opts = requestOptions({
+          request: {
+            title: "Native callback",
+            description: "Synthetic native action",
+            allowedDecisions: ["allow-once", "allow-always", "deny"],
+            twoPhase: true,
+          },
+          identity: {
+            ...identityWithoutExecution(),
+            approvalOwnerPluginId: "synthetic-harness",
+            ...(native ? { approvalContract: "native-tool" as const } : {}),
+          },
+        });
+        const { pending } = await waitForApprovalRequested(
+          opts.context,
+          "plugin.approval.requested",
+          () => fixture.track(Promise.resolve(requestHandler(fixture.manager)(opts))),
+        );
+        const record = (await fixture.manager.listPendingRecords())[0]!;
+        expect(record.request.allowedDecisions).toEqual(
+          native ? ["allow-once", "allow-always", "deny"] : ["allow-once", "deny"],
+        );
+        await fixture.manager.forceDenyDetailed(record.id, "user", { kind: "system", id: null });
+        await pending;
+      });
+    },
+  );
+
+  it.for(["description", "grantScopeSummary"] as const)(
+    "enforces the escaped display budget through signed RPC for %s",
+    async (field, testContext) => {
+      const fixture = createTestApprovalFixture<PluginApprovalRequestPayload>(testContext, {
+        approvalKind: "plugin",
+        validateAgentRuntimeDelegatedAuthority: () => true,
+      });
+      await fixture.run(async () => {
+        for (const overflow of [false, true]) {
+          const opts = requestOptions({
+            request: {
+              title: "Escaped budget",
+              description: "Synthetic action",
+              grantEligible: true,
+              grantScopeSummary: "Synthetic scope",
+              [field]: "\u200B".repeat(512) + (overflow ? "x" : ""),
+              twoPhase: true,
+            },
+            identity: { ...identityWithoutExecution(), approvalOwnerPluginId: "synthetic-plugin" },
+          });
+          if (overflow) {
+            await requestHandler(fixture.manager)(opts);
+            expect(opts.respond).toHaveBeenCalledWith(
+              false,
+              undefined,
+              expect.objectContaining({
+                message: expect.stringContaining("exceeds the display limit after sanitization"),
+              }),
+            );
+            expect(opts.context.broadcast).not.toHaveBeenCalled();
+          } else {
+            const { pending } = await waitForApprovalRequested(
+              opts.context,
+              "plugin.approval.requested",
+              () => fixture.track(Promise.resolve(requestHandler(fixture.manager)(opts))),
+            );
+            const record = (await fixture.manager.listPendingRecords())[0]!;
+            expect(record.request[field]).toBe("\\u{200B}".repeat(512));
+            await fixture.manager.forceDenyDetailed(record.id, "user", {
+              kind: "system",
+              id: null,
+            });
+            await pending;
+          }
+          expect(await fixture.manager.listPendingRecords()).toEqual([]);
+        }
+      });
+    },
+  );
+
   it("freezes approval authorization from the admitted run rather than request routing", async (testContext) => {
     const admission = prepareAgentRunAdmission({
       cfg: {},

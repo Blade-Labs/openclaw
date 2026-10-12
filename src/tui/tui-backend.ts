@@ -1,6 +1,7 @@
 import type { FastMode } from "@openclaw/normalization-core/string-coerce";
 // Defines the TUI backend contract and backend event shapes.
 import type {
+  ApprovalDecision,
   CommandEntry,
   CommandsListParams,
   ModelChoice,
@@ -47,7 +48,7 @@ export type TuiImageData = {
   mimeType: string;
 };
 
-export type TuiApprovalDecision = "allow-once" | "allow-always" | "deny";
+export type TuiApprovalDecision = ApprovalDecision;
 
 type TuiTaskSuggestionActionCapabilities = {
   canAccept: boolean;
@@ -59,6 +60,7 @@ export type TuiPluginApproval = {
   request: {
     title: string;
     description?: string | null;
+    grantScopeSummary?: string | null;
     pluginId?: string | null;
     severity?: "info" | "warning" | "critical" | null;
     toolName?: string | null;

@@ -206,7 +206,7 @@ describe("MCP HTTP work ownership", () => {
       await creator.drain();
       expect(await callTool()).toMatchObject({ result: { ...completed, isError: false } });
       expect(await callTool()).toMatchObject({ result: { ...completed, isError: false } });
-      expect(resolveTools).toHaveBeenCalledTimes(1);
+      expect(resolveTools).toHaveBeenCalledTimes(2);
       expect(constructionScopes[0]).toBeDefined();
       expect(constructionScopes[0]?.aborted).toBe(false);
       expect(constructionScopes[0]).not.toBe(creator.signal);

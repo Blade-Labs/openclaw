@@ -1,5 +1,5 @@
 // MCP loopback runtime scope cache.
-// Resolves Gateway-visible tools for MCP clients with short-lived schema caching.
+// Resolves request-bound Gateway tools with short-lived schema caching.
 import { stableStringify } from "@openclaw/normalization-core/stable-stringify";
 import type { AuthProfileStore } from "../agents/auth-profiles/types.js";
 import {
@@ -57,12 +57,7 @@ type McpLoopbackScopeParams = {
   rootedExecution?: PreparedRootedExecutionCapability;
   messageActionTurnCapability?: string;
   grantToken?: string;
-  /**
-   * Liveness of the authenticating client grant. Deliberately absent from the
-   * cache key: the grant token is already in it, and every row replacement
-   * evicts that token's cached tools, so a cached closure can only ever observe
-   * the exact row it was built for.
-   */
+  /** Current invocation authority, including the HTTP connection and live grant. */
   isGrantCurrent?: () => boolean;
   yieldContextCacheKey?: string;
   onYield?: (message: string, acknowledgment?: string) => Promise<void> | void;
@@ -319,41 +314,32 @@ function buildMcpLoopbackToolCacheKey(params: McpLoopbackScopeParams): string {
   })}`;
 }
 
-/** Short-lived cache for loopback tool lists keyed by session/channel context. */
+/** Cache discovery projections; executable factories belong to each requesting connection. */
 export class McpLoopbackToolCache {
-  #entries = new DirectoryCache<CachedScopedTools>(TOOL_CACHE_TTL_MS, TOOL_CACHE_MAX_ENTRIES);
-  // Revocation needs the config scopes where one grant may have cached tools.
+  #entries = new DirectoryCache<McpToolSchemaEntry[]>(TOOL_CACHE_TTL_MS, TOOL_CACHE_MAX_ENTRIES);
+  // Revocation needs the config scopes where one grant may have cached schemas.
   #grantConfigScopes = new Map<string, Set<OpenClawConfig>>();
   #epoch = 0;
 
   async resolve(input: McpLoopbackScopeParams): Promise<CachedScopedTools> {
     const epoch = this.#epoch;
-    const nodeExecParams = await resolveNodeExecScope(input, "exact");
-    input.signal?.throwIfAborted();
-    // A policy-excluded computer scope has no inventory component. It can use
-    // the ordinary cached catalog without touching Gateway again.
-    const preDiscoveryCacheKey = buildMcpLoopbackToolCacheKey(nodeExecParams);
-    const preDiscoveryCached = this.#entries.get(preDiscoveryCacheKey, nodeExecParams.cfg);
-    if (preDiscoveryCached) {
-      return preDiscoveryCached;
-    }
-
-    // Availability belongs to the current connection, not the schema TTL.
-    const resolved = await resolvePairedComputerNodeScope(nodeExecParams, "exact");
+    // Factory contexts and retained callbacks capture final-effect authority. Never
+    // reuse them across HTTP requests, even when the authenticated grant matches.
+    const resolved = await resolveNodeScope(input, "exact");
     input.signal?.throwIfAborted();
     const { params } = resolved;
     const cacheKey = buildMcpLoopbackToolCacheKey(params);
-    const cached = this.#entries.get(cacheKey, params.cfg);
-    if (cached) {
-      return cached;
+    const nextEntry = resolved.policyResolved ?? resolveMcpLoopbackTools(params, "exact");
+    const cachedSchema = this.#entries.get(cacheKey, params.cfg);
+    if (cachedSchema) {
+      return { ...nextEntry, toolSchema: cachedSchema };
     }
 
-    const nextEntry = resolved.policyResolved ?? resolveMcpLoopbackTools(params, "exact");
     // Revocation may overtake discovery before a grant owns any cached rows.
     if (epoch !== this.#epoch) {
       return nextEntry;
     }
-    this.#entries.set(cacheKey, nextEntry, params.cfg);
+    this.#entries.set(cacheKey, nextEntry.toolSchema, params.cfg);
     if (params.grantToken) {
       const scopes = this.#grantConfigScopes.get(params.grantToken) ?? new Set<OpenClawConfig>();
       scopes.add(params.cfg);

@@ -88,6 +88,8 @@ final class NodeAppModel {
         let pluginId: String?
         let toolName: String?
         let pluginSeverity: String?
+        let grantScopeSummary: String?
+        let reusableConsentAvailable: Bool?
         // Discovery provenance is transient: cached approvals must rediscover their
         // source under the current operator before contributing session attention.
         var attentionSource: ApprovalAttentionSource?
@@ -96,7 +98,7 @@ final class NodeAppModel {
         private enum CodingKeys: String, CodingKey {
             case id, kind, gatewayStableID, commandText, commandPreview, warningText
             case allowedDecisions, host, nodeId, agentId, expiresAtMs
-            case descriptionText, pluginId, toolName, pluginSeverity
+            case descriptionText, pluginId, toolName, pluginSeverity, grantScopeSummary, reusableConsentAvailable
         }
 
         init(
@@ -114,7 +116,9 @@ final class NodeAppModel {
             descriptionText: String? = nil,
             pluginId: String? = nil,
             toolName: String? = nil,
-            pluginSeverity: String? = nil)
+            pluginSeverity: String? = nil,
+            grantScopeSummary: String? = nil,
+            reusableConsentAvailable: Bool? = nil)
         {
             self.id = id
             self.kind = kind
@@ -131,6 +135,8 @@ final class NodeAppModel {
             self.pluginId = pluginId
             self.toolName = toolName
             self.pluginSeverity = pluginSeverity
+            self.grantScopeSummary = grantScopeSummary
+            self.reusableConsentAvailable = reusableConsentAvailable
         }
 
         var allowsAllowOnce: Bool {
@@ -267,6 +273,8 @@ final class NodeAppModel {
 
     private enum ExecApprovalTerminalVerdict {
         case allowOnce
+        case allow15m
+        case allowSession
         case allowAlways
         case deny
         case expired
@@ -275,7 +283,7 @@ final class NodeAppModel {
 
         var status: String {
             switch self {
-            case .allowOnce, .allowAlways:
+            case .allowOnce, .allow15m, .allowSession, .allowAlways:
                 "allowed"
             case .deny:
                 "denied"
@@ -292,6 +300,10 @@ final class NodeAppModel {
             switch self {
             case .allowOnce:
                 ApprovalDecision.allowOnce.rawValue
+            case .allow15m:
+                ApprovalDecision.allow15m.rawValue
+            case .allowSession:
+                ApprovalDecision.allowSession.rawValue
             case .allowAlways:
                 ApprovalDecision.allowAlways.rawValue
             case .deny:
@@ -5827,9 +5839,11 @@ extension NodeAppModel {
         }
         // Shipped caches before unified approvals have no owner kind. Preserve only
         // their exact ID + gateway owner until approval.get rebuilds canonical state.
-        let typedApprovals = state.approvals.filter {
-            guard let kind = ApprovalKind(rawValue: $0.kind ?? "") else { return false }
-            return kind == .exec || kind == .plugin
+        let typedApprovals = state.approvals.compactMap { prompt -> ExecApprovalPrompt? in
+            guard let kind = ApprovalKind(rawValue: prompt.kind ?? ""),
+                  kind == .exec || kind == .plugin
+            else { return nil }
+            return Self.makeExecApprovalPrompt(prompt)
         }
         self.watchExecApprovalPromptsByID = typedApprovals.reduce(into: [:]) { result, prompt in
             guard let approvalID = Self.execApprovalIDKey(prompt.id) else { return }
@@ -6484,7 +6498,7 @@ extension NodeAppModel {
                 gatewayStableID: gatewayStableID,
                 reason: .unavailable,
                 syncSnapshots: syncSnapshots)
-        case .resolvedUnknown:
+        case .allow15m, .allowSession, .resolvedUnknown:
             await self.publishWatchExecApprovalExpired(
                 approvalId: terminal.id,
                 gatewayStableID: gatewayStableID,
@@ -6503,7 +6517,7 @@ extension NodeAppModel {
             .allowedAlways
         case .deny:
             .denied
-        case .expired, .cancelled, .resolvedUnknown:
+        case .allow15m, .allowSession, .expired, .cancelled, .resolvedUnknown:
             nil
         }
     }
@@ -8610,7 +8624,8 @@ extension NodeAppModel {
                 descriptionText: presentation.description,
                 pluginId: self.approvalPresentationString(presentation.pluginid),
                 toolName: self.approvalPresentationString(presentation.toolname),
-                pluginSeverity: presentation.severity.rawValue)
+                pluginSeverity: presentation.severity.rawValue,
+                grantScopeSummary: presentation.grantscopesummary)
         case let .systemAgent(presentation):
             guard presentation.kind == ApprovalKind.systemAgent.rawValue,
                   self.trimmedOrNil(presentation.title) != nil,
@@ -8669,10 +8684,18 @@ extension NodeAppModel {
         let decisions = input.allowedDecisions
         guard decisions.count == Set(decisions).count,
               decisions.allSatisfy({ ApprovalDecision(rawValue: $0) != nil }),
+              kind != .exec || decisions.allSatisfy({ ExecApprovalDecision(rawValue: $0) != nil }),
               kind == .systemAgent ? decisions.isEmpty : decisions.contains(ApprovalDecision.deny.rawValue)
         else {
             return nil
         }
+        // Native plugin consent is intentionally once/deny. Reusable delegation is
+        // reviewed in Dashboard, which owns the full scoped decision contract.
+        let nativeDecisions = kind == .plugin
+            ? decisions.filter { $0 == ApprovalDecision.allowOnce.rawValue || $0 == ApprovalDecision.deny.rawValue }
+            : decisions
+        let reusableConsentAvailable = kind == .plugin &&
+            (input.reusableConsentAvailable == true || nativeDecisions != decisions)
         var prompt = ExecApprovalPrompt(
             id: approvalId,
             kind: approvalKind,
@@ -8680,7 +8703,7 @@ extension NodeAppModel {
             commandText: normalizedCommandText,
             commandPreview: self.trimmedOrNil(input.commandPreview),
             warningText: self.trimmedOrNil(input.warningText),
-            allowedDecisions: decisions,
+            allowedDecisions: nativeDecisions,
             host: self.trimmedOrNil(input.host),
             nodeId: self.trimmedOrNil(input.nodeId),
             agentId: self.trimmedOrNil(input.agentId),
@@ -8688,7 +8711,9 @@ extension NodeAppModel {
             descriptionText: self.trimmedOrNil(input.descriptionText),
             pluginId: self.trimmedOrNil(input.pluginId),
             toolName: self.trimmedOrNil(input.toolName),
-            pluginSeverity: self.trimmedOrNil(input.pluginSeverity))
+            pluginSeverity: self.trimmedOrNil(input.pluginSeverity),
+            grantScopeSummary: self.trimmedOrNil(input.grantScopeSummary),
+            reusableConsentAvailable: reusableConsentAvailable)
         prompt.attentionSource = input.attentionSource
         prompt.createdAtMs = input.createdAtMs
         return prompt
@@ -8742,7 +8767,7 @@ extension NodeAppModel {
         guard presentation.kind == ApprovalKind.plugin.rawValue,
               self.trimmedOrNil(presentation.title) != nil,
               self.trimmedOrNil(presentation.description) != nil,
-              (1...3).contains(decisions.count),
+              (1...5).contains(decisions.count),
               decisions.count == Set(decisions).count,
               decisions.contains(ApprovalDecision.deny.rawValue),
               self.isValidOptionalApprovalPresentationString(
@@ -8754,7 +8779,8 @@ extension NodeAppModel {
               self.isValidOptionalApprovalPresentationString(
                   presentation.agentid,
                   requiresNonEmpty: true),
-              terminalDecision.map(decisions.contains) != false
+              terminalDecision.map(decisions.contains) != false,
+              presentation.granteligible != true || self.trimmedOrNil(presentation.grantscopesummary) != nil
         else { return false }
         return true
     }
@@ -8879,6 +8905,10 @@ extension NodeAppModel {
                 verdict = .allowOnce
             case ApprovalDecision.allowAlways.rawValue:
                 verdict = .allowAlways
+            case ApprovalDecision.allow15m.rawValue:
+                verdict = .allow15m
+            case ApprovalDecision.allowSession.rawValue:
+                verdict = .allowSession
             default:
                 return nil
             }
@@ -8939,6 +8969,10 @@ extension NodeAppModel {
         switch terminal.verdict {
         case .allowOnce:
             return "\(prefix) allowed once."
+        case .allow15m:
+            return "\(prefix) allowed for 15 minutes."
+        case .allowSession:
+            return "\(prefix) allowed for this session."
         case .allowAlways:
             return alreadyResolved
                 ? "This approval was already set to Always Allow."
@@ -9345,7 +9379,9 @@ extension NodeAppModel {
         let resolutionReason = (normalizedSourceReason?.isEmpty == false) ? normalizedSourceReason! : "direct"
         guard let approvalKind = ApprovalKind(rawValue: rawApprovalKind),
               approvalKind == .exec || approvalKind == .plugin,
-              let approvalDecision = ApprovalDecision(rawValue: decision)
+              let approvalDecision = ApprovalDecision(rawValue: decision),
+              approvalKind != .plugin || approvalDecision == .allowOnce || approvalDecision == .deny,
+              approvalKind != .exec || ExecApprovalDecision(rawValue: decision) != nil
         else {
             return .failed(message: "Invalid approval request.")
         }
@@ -9762,7 +9798,7 @@ extension NodeAppModel {
         alreadyResolved: Bool)
     {
         let tone: ExecApprovalOutcomeTone = switch terminal.verdict {
-        case .allowOnce, .allowAlways:
+        case .allowOnce, .allow15m, .allowSession, .allowAlways:
             .success
         case .deny:
             .danger
@@ -9794,8 +9830,10 @@ extension NodeAppModel {
 
     private static func execApprovalVerdict(for decision: ApprovalDecision) -> ExecApprovalTerminalVerdict {
         switch decision {
-        case .allow15m, .allowSession:
-            .resolvedUnknown
+        case .allow15m:
+            .allow15m
+        case .allowSession:
+            .allowSession
         case .allowOnce:
             .allowOnce
         case .allowAlways:

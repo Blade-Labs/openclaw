@@ -108,13 +108,17 @@ function buildPluginApprovalPresentation(params: {
     return null;
   }
   const request = params.request as PluginApprovalRequestPayload;
+  if (
+    (typeof request.description === "string" &&
+      exceedsApprovalTextLimit(request.description, PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH)) ||
+    (typeof request.grantScopeSummary === "string" &&
+      exceedsApprovalTextLimit(request.grantScopeSummary, PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH))
+  ) {
+    return null;
+  }
   const rawTitle = normalizeOptionalString(request.title);
   const rawDescription = normalizeOptionalString(request.description);
-  if (
-    !rawTitle ||
-    !rawDescription ||
-    exceedsApprovalTextLimit(rawDescription, PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH)
-  ) {
+  if (!rawTitle || !rawDescription) {
     return null;
   }
   // Plugin text crosses every reviewer surface. Apply the same redaction and
@@ -130,11 +134,7 @@ function buildPluginApprovalPresentation(params: {
   const rawGrantScope = request.grantEligible
     ? normalizeOptionalString(request.grantScopeSummary)
     : undefined;
-  if (
-    request.grantEligible &&
-    (!rawGrantScope ||
-      exceedsApprovalTextLimit(rawGrantScope, PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH))
-  ) {
+  if (request.grantEligible && !rawGrantScope) {
     return null;
   }
   const grantScopeSummary = rawGrantScope

@@ -863,6 +863,54 @@ describe("exec approval forwarder", () => {
     expect(payload.interactive).toBeUndefined();
   });
 
+  it("forwards eligible plugin delegation text and all five typed decisions together", async () => {
+    const decisions = ["allow-once", "allow-15m", "allow-session", "allow-always", "deny"] as const;
+    const { deliver, forwarder } = createForwarder({
+      cfg: {
+        approvals: {
+          plugin: { enabled: true, mode: "targets", targets: [{ channel: "slack", to: "U123" }] },
+        },
+      },
+    });
+    await expect(
+      forwarder.handlePluginApprovalRequested?.({
+        id: "plugin:scoped-fields",
+        request: {
+          title: "Set Status to Backlog",
+          description: "Set Status to Backlog",
+          grantEligible: true,
+          grantScopeSummary: "Project 4 approved fields;\u202E later values may differ.",
+          allowedDecisions: decisions,
+        },
+        createdAtMs: 1_000,
+        expiresAtMs: 6_000,
+      }),
+    ).resolves.toBe(true);
+
+    const payload = requireFirstPayload(deliver);
+    expect(payload.text).toContain(
+      "Delegation: Project 4 approved fields;\\u{202E} later values may differ.",
+    );
+    expect(payload.text).not.toContain("\u202E");
+    expect(payload.text).toContain(`/approve plugin:scoped-fields ${decisions.join("|")}`);
+    expect(payload.channelData?.execApproval).toMatchObject({ allowedDecisions: decisions });
+    expect(payload.presentation).toMatchObject({
+      blocks: [
+        {
+          type: "buttons",
+          buttons: decisions.map((decision) => ({
+            action: {
+              type: "approval",
+              approvalId: "plugin:scoped-fields",
+              approvalKind: "plugin",
+              decision,
+            },
+          })),
+        },
+      ],
+    });
+  });
+
   it("stores exec metadata on generic forwarded fallback payloads", async () => {
     vi.useFakeTimers();
     const { deliver, forwarder } = createForwarder({ cfg: TARGETS_CFG });

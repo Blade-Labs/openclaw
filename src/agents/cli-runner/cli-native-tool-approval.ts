@@ -17,7 +17,6 @@ import {
 import { buildAuthorizedShellCommandFromPlan } from "../../infra/exec-authorization-render.js";
 import {
   DEFAULT_PLUGIN_APPROVAL_TIMEOUT_MS,
-  PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH,
   PLUGIN_APPROVAL_TITLE_MAX_LENGTH,
   truncatePluginApprovalDetail,
 } from "../../infra/plugin-approvals.js";
@@ -45,6 +44,8 @@ type CliNativeToolApprovalOutcome =
       message?: string;
     };
 
+// Native shell callbacks keep their existing complete-summary budget independently of plugin batches.
+const CLI_NATIVE_TOOL_APPROVAL_SUMMARY_MAX_LENGTH = 512;
 const CLI_NATIVE_TOOL_DESCRIPTION_HEAD_CHARS = 300;
 const CLI_NATIVE_TOOL_DESCRIPTION_TAIL_CHARS = 80;
 const CLI_NATIVE_TOOL_DESCRIPTION_MAX_CHARS =
@@ -72,7 +73,7 @@ export function resolveCliNativeToolApprovalPlan(execPermission: {
 type CliNativeToolDescription = { compact: string; text: string; truncated: boolean };
 
 /**
- * The gateway caps approval descriptions (PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH),
+ * Native callbacks cap summaries at CLI_NATIVE_TOOL_APPROVAL_SUMMARY_MAX_LENGTH,
  * so full inputs cannot ride this channel. Head+tail display defeats padded
  * prefixes hiding an executable tail, and the quantified marker makes a partial
  * view an explicit operator decision. Accepted tradeoff: the middle stays
@@ -137,7 +138,7 @@ export async function requestCliNativeToolApproval(params: {
         (summarySanitization &&
           exceedsApprovalTextLimit(
             summarySanitization.text,
-            PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH,
+            CLI_NATIVE_TOOL_APPROVAL_SUMMARY_MAX_LENGTH,
           )))
     ) {
       return { kind: "deny", reason: "policy-oversized" };
@@ -248,7 +249,7 @@ export async function requestCliNativeToolApproval(params: {
       bashCommand &&
       exceedsApprovalTextLimit(
         sanitizeExecApprovalWarningTextWithStatus(description.text).text,
-        PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH,
+        CLI_NATIVE_TOOL_APPROVAL_SUMMARY_MAX_LENGTH,
       )
     ) {
       return { kind: "deny", reason: "policy-oversized" };
@@ -262,29 +263,32 @@ export async function requestCliNativeToolApproval(params: {
         ? ["allow-once", "deny"]
         : ["allow-once", "allow-always", "deny"];
     const requestResult = await racePromiseWithAbortSignal(
-      withGatewayToolApprovalOwner(params.approvalOwnerPluginId, () =>
-        callGatewayTool<Partial<ApprovalWaitDecisionResult>>(
-          "plugin.approval.request",
-          { timeoutMs: gatewayTimeoutMs },
-          {
-            pluginId: params.pluginId,
-            toolName: params.toolName,
-            toolCallId: params.toolCallId,
-            agentId: params.agentId,
-            sessionKey: params.sessionKey,
-            title: truncateUtf16Safe(
-              `${params.pluginId} native tool: ${params.toolName}`,
-              PLUGIN_APPROVAL_TITLE_MAX_LENGTH,
-            ),
-            description: description.text,
-            detail: truncatePluginApprovalDetail(description.compact),
-            severity: "warning",
-            allowedDecisions,
-            timeoutMs,
-            twoPhase: true,
-          },
-          { expectFinal: false, signal: params.abortSignal },
-        ),
+      withGatewayToolApprovalOwner(
+        params.approvalOwnerPluginId,
+        () =>
+          callGatewayTool<Partial<ApprovalWaitDecisionResult>>(
+            "plugin.approval.request",
+            { timeoutMs: gatewayTimeoutMs },
+            {
+              pluginId: params.pluginId,
+              toolName: params.toolName,
+              toolCallId: params.toolCallId,
+              agentId: params.agentId,
+              sessionKey: params.sessionKey,
+              title: truncateUtf16Safe(
+                `${params.pluginId} native tool: ${params.toolName}`,
+                PLUGIN_APPROVAL_TITLE_MAX_LENGTH,
+              ),
+              description: description.text,
+              detail: truncatePluginApprovalDetail(description.compact),
+              severity: "warning",
+              allowedDecisions,
+              timeoutMs,
+              twoPhase: true,
+            },
+            { expectFinal: false, signal: params.abortSignal },
+          ),
+        "native-tool",
       ),
       params.abortSignal,
     );

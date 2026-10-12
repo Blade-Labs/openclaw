@@ -61,7 +61,11 @@ function buildApprovalSubject(
   return [
     { type: "TextBlock", text: "Request", weight: "Bolder", wrap: true },
     { type: "TextBlock", text: view.title, weight: "Bolder", wrap: true },
-    ...(view.description ? [{ type: "TextBlock", text: view.description, wrap: true }] : []),
+    ...(view.description
+      ? view.description
+          .split(/\n(?=\d+\.\s)/u)
+          .map((text) => ({ type: "TextBlock", text, wrap: true }))
+      : []),
   ];
 }
 

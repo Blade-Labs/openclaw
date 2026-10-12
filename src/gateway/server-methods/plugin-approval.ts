@@ -107,6 +107,39 @@ export function createPluginApprovalHandlers(
         return;
       }
 
+      if (
+        p.grantEligible === true &&
+        (!trustedAgentRuntime?.approvalOwnerPluginId || !p.grantScopeSummary?.trim())
+      ) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            "scoped plugin grants require a signed plugin owner and scope summary",
+          ),
+        );
+        return;
+      }
+      const grantScopeSummary =
+        p.grantEligible === true
+          ? sanitizeExecApprovalWarningText(p.grantScopeSummary!)
+          : undefined;
+      if (
+        grantScopeSummary &&
+        exceedsApprovalTextLimit(grantScopeSummary, PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH)
+      ) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            "grant scope exceeds the display limit after sanitization",
+          ),
+        );
+        return;
+      }
+
       const normalizeTrimmedString = (value?: string | null): string | null =>
         normalizeOptionalString(value) || null;
 
@@ -162,10 +195,27 @@ export function createPluginApprovalHandlers(
         normalizeTrimmedString(value) === null
           ? null
           : sanitizeExecApprovalDisplayText(normalizeTrimmedString(value)!);
+      const mcpToolApprovalActive =
+        trustedAgentRuntime && p.mcpTool && p.toolCallId
+          ? takeMcpToolApprovalBinding({
+              authority: trustedAgentRuntime.delegatedAuthority,
+              agentId: trustedAgentRuntime.agentId,
+              toolCallId: p.toolCallId,
+              ...p.mcpTool,
+            })
+          : undefined;
+      const nativeApproval =
+        trustedAgentRuntime?.approvalContract === "native-tool" ||
+        mcpToolApprovalActive?.() === true;
+      // Public input cannot opt into the host's legacy native consent contract.
+      const grantEligible = p.grantEligible ?? (nativeApproval ? undefined : false);
       const request: PluginApprovalRequestPayload = {
         pluginId: trustedAgentRuntime?.approvalOwnerPluginId ?? sanitizeMeta(p.pluginId),
         title: sanitizedTitle,
         description: sanitizedDescription,
+        ...(grantEligible === false ? { grantEligible: false } : {}),
+        ...(nativeApproval ? { nativeApproval: true } : {}),
+        ...(grantScopeSummary ? { grantEligible: true, grantScopeSummary } : {}),
         scope: p.scope ? sanitizeApprovalScope(p.scope) : null,
         detail:
           rawDetail === null
@@ -179,6 +229,10 @@ export function createPluginApprovalHandlers(
           ? {
               allowedDecisions: resolveCanonicalPluginApprovalRequestAllowedDecisions({
                 allowedDecisions: p.allowedDecisions,
+                grantEligible,
+                ...(nativeApproval ? { nativeApproval: true } : {}),
+                ...(grantScopeSummary ? { grantEligible: true, grantScopeSummary } : {}),
+                ...(trustedAgentRuntime && p.mcpTool ? { mcpTool: p.mcpTool } : {}),
               }),
             }
           : {}),
@@ -201,18 +255,15 @@ export function createPluginApprovalHandlers(
           : (p.turnSourceThreadId ?? null),
       };
 
+      request.allowedDecisions = resolveCanonicalPluginApprovalRequestAllowedDecisions(request);
+
       // Always server-generate the ID — never accept plugin-provided IDs.
       // Kind-prefix so /approve routing can distinguish plugin vs exec IDs deterministically.
       const record = manager.create(request, timeoutMs, `plugin:${randomUUID()}`);
       if (trustedAgentRuntime) {
         record.agentRuntimeDelegatedAuthority = trustedAgentRuntime.delegatedAuthority;
-        if (request.mcpTool && request.toolCallId) {
-          record.mcpToolApprovalActive = takeMcpToolApprovalBinding({
-            authority: trustedAgentRuntime.delegatedAuthority,
-            agentId: trustedAgentRuntime.agentId,
-            toolCallId: request.toolCallId,
-            ...request.mcpTool,
-          });
+        if (mcpToolApprovalActive) {
+          record.mcpToolApprovalActive = mcpToolApprovalActive;
         }
       }
       if (

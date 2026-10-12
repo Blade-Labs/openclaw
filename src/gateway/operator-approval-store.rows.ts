@@ -211,11 +211,13 @@ function hasValidLifecycleTuple(params: {
   }
   if (status === "allowed") {
     const validConsumption =
-      decision === "allow-once"
+      decision === "allow-once" || row.kind === "plugin"
         ? noConsumption || (row.consumed_at_ms !== null && Boolean(row.consumed_by?.trim()))
         : noConsumption;
     return (
-      (decision === "allow-once" || decision === "allow-always") &&
+      (decision === "allow-once" ||
+        decision === "allow-always" ||
+        (row.kind === "plugin" && (decision === "allow-15m" || decision === "allow-session"))) &&
       terminalReason === "user" &&
       validConsumption
     );
@@ -300,6 +302,8 @@ export function decodeOperatorApprovalRow(row: OperatorApprovalRow): OperatorApp
     (decision !== null &&
       decision !== "allow-once" &&
       decision !== "allow-always" &&
+      decision !== "allow-15m" &&
+      decision !== "allow-session" &&
       decision !== "deny") ||
     (terminalReason !== null &&
       terminalReason !== "user" &&
@@ -319,6 +323,7 @@ export function decodeOperatorApprovalRow(row: OperatorApprovalRow): OperatorApp
   }
   if (
     presentation.kind !== kind ||
+    (kind !== "plugin" && (decision === "allow-15m" || decision === "allow-session")) ||
     row.resolution_ref !==
       buildApprovalResolutionRef({ approvalId: row.approval_id, approvalKind: kind }) ||
     !hasValidLifecycleTuple({ row, status, decision, terminalReason, resolverKind }) ||

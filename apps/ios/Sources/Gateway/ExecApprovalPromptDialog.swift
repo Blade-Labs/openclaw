@@ -147,6 +147,9 @@ private struct ExecApprovalPromptCard: View {
 
             VStack(alignment: .leading, spacing: 8) {
                 if self.isPluginApproval {
+                    if let summary = self.normalized(self.prompt.grantScopeSummary) {
+                        ExecApprovalPromptMetadataRow(label: "Delegation", value: summary)
+                    }
                     if let pluginId = self.normalized(self.prompt.pluginId) {
                         ExecApprovalPromptMetadataRow(label: "Plugin", value: pluginId)
                     }
@@ -203,8 +206,13 @@ private struct ExecApprovalPromptCard: View {
     private var actionFooter: some View {
         VStack(spacing: 10) {
             if self.resolvedText == nil {
-                if self.prompt.kind == "system-agent" {
+                if self.prompt.kind == "system-agent" || self.prompt.reusableConsentAvailable == true {
                     ApprovalDashboardReviewButton(prompt: self.prompt)
+                }
+                if self.prompt.reusableConsentAvailable == true {
+                    Text("Native plugin approvals offer Allow Once and Deny. Review in Dashboard for reusable permission.")
+                        .font(OpenClawType.footnote)
+                        .foregroundStyle(.secondary)
                 }
                 if self.prompt.allowsAllowOnce {
                     Button {

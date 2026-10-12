@@ -97,7 +97,16 @@ export const ApprovalRequestAuthorizationSchema = object({
     object({
       requireResolverMatch: Type.Literal(true),
       delivery: Type.Literal("requester"),
-      allowedDecisions: Type.Tuple([Type.Literal("allow-once"), Type.Literal("deny")]),
+      allowedDecisions: Type.Array(
+        Type.Union([
+          Type.Literal("allow-once"),
+          Type.Literal("allow-15m"),
+          Type.Literal("allow-session"),
+          Type.Literal("allow-always"),
+          Type.Literal("deny"),
+        ]),
+        { minItems: 2, maxItems: 5, uniqueItems: true, contains: Type.Literal("deny") },
+      ),
     }),
   ]),
 });

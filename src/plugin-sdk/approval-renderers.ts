@@ -137,14 +137,21 @@ export function buildPluginApprovalPendingReplyPayload(
 export function buildTypedPluginApprovalPendingReplyPayload(
   params: BuildPluginApprovalPendingReplyPayloadParams,
 ): ReplyPayload {
+  const requestDecisions = resolveCanonicalPluginApprovalRequestAllowedDecisions(
+    params.request.request,
+  );
+  const overrideDecisions = params.allowedDecisions;
+  const allowedDecisions = overrideDecisions
+    ? requestDecisions.filter(
+        (decision) => decision === "deny" || overrideDecisions.includes(decision),
+      )
+    : requestDecisions;
   return buildTypedApprovalPendingReplyPayload({
     approvalKind: "plugin",
     approvalId: params.request.id,
     approvalSlug: params.approvalSlug ?? params.request.id.slice(0, 8),
     text: params.text ?? buildPluginApprovalRequestMessage(params.request, params.nowMs),
-    allowedDecisions: resolveCanonicalPluginApprovalRequestAllowedDecisions({
-      allowedDecisions: params.allowedDecisions ?? params.request.request.allowedDecisions,
-    }),
+    allowedDecisions,
     channelData: params.channelData,
   });
 }

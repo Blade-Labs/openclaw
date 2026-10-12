@@ -42,6 +42,16 @@ export function renderApprovalPresentation(presentation: ApprovalPresentation) {
     <div class="approval-page__preview-label">${t("approvalPage.requestLabel")}</div>
     <div class=${previewClass}>${presentation.description}</div>
     ${
+      presentation.kind === "plugin" && presentation.grantScopeSummary
+        ? html`
+            <div class="approval-page__preview-label">${t("approvalPage.summaryLabel")}</div>
+            <div class=${previewClass} data-grant-scope-summary>
+              ${presentation.grantScopeSummary}
+            </div>
+          `
+        : nothing
+    }
+    ${
       presentation.kind === "plugin" && presentation.detail
         ? html`<pre class="approval-page__preview mono" dir="ltr">${presentation.detail}</pre>`
         : nothing

@@ -677,6 +677,12 @@ describe("exec approval reply helpers", () => {
       approvalId: "req-1",
       decision: "allow-always",
     });
+    for (const decision of ["allow-15m", "allow-session"] as const) {
+      expect(parseExecApprovalCommandText(`/approve plugin:scoped ${decision}`)).toEqual({
+        approvalId: "plugin:scoped",
+        decision,
+      });
+    }
     expect(parseExecApprovalCommandText("/approve req-1 maybe")).toBeNull();
   });
 

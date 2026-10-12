@@ -126,6 +126,38 @@ describe("parsePluginApprovalRequested", () => {
     expect(result?.expiresAtMs).toBe(120_000);
   });
 
+  it("bounds live scoped plugin decisions to once/deny and keeps legacy Always", () => {
+    const scoped = parsePluginApprovalRequested({
+      ...validPayload,
+      request: {
+        ...validPayload.request,
+        allowedDecisions: ["allow-once", "allow-15m", "allow-session", "allow-always", "deny"],
+      },
+    });
+    expect(scoped?.request.allowedDecisions).toEqual(["allow-once", "deny"]);
+    const legacy = parsePluginApprovalRequested({
+      ...validPayload,
+      request: {
+        ...validPayload.request,
+        allowedDecisions: ["allow-once", "allow-always", "deny"],
+      },
+    });
+    expect(legacy?.request.allowedDecisions).toEqual(["allow-once", "allow-always", "deny"]);
+  });
+
+  it.each([
+    ["only scoped choices", ["allow-15m", "allow-session"]],
+    ["unknown choices", ["approve", "yes"]],
+    ["an empty list", []],
+  ])("offers only deny when a plugin decision list has %s", (_name, allowedDecisions) => {
+    const parsed = parsePluginApprovalRequested({
+      ...validPayload,
+      request: { ...validPayload.request, allowedDecisions },
+    });
+    // A non-empty list keeps the card from substituting its exec defaults.
+    expect(parsed?.request.allowedDecisions).toEqual(["deny"]);
+  });
+
   it("returns null when title is missing from request", () => {
     const {
       request: { title: _, ...restRequest },

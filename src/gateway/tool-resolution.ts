@@ -90,8 +90,8 @@ export function resolveGatewayScopedTools(
     allowMediaInvokeCommands?: boolean;
     surface?: GatewayScopedToolSurface;
     /**
-     * Liveness of the client grant this request authenticated with, supplied by
-     * the loopback server. Run-contract tools re-check it before they write.
+     * Live authority of this loopback invocation, including its connection and
+     * authenticating grant. Retained tools re-check it before final effects.
      */
     isGrantCurrent?: () => boolean;
     /** Authenticated standalone invocation lifetime supplied by its HTTP/RPC owner. */

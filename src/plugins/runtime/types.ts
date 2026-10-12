@@ -134,6 +134,7 @@ export type RuntimeGatewayRequestOptions = {
 
 /** Trusted in-process runtime surface injected into native plugins. */
 export type PluginRuntime = PluginRuntimeCore & {
+  approvalUX: import("./types-approval-ux.js").PluginApprovalUX;
   gateway: {
     /** Whether this process owns an active Gateway request context. */
     isAvailable: () => Promise<boolean>;
@@ -230,5 +231,5 @@ export type CreatePluginRuntimeOptions = {
 /** Checked contract for both the path-loaded factory and its implementation. */
 export type PluginRuntimeFactory = (
   options?: CreatePluginRuntimeOptions,
-  base?: Pick<PluginRuntime, "config" | "state" | "system">,
+  base?: Pick<PluginRuntime, "config" | "state" | "system" | "approvalUX">,
 ) => PluginRuntime;

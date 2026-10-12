@@ -18,10 +18,12 @@ export function prepareApprovalExecution(params: {
   requireRequesterMatch?: boolean;
   manager?: Pick<
     ExecApprovalManager<unknown>,
-    "getLiveSnapshot" | "prepareAllowOnceExecution" | "projectDecisionIfActive"
+    "approvalKind" | "getLiveSnapshot" | "prepareAllowOnceExecution" | "projectDecisionIfActive"
   >;
   /** Consumers which already consume option-off one-shot consent retain that contract. */
   consumeAllowOnce?: boolean;
+  /** Exact Policy choice; host redemption consumes this call once for every grant choice. */
+  decision?: import("../infra/exec-approvals-core.js").ExecApprovalDecision;
   /** Timeout policy authorizes fallback separately from explicit human consent. */
   isFallback?: () => boolean;
 }) {
@@ -99,7 +101,11 @@ export function prepareApprovalExecution(params: {
         },
       ),
     );
-    if (result.id !== params.id || result.decision !== "allow-once" || result.consumed !== true) {
+    if (
+      result.id !== params.id ||
+      result.decision !== (params.decision ?? "allow-once") ||
+      result.consumed !== true
+    ) {
       throw new ApprovalRequesterPolicyError("stale");
     }
     assertOwner();

@@ -312,6 +312,8 @@ struct OpenClawTypographyTests {
         #expect(approvalDialog.contains("exec-approval-review-scroll"))
         #expect(approvalDialog.contains("exec-approval-actions"))
         #expect(approvalDialog.contains("ViewThatFits(in: .horizontal)"))
+        #expect(approvalDialog.contains("ExecApprovalPromptMetadataRow(label: \"Delegation\", value: summary)"))
+        #expect(approvalDialog.contains("Text(\"Native plugin approvals offer Allow Once and Deny. Review in Dashboard for reusable permission.\")"))
         #expect(settingsSections.contains("OpenClawToggleIndicator(isOn: isOn.wrappedValue)"))
         #expect(settingsSections.contains(".font(OpenClawType.subhead)"))
         let gatewayDestination = try Self.extract(

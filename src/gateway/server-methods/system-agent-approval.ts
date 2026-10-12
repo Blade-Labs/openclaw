@@ -212,7 +212,12 @@ export async function prepareDelegatedSystemAgentApproval(params: {
           assertLiveApprovalAuthority();
         }
         return await params.session.engine.resolveOperatorApproval(
-          decision,
+          decision === "allow-once" ||
+            decision === "allow-always" ||
+            decision === "deny" ||
+            decision === null
+            ? decision
+            : "deny",
           proposal.hash,
           () => {
             assertLiveApprovalAuthority();

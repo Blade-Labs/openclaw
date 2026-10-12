@@ -158,6 +158,54 @@ describe("TUI plugin approvals", () => {
     expect(harness.addSystem).toHaveBeenLastCalledWith("workspace skill approval: allowed once");
   });
 
+  it.each([
+    { decision: "allow-15m", resolved: "allowed for 15 minutes" },
+    {
+      decision: "allow-session",
+      resolved: "allowed for this session",
+    },
+  ])("shows all scoped choices and submits $decision from the event prompt", async (choice) => {
+    const harness = createHarness();
+    const decisions = ["allow-once", "allow-15m", "allow-session", "allow-always", "deny"];
+    harness.controller.handleEvent(
+      "plugin.approval.requested",
+      approvalPayload({
+        request: {
+          ...approvalPayload().request,
+          allowedDecisions: decisions,
+          grantScopeSummary: "Project 4 approved fields; later values may differ.",
+        },
+      }),
+    );
+
+    const selector = expectDefined(harness.selectors[0], "approval selector");
+    expect(selector.items.map((item) => item.value)).toEqual(decisions);
+    expect(selector.items.map((item) => item.label)).toEqual([
+      "Allow once",
+      "Allow 15 min",
+      "Allow for this session",
+      "Always allow",
+      "Deny",
+    ]);
+    expect(selector.setSelectedIndex).toHaveBeenCalledWith(4);
+    const prompt = expectDefined(harness.openOverlay.mock.calls[0]?.[0], "approval prompt");
+    expect(stripAnsi(prompt.render(120).join("\n"))).toContain(
+      "Delegation: Project 4 approved fields; later values may differ.",
+    );
+    const selected = expectDefined(
+      selector.items.find((item) => item.value === choice.decision),
+      "bounded decision",
+    );
+    selector.onSelectionChange?.(selected);
+    selector.onSelect?.(selected);
+    expect(harness.resolvePluginApproval).toHaveBeenCalledWith("plugin:skill-1", choice.decision);
+    await harness.resolvePluginApproval.mock.results[0]?.value;
+    expect(harness.addSystem).toHaveBeenLastCalledWith(
+      `workspace skill approval: ${choice.resolved}`,
+    );
+    harness.controller.dispose();
+  });
+
   it("ignores other sessions and restores matching pending approvals after connect", async () => {
     const harness = createHarness();
     harness.controller.handleEvent(
@@ -509,6 +557,7 @@ describe("TUI plugin approvals", () => {
           ...approvalPayload().request,
           title: "Apply\nAllow once\u202E\u001B]52;c;YWJj\u0007 skill",
           description: "Review\nPress Enter again\u2066\u001B[2J this\u0000 change",
+          grantScopeSummary: "Project\nfields\u202E\u001B]52;c;YWJj\u0007 only",
         },
       }),
     );
@@ -522,6 +571,7 @@ describe("TUI plugin approvals", () => {
     expect(renderedPrompt).not.toContain("\u2066");
     expect(stripAnsi(renderedPrompt)).toContain("workspace skill approval: Apply Allow once skill");
     expect(stripAnsi(renderedPrompt)).toContain("Request: Review Press Enter again this change");
+    expect(stripAnsi(renderedPrompt)).toContain("Delegation: Project fields only");
   });
 
   it("clears the active prompt timer when disposed", () => {

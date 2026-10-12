@@ -133,7 +133,7 @@ describe("buildApprovalPresentation", () => {
 
   it("applies plugin limits by Unicode code point after sanitization", () => {
     const title = String.fromCodePoint(0x1f680).repeat(80);
-    const description = String.fromCodePoint(0x1f6e1).repeat(512);
+    const description = String.fromCodePoint(0x1f6e1).repeat(4_096);
 
     expect(buildPluginPresentation({ title, description })).toMatchObject({
       kind: "plugin",
@@ -152,6 +152,16 @@ describe("buildApprovalPresentation", () => {
         description: `${description}${String.fromCodePoint(0x1f6e1)}`,
       }),
     ).toBeNull();
+  });
+
+  it("rejects escaped descriptions beyond the budget instead of truncating", () => {
+    const input = "\u200B".repeat(512);
+    const description = "\\u{200B}".repeat(512);
+    expect(Array.from(description)).toHaveLength(4_096);
+    expect(buildPluginPresentation({ title: "Batch", description: input })).toMatchObject({
+      description,
+    });
+    expect(buildPluginPresentation({ title: "Batch", description: input + "x" })).toBeNull();
   });
 
   it("truncates oversized plugin detail without invalidating the presentation", () => {

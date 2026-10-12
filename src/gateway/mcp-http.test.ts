@@ -2389,18 +2389,22 @@ describe("mcp loopback server", () => {
     expect(deniedOverride.toolSchema.map((tool) => tool.name)).not.toContain("exec");
     expect(fullOverride.toolSchema.map((tool) => tool.name)).toContain("exec");
     expect(
-      await cache.resolve({
-        ...baseParams,
-        context: { ...baseParams.context, execSession: { permissionMode: "read-only" } },
-      }),
-    ).toBe(readOnly);
+      (
+        await cache.resolve({
+          ...baseParams,
+          context: { ...baseParams.context, execSession: { permissionMode: "read-only" } },
+        })
+      ).toolSchema,
+    ).toBe(readOnly.toolSchema);
     expect(
-      await cache.resolve({
-        ...baseParams,
-        context: { ...baseParams.context, execOverrides: { mode: "deny" } },
-      }),
-    ).toBe(deniedOverride);
-    expect(resolveGatewayScopedToolsMock).toHaveBeenCalledTimes(4);
+      (
+        await cache.resolve({
+          ...baseParams,
+          context: { ...baseParams.context, execOverrides: { mode: "deny" } },
+        })
+      ).toolSchema,
+    ).toBe(deniedOverride.toolSchema);
+    expect(resolveGatewayScopedToolsMock).toHaveBeenCalledTimes(6);
   });
 
   it("keeps model policy identity cache-bound", async () => {
@@ -2449,7 +2453,7 @@ describe("mcp loopback server", () => {
     expect(openAi.toolSchema.map((tool) => tool.name)).toContain("exec");
     expect(blockedAnthropic.toolSchema.map((tool) => tool.name)).not.toContain("exec");
     expect(allowedAnthropic.toolSchema.map((tool) => tool.name)).toContain("exec");
-    expect(resolveGatewayScopedToolsMock).toHaveBeenCalledTimes(3);
+    expect(resolveGatewayScopedToolsMock).toHaveBeenCalledTimes(4);
   });
 
   it("keeps exec overrides and sender identities cache-bound", async () => {
@@ -2500,7 +2504,7 @@ describe("mcp loopback server", () => {
     });
     await cache.resolve(baseParams);
 
-    expect(resolveGatewayScopedToolsMock).toHaveBeenCalledTimes(11);
+    expect(resolveGatewayScopedToolsMock).toHaveBeenCalledTimes(12);
   });
 
   it("keeps every elevated-exec authority field cache-bound", async () => {
@@ -2552,7 +2556,7 @@ describe("mcp loopback server", () => {
     });
     await cache.resolve(baseParams);
 
-    expect(resolveGatewayScopedToolsMock).toHaveBeenCalledTimes(5);
+    expect(resolveGatewayScopedToolsMock).toHaveBeenCalledTimes(6);
   });
 
   it("caps loopback tool cache cardinality by evicting oldest contexts", async () => {
@@ -2594,7 +2598,7 @@ describe("mcp loopback server", () => {
         currentMessageId: "message-256",
       },
     });
-    expect(resolveGatewayScopedToolsMock).toHaveBeenCalledTimes(258);
+    expect(resolveGatewayScopedToolsMock).toHaveBeenCalledTimes(259);
   });
 
   it("adds empty properties for object schemas that omit properties", async () => {
@@ -3525,17 +3529,17 @@ describe("mcp loopback server", () => {
 
   it("preserves request-disconnect evidence without classifying a tool failure", async () => {
     const controller = new AbortController();
-    controller.abort();
     const onToolCallResult = vi.fn();
     const partialDelivery = Object.assign(new Error("request disconnected"), {
       name: "AbortError",
       sentBeforeError: true,
     });
-    const tool = makeMessageTool({
-      execute: async () => {
-        throw partialDelivery;
-      },
+    const execute = vi.fn(async () => {
+      // The request disconnects while the tool is delivering.
+      controller.abort(partialDelivery);
+      throw partialDelivery;
     });
+    const tool = makeMessageTool({ execute });
 
     await handleMcpJsonRpc({
       message: mcpToolCallMessage("message", { body: "hello" }),
@@ -3545,12 +3549,44 @@ describe("mcp loopback server", () => {
       onToolCallResult,
     });
 
-    expect(onToolCallResult).toHaveBeenCalledWith({
+    expect(execute).toHaveBeenCalledOnce();
+    expect(onToolCallResult).toHaveBeenCalledExactlyOnceWith({
       toolName: "message",
       args: { body: "hello" },
       outcome: "unknown",
       result: partialDelivery,
     });
+    expect(onToolCallResult.mock.calls[0]?.[0].result).toMatchObject({
+      message: "request disconnected",
+      name: "AbortError",
+      sentBeforeError: true,
+    });
+  });
+
+  it("does not run the tool when the request disconnected before execution", async () => {
+    const controller = new AbortController();
+    const disconnected = Object.assign(new Error("request disconnected"), { name: "AbortError" });
+    controller.abort(disconnected);
+    const onToolCallResult = vi.fn();
+    const execute = vi.fn(async () => ({ content: [{ type: "text", text: "EXECUTED" }] }));
+    const tool = makeMessageTool({ execute });
+
+    const payload = await handleMcpJsonRpc({
+      message: mcpToolCallMessage("message", { body: "hello" }),
+      tools: [tool as unknown as AnyAgentTool],
+      toolSchema: buildMockMcpToolSchema([tool]),
+      signal: controller.signal,
+      onToolCallResult,
+    });
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(onToolCallResult).toHaveBeenCalledExactlyOnceWith({
+      toolName: "message",
+      args: { body: "hello" },
+      outcome: "unknown",
+      result: disconnected,
+    });
+    expect(payload).toMatchObject({ result: { isError: true } });
   });
 
   it("tracks the active runtime only while the server is running", async () => {

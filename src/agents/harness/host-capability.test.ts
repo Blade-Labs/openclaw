@@ -756,7 +756,9 @@ describe("agent harness host capability", () => {
     const host = createAgentHarnessHostCapabilities({ attempt, pluginId: "codex" });
     const turn = new AbortController();
     const scopes: AbortSignal[] = [];
+    const contracts: Array<string | undefined> = [];
     const captureScope = () => {
+      contracts.push(getGatewayToolCallerIdentity()?.approvalContract);
       scopes.push(AbortSignal.any([...(getGatewayToolCallerIdentity()?.approvalSignals ?? [])]));
     };
     mockRunBefore.mockImplementationOnce(async ({ params }) => {
@@ -786,6 +788,7 @@ describe("agent harness host capability", () => {
       signal: turn.signal,
     });
     expect(scopes).toHaveLength(3);
+    expect(contracts).toEqual([undefined, "native-tool", undefined]);
     turn.abort();
     expect(scopes.every((signal) => signal.aborted)).toBe(true);
     expect(() => host.capabilities.assertActive()).not.toThrow();

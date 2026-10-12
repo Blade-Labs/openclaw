@@ -320,30 +320,32 @@ describe("maybeHandleMSTeamsApprovalCardSubmit", () => {
     expect(resolveApprovalOverGateway).toHaveBeenCalledTimes(2);
   });
 
-  it("retries a failed terminal card update with the canonical winning decision", async () => {
-    const token = "update-retry";
+  it("consumes the resolved token even when the terminal card edit fails", async () => {
+    const token = "update-failed";
     registerBinding({ token });
     resolveApprovalOverGateway.mockResolvedValue(
       createResolution({ approvalId: `approval-${token}`, decision: "deny", applied: false }),
     );
-    const failedContext = createContext({ token });
     editAdaptiveCardMSTeams.mockRejectedValueOnce(new Error("update failed"));
     const deps = createDeps();
 
     await expect(
-      maybeHandleMSTeamsApprovalCardSubmit({ context: failedContext, deps }),
-    ).rejects.toThrow("update failed");
-    const retriedContext = createContext({ token });
-    await expect(
-      maybeHandleMSTeamsApprovalCardSubmit({ context: retriedContext, deps }),
+      maybeHandleMSTeamsApprovalCardSubmit({ context: createContext({ token }), deps }),
     ).resolves.toBe(true);
-
-    expect(resolveApprovalOverGateway).toHaveBeenCalledTimes(2);
-    const cardJson = JSON.stringify(editAdaptiveCardMSTeams.mock.calls[1]?.[0]);
+    expect(msTeamsApprovalControls.get(token)).toBeNull();
+    expect(deps.log.error).toHaveBeenCalledWith(
+      "msteams approval resolved; display update failed",
+      expect.objectContaining({ approvalId: `approval-${token}`, status: "denied" }),
+    );
+    const cardJson = JSON.stringify(editAdaptiveCardMSTeams.mock.calls[0]?.[0]);
     expect(cardJson).toContain("Exec Approval: Denied");
     expect(cardJson).toContain("Already resolved");
-    expect(cardJson).not.toContain("Exec Approval: Allowed once");
-    expect(msTeamsApprovalControls.get(token)).toBeNull();
+
+    await expect(
+      maybeHandleMSTeamsApprovalCardSubmit({ context: createContext({ token }), deps }),
+    ).resolves.toBe(true);
+    expect(resolveApprovalOverGateway).toHaveBeenCalledTimes(1);
+    expect(editAdaptiveCardMSTeams).toHaveBeenCalledTimes(1);
   });
 
   it("retires permanently missing approvals and ignores subsequent clicks", async () => {

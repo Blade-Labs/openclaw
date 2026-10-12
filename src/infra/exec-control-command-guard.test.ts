@@ -9,6 +9,14 @@ function nestedCommandSubstitution(inner: string, depth: number): string {
 }
 
 describe("exec control command guard", () => {
+  it.each(["allow-15m", "allow-session"])(
+    "rejects shell-issued scoped %s approvals",
+    async (decision) => {
+      await expect(
+        rejectUnsafeExecControlShellCommand(`/approve plugin:scoped ${decision}`),
+      ).rejects.toThrow("exec cannot run /approve commands");
+    },
+  );
   it("rejects a control command below deeply nested command substitutions", async () => {
     const command = nestedCommandSubstitution("/approve abc123 allow-once", 5_000);
 

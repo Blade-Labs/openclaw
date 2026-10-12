@@ -9,6 +9,10 @@ import {
   onAgentEvent as registerAgentEventListener,
   resetAgentEventsForTest,
 } from "../infra/agent-events.js";
+import type { PluginHookAfterToolCallEvent } from "../plugins/hook-types.js";
+import { createHookRunner } from "../plugins/hooks.js";
+import { addTestHook } from "../plugins/hooks.test-helpers.js";
+import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
 import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
 import { createTestAdmittedRunContext } from "./admitted-run-context.test-support.js";
@@ -38,6 +42,7 @@ import type {
   ToolHandlerContext,
 } from "./embedded-agent-subscribe.handlers.types.js";
 import { claimPendingAgentQuestionAnswer } from "./harness/gateway-question.js";
+import { withToolEffectBoundary } from "./tool-effect-receipt.js";
 import {
   createAskUserTool,
   normalizeAskUserParams,
@@ -4598,3 +4603,48 @@ describe("control UI credential redaction (issue #72283)", () => {
   });
 });
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
+
+describe("after_tool_call observed execution receipts", () => {
+  it.each(["success", "failed-before-effect", "uncertain-error", "unknown-success"] as const)(
+    "publishes only observed effect outcomes (%s)",
+    async (mode) => {
+      const { ctx } = createTestContext();
+      const seen = createDeferred<PluginHookAfterToolCallEvent>();
+      const registry = createEmptyPluginRegistry();
+      addTestHook({
+        registry,
+        pluginId: "synthetic-policy",
+        hookName: "after_tool_call",
+        handler: (event: PluginHookAfterToolCallEvent) => {
+          seen.resolve(event);
+        },
+      });
+      ctx.hookRunner = createHookRunner(registry);
+      let result: unknown = {
+        content: [{ type: "text", text: "Synthetic result" }],
+        details: { ok: true },
+      };
+      if (mode === "failed-before-effect") {
+        // The actual effect owner marks this rejected operation before any write.
+        result = await withToolEffectBoundary(async () => {
+          throw new Error("Synthetic refusal");
+        }).catch((error: unknown) => error);
+      }
+      await executeTool(ctx, {
+        toolName: mode === "unknown-success" ? "plugin_unknown" : "message",
+        toolCallId: `synthetic-receipt-${mode}`,
+        args: { action: "send", target: "synthetic-dm", message: "Synthetic message" },
+        isError: mode === "failed-before-effect" || mode === "uncertain-error",
+        result,
+      });
+      const event = await seen.promise;
+      if (mode === "success") {
+        expect(event.executionReceipt).toEqual({ outcome: "succeeded" });
+      } else if (mode === "failed-before-effect") {
+        expect(event.executionReceipt).toEqual({ outcome: "failed" });
+      } else {
+        expect(event).not.toHaveProperty("executionReceipt");
+      }
+    },
+  );
+});

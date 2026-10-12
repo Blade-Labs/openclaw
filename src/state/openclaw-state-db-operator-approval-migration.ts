@@ -1,5 +1,7 @@
-// Doctor-only repair for the operator approval kind constraint.
+// Doctor repairs legacy approval kinds; versioned migration extends plugin decisions.
 import type { DatabaseSync } from "node:sqlite";
+import { assertSqliteSchemaContains } from "../infra/sqlite-schema-contract.js";
+import { quoteSqliteIdentifier } from "../infra/sqlite-schema-sql.js";
 import { runSqliteImmediateTransactionSync } from "../infra/sqlite-transaction.js";
 import { tableExists } from "./openclaw-state-db-schema-helpers.js";
 import { OPENCLAW_STATE_SCHEMA_SQL } from "./openclaw-state-schema.js";
@@ -10,6 +12,8 @@ const COLUMNS = [
   "kind",
   "status",
   "presentation_json",
+  "authorization_json",
+  "resolver_actor_json",
   "requested_by_device_id",
   "requested_by_client_id",
   "requested_by_device_token_auth",
@@ -89,6 +93,16 @@ function canonicalOperatorApprovalCreateSql(): string {
   return OPENCLAW_STATE_SCHEMA_SQL.slice(start, end + tableTerminator.length);
 }
 
+function priorPluginDecisionCreateSql(): string {
+  return canonicalOperatorApprovalCreateSql()
+    .replaceAll(
+      "'allow-once', 'allow-15m', 'allow-session', 'allow-always'",
+      "'allow-once', 'allow-always'",
+    )
+    .replace("\n  CHECK (kind = 'plugin' OR decision NOT IN ('allow-15m', 'allow-session')),", "")
+    .replace("AND (decision = 'allow-once' OR kind = 'plugin')", "AND decision = 'allow-once'");
+}
+
 function alterAppendedResolutionRefCreateSql(sql: string): string {
   const resolutionRefStart = sql.indexOf("\n  resolution_ref ");
   const followingColumnStart = sql.indexOf("\n  kind ", resolutionRefStart);
@@ -102,8 +116,8 @@ function alterAppendedResolutionRefCreateSql(sql: string): string {
 }
 
 // The only legacy shapes this repair may destructively replace are the exact
-// prior canonical table with the two-kind constraint (before 'system-agent')
-// and its shipped ALTER-appended resolution_ref variant.
+// prior canonical tables with the two-kind constraint (before 'system-agent')
+// and their shipped ALTER-appended resolution_ref variants.
 // Matching column names alone is not fail-closed: a table with the same names
 // but different constraints/defaults/types would get its rows copied under a
 // schema that silently discards those semantics.
@@ -112,13 +126,20 @@ function hasExactLegacyOperatorApprovalSchema(db: DatabaseSync): boolean {
   if (!live) {
     return false;
   }
-  const exactStrictLegacy = canonicalOperatorApprovalCreateSql()
-    // sqlite_master stores the CREATE statement without "IF NOT EXISTS".
-    .replace("CREATE TABLE IF NOT EXISTS operator_approvals (", "CREATE TABLE operator_approvals (")
-    .replace(/'exec',\s*'plugin',\s*'system-agent'/, "'exec', 'plugin'");
   const normalizedLive = normalizeDdl(live);
-  const alterAppendedStrictLegacy = alterAppendedResolutionRefCreateSql(exactStrictLegacy);
-  return [exactStrictLegacy, alterAppendedStrictLegacy].some((strictLegacy) =>
+  const strictLegacyShapes = [
+    canonicalOperatorApprovalCreateSql(),
+    priorPluginDecisionCreateSql(),
+  ].flatMap((sql) => {
+    const exact = sql
+      .replace(
+        "CREATE TABLE IF NOT EXISTS operator_approvals (",
+        "CREATE TABLE operator_approvals (",
+      )
+      .replace(/'exec',\s*'plugin',\s*'system-agent'/, "'exec', 'plugin'");
+    return [exact, alterAppendedResolutionRefCreateSql(exact)];
+  });
+  return strictLegacyShapes.some((strictLegacy) =>
     [strictLegacy, strictLegacy.replace(/\) STRICT;$/u, ");")]
       .map(normalizeDdl)
       .includes(normalizedLive),
@@ -185,4 +206,59 @@ export function repairOperatorApprovalSchema(db: DatabaseSync): string[] {
   return repairOperatorApprovalKinds(db)
     ? ["Migrated shared state operator approvals → OpenClaw system changes"]
     : [];
+}
+
+/** The existing schema transaction owns FK suspension, atomic copy, and version publication. */
+export function migratePluginApprovalDecisions(db: DatabaseSync, previousVersion: number): boolean {
+  if (
+    previousVersion >= 19 ||
+    !tableExists(db, "operator_approvals") ||
+    !hasCanonicalOperatorApprovalKinds(db)
+  ) {
+    return false;
+  }
+  if (tableSql(db)?.includes("'allow-15m'")) {
+    return false;
+  }
+  const indexSql = operatorApprovalIndexSql();
+  const indexNames = [...indexSql.matchAll(/INDEX IF NOT EXISTS (\w+)/gu)].map(
+    (match) => match[1]!,
+  );
+  const strict = db
+    .prepare("SELECT strict FROM pragma_table_list WHERE name = 'operator_approvals'")
+    .get()?.strict;
+  // Versions before STRICT admission can already have the canonical three-kind
+  // table; this decision rebuild runs before the existing STRICT migration.
+  const priorSchema =
+    previousVersion < 3 && strict === 0
+      ? priorPluginDecisionCreateSql().replace(/\) STRICT;$/u, ");")
+      : priorPluginDecisionCreateSql();
+  assertSqliteSchemaContains(
+    db,
+    "operator approvals before schema 19",
+    `${priorSchema}\n${indexSql}`,
+    {
+      allowedMissingIndexes: indexNames,
+    },
+  );
+  const attachedObjects = db
+    .prepare(
+      "SELECT sql FROM sqlite_schema WHERE tbl_name = 'operator_approvals' AND type IN ('index', 'trigger') AND sql IS NOT NULL",
+    )
+    .all();
+  if (tableExists(db, "operator_approvals_migration_new")) {
+    throw new Error("OpenClaw operator approval migration table already exists");
+  }
+  const columns = COLUMNS.map(quoteSqliteIdentifier).join(", ");
+  db.exec(canonicalCreateSql());
+  db.exec(`INSERT INTO operator_approvals_migration_new (${columns}) SELECT ${columns} FROM operator_approvals;
+    DROP TABLE operator_approvals;
+    ALTER TABLE operator_approvals_migration_new RENAME TO operator_approvals;`);
+  for (const object of attachedObjects) {
+    if (typeof object.sql === "string") {
+      db.exec(object.sql);
+    }
+  }
+  db.exec(indexSql);
+  return true;
 }

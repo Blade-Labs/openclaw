@@ -19,7 +19,7 @@ import { isPathInside } from "./path-guards.js";
 
 type ParsedExecApprovalCommand = {
   approvalId: string;
-  decision: "allow-once" | "allow-always" | "deny";
+  decision: "allow-once" | "allow-15m" | "allow-session" | "allow-always" | "deny";
 };
 
 type UnsafeExecControlShellCommandKind =
@@ -59,7 +59,7 @@ const SQLITE_OPEN_OPTIONS_WITH_VALUES = new Map<string, number>([
 function parseExecApprovalShellCommand(raw: string): ParsedExecApprovalCommand | null {
   const normalized = raw.trimStart();
   const match = normalized.match(
-    /^\/approve(?:@[^\s]+)?\s+([A-Za-z0-9][A-Za-z0-9._:-]*)\s+(allow-once|allow-always|always|deny)\b/i,
+    /^\/approve(?:@[^\s]+)?\s+([A-Za-z0-9][A-Za-z0-9._:-]*)\s+(allow-once|allow-15m|allow-session|allow-always|always|deny)\b/i,
   );
   if (!match) {
     return null;

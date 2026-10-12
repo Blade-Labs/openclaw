@@ -242,7 +242,7 @@ const invalidRequestCases = [
   },
   {
     name: "description exceeding max length",
-    params: { title: "T", description: "x".repeat(513) },
+    params: { title: "T", description: "x".repeat(4_097) },
   },
   {
     name: "timeoutMs exceeding max",
@@ -282,6 +282,96 @@ describe("createPluginApprovalHandlers", () => {
   });
 
   describe("plugin.approval.request", () => {
+    it("rejects grant eligibility submitted without the signed plugin owner", async () => {
+      const opts = createMockOptions("plugin.approval.request", {
+        title: "Forged delegation",
+        description: "D",
+        grantEligible: true,
+        grantScopeSummary: "Synthetic scope",
+        twoPhase: true,
+      });
+      await createPluginApprovalHandlers(manager)["plugin.approval.request"]!(opts);
+      expect(opts.respond).toHaveBeenCalledWith(
+        false,
+        undefined,
+        expect.objectContaining({
+          message: "scoped plugin grants require a signed plugin owner and scope summary",
+        }),
+      );
+      expect(await manager.listPendingRecords()).toEqual([]);
+      expect(opts.context.broadcast).not.toHaveBeenCalled();
+    });
+    it("keeps public legacy lists once/deny and rejects reusable resolution", async () => {
+      const handlers = createPluginApprovalHandlers(manager);
+      const { respond, accepted } = createApprovalRequestResponder();
+      const opts = createMockOptions(
+        "plugin.approval.request",
+        {
+          title: "Public consent",
+          description: "Exact synthetic action",
+          allowedDecisions: ["allow-once", "allow-always", "deny"],
+          mcpTool: { server: "synthetic", tool: "write" },
+          twoPhase: true,
+        },
+        { respond },
+      );
+      const pending = handlers["plugin.approval.request"]!(opts);
+      const id = await accepted;
+      try {
+        expect((await manager.getSnapshot(id))?.request).toMatchObject({
+          grantEligible: false,
+          allowedDecisions: ["allow-once", "deny"],
+        });
+        expect(
+          requireRecord(broadcastCall(opts).payload.request, "broadcast request").allowedDecisions,
+        ).toEqual(["allow-once", "deny"]);
+        const reusable = createMockOptions("plugin.approval.resolve", {
+          id,
+          decision: "allow-always",
+        });
+        await handlers["plugin.approval.resolve"]!(reusable);
+        expect(expectResponseRejected(reusable.respond).message).toBe(
+          "allow-always is unavailable for this plugin approval",
+        );
+      } finally {
+        await handlers["plugin.approval.resolve"]!(
+          createMockOptions("plugin.approval.resolve", { id, decision: "deny" }),
+        );
+        await pending;
+      }
+    });
+
+    it.each(["description", "grantScopeSummary"] as const)(
+      "enforces the raw whitespace budget for public %s",
+      async (field) => {
+        const handlers = createPluginApprovalHandlers(manager);
+        for (const leading of [false, true]) {
+          for (const length of [4_096, 4_097]) {
+            const value = leading ? " " + "x".repeat(length - 1) : "x".repeat(length - 1) + " ";
+            const opts = createMockOptions("plugin.approval.request", {
+              title: "Raw budget",
+              description: "Synthetic action",
+              [field]: value,
+              twoPhase: true,
+            });
+            if (length === 4_097) {
+              await handlers["plugin.approval.request"]!(opts);
+              expectResponseRejected(opts.respond);
+            } else {
+              const { respond, accepted } = createApprovalRequestResponder();
+              opts.respond = respond;
+              const pending = handlers["plugin.approval.request"]!(opts);
+              const id = await accepted;
+              await handlers["plugin.approval.resolve"]!(
+                createMockOptions("plugin.approval.resolve", { id, decision: "deny" }),
+              );
+              await pending;
+            }
+          }
+        }
+      },
+    );
+
     it("creates and registers approval with twoPhase", async () => {
       const handlers = createPluginApprovalHandlers(manager);
       const { respond, accepted } = createApprovalRequestResponder();
@@ -1081,14 +1171,14 @@ describe("createPluginApprovalHandlers", () => {
 
       const opts = createMockOptions("plugin.approval.resolve", {
         id: "abcdef",
-        decision: "allow-always",
+        decision: "allow-once",
       });
       await expectDefined(
         handlers["plugin.approval.resolve"],
         'handlers["plugin.approval.resolve"] test invariant',
       )(opts);
       expect(opts.respond).toHaveBeenCalledWith(true, { ok: true }, undefined);
-      expect((await manager.getSnapshot(record.id))?.decision).toBe("allow-always");
+      expect((await manager.getSnapshot(record.id))?.decision).toBe("allow-once");
     });
 
     it("does not leak candidate ids when prefixes are ambiguous", async () => {

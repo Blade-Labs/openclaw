@@ -16,8 +16,10 @@ import { prepareExecApprovalOnceExecution } from "../gateway/exec-approval-consu
 import type { ExecApprovalRecord } from "../gateway/exec-approval-manager.types.js";
 import { prepareExecApprovalRequesterGuard } from "../gateway/exec-approval-requester-guard.js";
 import { notifyListeners } from "../shared/listeners.js";
+import { buildApprovalPresentation } from "./approval-presentation.js";
 import type { ExecApprovalDecision } from "./exec-approvals.js";
 import { resolveCanonicalPluginApprovalRequestAllowedDecisions } from "./plugin-approval-canonical-decisions.js";
+import { isScopedPluginGrantApproval } from "./plugin-approvals.js";
 import type {
   PluginApprovalRequest,
   PluginApprovalRequestPayload,
@@ -65,16 +67,36 @@ export class EmbeddedPluginApprovalBroker {
     id: string;
     decision: ExecApprovalDecision | null;
     approvalExecutions?: ApprovalExecution[];
+    receipt?: import("../plugins/hook-before-tool-call-result.js").PluginApprovalReceipt;
   }> {
     if (params.signal?.aborted) {
       throw params.signal.reason ?? new Error("approval request aborted");
+    }
+    const presentation = buildApprovalPresentation({
+      kind: "plugin",
+      request: params.request,
+      allowedDecisions: resolveCanonicalPluginApprovalRequestAllowedDecisions(params.request),
+    });
+    if (!presentation || presentation.kind !== "plugin") {
+      throw new Error("invalid plugin approval presentation or display limit exceeded");
     }
     const id = `plugin:${randomUUID()}`;
     const createdAtMs = Date.now();
     const record: PendingApproval["record"] = {
       approvalKind: "plugin",
       id,
-      request: { ...params.request },
+      request: {
+        ...params.request,
+        title: presentation.title,
+        description: presentation.description,
+        detail: presentation.detail,
+        toolName: presentation.toolName,
+        pluginId: presentation.pluginId,
+        agentId: presentation.agentId,
+        scope: presentation.scope,
+        grantScopeSummary: presentation.grantScopeSummary,
+        allowedDecisions: presentation.allowedDecisions,
+      },
       createdAtMs,
       expiresAtMs: createdAtMs + params.timeoutMs,
     };
@@ -145,10 +167,27 @@ export class EmbeddedPluginApprovalBroker {
     try {
       const verdict = await decision;
       const outcome = { id, decision: verdict };
-      if (verdict !== "allow-once" && verdict !== "allow-always") {
+      Object.defineProperty(outcome, "receipt", {
+        value: {
+          approvalId: id,
+          decision: verdict,
+          createdAtMs: record.createdAtMs,
+          expiresAtMs: record.expiresAtMs,
+          ...(record.resolvedAtMs !== undefined ? { resolvedAtMs: record.resolvedAtMs } : {}),
+          ...(record.resolvedByActor ? { resolvedByActor: record.resolvedByActor } : {}),
+          ...(record.terminalReason ? { terminalReason: record.terminalReason } : {}),
+        },
+      });
+      if (
+        verdict !== "allow-once" &&
+        verdict !== "allow-15m" &&
+        verdict !== "allow-session" &&
+        verdict !== "allow-always"
+      ) {
         return outcome;
       }
       const manager = {
+        approvalKind: "plugin" as const,
         getLiveSnapshot: (recordId: string) =>
           recordId === id && generation === this.generation ? record : null,
         projectDecisionIfActive: (_recordId: string, value: ExecApprovalDecision | null) => {
@@ -156,11 +195,11 @@ export class EmbeddedPluginApprovalBroker {
           return value;
         },
         consumeAllowOnce: async (_recordId: string, consumerId: string) => {
-          assertCurrent("allow-once");
+          assertCurrent(verdict);
           if (record.consumedDecision) {
             return false;
           }
-          record.consumedDecision = "allow-once";
+          record.consumedDecision = verdict;
           record.consumedBy = consumerId;
           record.consumedAtMs = Date.now();
           return true;
@@ -174,7 +213,8 @@ export class EmbeddedPluginApprovalBroker {
           kind: "plugin",
           authorization: record.authorization,
           manager,
-          consumeAllowOnce: verdict === "allow-once",
+          consumeAllowOnce: verdict === "allow-once" || isScopedPluginGrantApproval(record.request),
+          decision: verdict,
         }),
       ]);
     } finally {
@@ -196,6 +236,7 @@ export class EmbeddedPluginApprovalBroker {
     entry.assertCurrent(decision);
     entry.record.resolvedByActor = actor;
     entry.record.decision = decision;
+    entry.record.resolvedAtMs = Date.now();
     entry.record.status = decision === "deny" ? "denied" : "allowed";
     entry.record.terminalReason = "user";
     clearTimeout(entry.timer);

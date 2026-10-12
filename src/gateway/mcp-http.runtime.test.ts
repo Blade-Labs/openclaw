@@ -91,7 +91,7 @@ beforeEach(() => {
   listNodes.mockReset();
   listNodes.mockResolvedValue([]);
   resolveGatewayScopedTools.mockReset();
-  resolveGatewayScopedTools.mockReturnValue(
+  resolveGatewayScopedTools.mockImplementation(() =>
     scopedToolFixture(["memory_search", "memory_get", "message", "cron"]),
   );
 });
@@ -405,7 +405,7 @@ describe("McpLoopbackToolCache", () => {
     await cache.resolve({ ...params, signal: next.signal });
     next.abort();
     await cache.resolve({ ...params, signal: new AbortController().signal });
-    expect(resolveGatewayScopedTools).toHaveBeenCalledOnce();
+    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(2);
     expect(resolveGatewayScopedTools.mock.calls[0]?.[0]).not.toHaveProperty("signal");
   });
 
@@ -444,17 +444,18 @@ describe("McpLoopbackToolCache", () => {
     const cfgB = {} as OpenClawConfig;
     const paramsA = scopeParams({ cfg: cfgA });
 
-    await cache.resolve(paramsA);
-    await cache.resolve(paramsA);
-    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(1);
+    const first = await cache.resolve(paramsA);
+    const second = await cache.resolve(paramsA);
+    expect(second.toolSchema).toBe(first.toolSchema);
+    expect(second.tools).not.toBe(first.tools);
 
     vi.advanceTimersByTime(30_000);
-    await cache.resolve(paramsA);
-    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(2);
+    const refreshed = await cache.resolve(paramsA);
+    expect(refreshed.toolSchema).not.toBe(first.toolSchema);
 
-    await cache.resolve(scopeParams({ cfg: cfgB }));
-    await cache.resolve(paramsA);
-    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(3);
+    const otherConfig = await cache.resolve(scopeParams({ cfg: cfgB }));
+    expect(otherConfig.toolSchema).not.toBe(refreshed.toolSchema);
+    expect((await cache.resolve(paramsA)).toolSchema).toBe(refreshed.toolSchema);
   });
 
   it("does not share cache rows across different grant allowlists", async () => {
@@ -471,8 +472,10 @@ describe("McpLoopbackToolCache", () => {
     expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(3);
 
     // Duplicate entries do not change the granted set.
-    await cache.resolve(scopeParams({ cfg, toolsAllow: ["memory_search", "memory_search"] }));
-    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(3);
+    const duplicate = await cache.resolve(
+      scopeParams({ cfg, toolsAllow: ["memory_search", "memory_search"] }),
+    );
+    expect(duplicate.toolSchema).toBe(restricted.toolSchema);
   });
 
   it("does not share cache rows across different runtime policy agents", async () => {
@@ -483,7 +486,7 @@ describe("McpLoopbackToolCache", () => {
     await cache.resolve(scopeParams({ cfg, runtimePolicyAgentId: "worker" }));
     await cache.resolve(scopeParams({ cfg, runtimePolicyAgentId: "main" }));
 
-    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(2);
+    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(3);
   });
 
   it("does not share loopback tools across prepared vision capabilities", async () => {
@@ -494,7 +497,7 @@ describe("McpLoopbackToolCache", () => {
     await cache.resolve(scopeParams({ cfg, modelHasVision: false }));
     await cache.resolve(scopeParams({ cfg, modelHasVision: true }));
 
-    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(2);
+    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(3);
     expect(resolveGatewayScopedTools.mock.calls[0]?.[0]).toMatchObject({
       modelHasVision: true,
     });
@@ -511,7 +514,7 @@ describe("McpLoopbackToolCache", () => {
     await cache.resolve(scopeParams({ cfg, replyToMode: "off" }));
     await cache.resolve(scopeParams({ cfg, replyToMode: "all" }));
 
-    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(2);
+    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(3);
     expect(resolveGatewayScopedTools.mock.calls[0]?.[0]).toMatchObject({ replyToMode: "all" });
     expect(resolveGatewayScopedTools.mock.calls[1]?.[0]).toMatchObject({ replyToMode: "off" });
   });
@@ -532,43 +535,45 @@ describe("McpLoopbackToolCache", () => {
         pinnedWidgetAuthoring ? ["dashboard", "show_widget"] : ["dashboard"],
       );
     }
-    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(2);
+    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(4);
   });
 
-  it("evicts only the revoked grant's cached tool closures", async () => {
+  it("evicts only the revoked grant's cached discovery schema", async () => {
     const cache = new McpLoopbackToolCache();
     const cfg = {} as OpenClawConfig;
-
-    await cache.resolve(scopeParams({ cfg, grantToken: "grant-a" }));
-    await cache.resolve(scopeParams({ cfg, grantToken: "grant-b" }));
-    await cache.resolve(scopeParams({ cfg, grantToken: "grant-a" }));
-    await cache.resolve(scopeParams({ cfg, grantToken: "grant-b" }));
-    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(2);
+    const paramsA = scopeParams({ cfg, grantToken: "grant-a" });
+    const paramsB = scopeParams({ cfg, grantToken: "grant-b" });
+    const firstA = await cache.resolve(paramsA);
+    const firstB = await cache.resolve(paramsB);
+    expect((await cache.resolve(paramsA)).toolSchema).toBe(firstA.toolSchema);
+    expect((await cache.resolve(paramsB)).toolSchema).toBe(firstB.toolSchema);
 
     expect(cache.evictGrant("grant-a")).toBe(true);
-    await cache.resolve(scopeParams({ cfg, grantToken: "grant-a" }));
-    await cache.resolve(scopeParams({ cfg, grantToken: "grant-b" }));
-
-    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(3);
+    expect((await cache.resolve(paramsA)).toolSchema).not.toBe(firstA.toolSchema);
+    expect((await cache.resolve(paramsB)).toolSchema).toBe(firstB.toolSchema);
   });
 
-  it("preserves the global 256-entry cache cap across grants", async () => {
+  it("preserves the global 256-entry schema cache cap across grants", async () => {
     const cache = new McpLoopbackToolCache();
     const cfg = {} as OpenClawConfig;
-
-    for (let index = 0; index < 256; index += 1) {
+    const first = await cache.resolve(
+      scopeParams({ cfg, grantToken: "grant-a", currentMessageId: "message-0" }),
+    );
+    for (let index = 1; index < 256; index += 1) {
       await cache.resolve(
         scopeParams({ cfg, grantToken: "grant-a", currentMessageId: `message-${index}` }),
       );
     }
-    await cache.resolve(scopeParams({ cfg, grantToken: "grant-b", currentMessageId: "message-b" }));
-    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(257);
-
-    await cache.resolve(scopeParams({ cfg, grantToken: "grant-a", currentMessageId: "message-0" }));
-    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(258);
-
-    await cache.resolve(scopeParams({ cfg, grantToken: "grant-b", currentMessageId: "message-b" }));
-    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(258);
+    const paramsB = scopeParams({ cfg, grantToken: "grant-b", currentMessageId: "message-b" });
+    const other = await cache.resolve(paramsB);
+    expect(
+      (
+        await cache.resolve(
+          scopeParams({ cfg, grantToken: "grant-a", currentMessageId: "message-0" }),
+        )
+      ).toolSchema,
+    ).not.toBe(first.toolSchema);
+    expect((await cache.resolve(paramsB)).toolSchema).toBe(other.toolSchema);
   });
 
   it("never reuses ordinary private-mode tools for a source-reply-only grant", async () => {
@@ -587,7 +592,7 @@ describe("McpLoopbackToolCache", () => {
     await cache.resolve(params);
     await cache.resolve({ ...params, context: { ...params.context, sourceReplyOnly: true } });
 
-    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(2);
+    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(4);
     expect(resolveGatewayScopedTools.mock.calls[0]?.[0]).not.toHaveProperty("sourceReplyOnly");
     expect(resolveGatewayScopedTools.mock.calls[1]?.[0]).toMatchObject({ sourceReplyOnly: true });
   });
@@ -607,7 +612,7 @@ describe("McpLoopbackToolCache", () => {
     });
 
     await cache.resolve(scopeParams({ cfg, delegationCapability: "report_only" }));
-    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(2);
+    expect(resolveGatewayScopedTools).toHaveBeenCalledTimes(3);
   });
 });
 

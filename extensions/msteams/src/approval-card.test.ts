@@ -62,6 +62,53 @@ function createPluginPendingView(): PluginApprovalPendingView {
 }
 
 describe("Microsoft Teams approval Adaptive Cards", () => {
+  it("renders all scoped decisions and every numbered operation in a long description", () => {
+    const view = createPluginPendingView();
+    view.description = Array.from(
+      { length: 20 },
+      (_, index) => `${index + 1}. Set field to ${"value ".repeat(24)}`,
+    ).join("\n");
+    view.actions = (
+      ["allow-once", "allow-15m", "allow-session", "allow-always", "deny"] as const
+    ).map((decision) => ({
+      decision,
+      label:
+        decision === "allow-15m"
+          ? "Allow 15 min"
+          : decision === "allow-session"
+            ? "Allow for this session"
+            : decision === "deny"
+              ? "Deny"
+              : decision === "allow-once"
+                ? "Allow once"
+                : "Always",
+      style: "primary",
+      command: `/approve plugin-1 ${decision}`,
+    }));
+    const result = buildMSTeamsPendingApprovalCard({ view, nowMs: 1_000 });
+    expect(result.allowedDecisions).toEqual([
+      "allow-once",
+      "allow-15m",
+      "allow-session",
+      "allow-always",
+      "deny",
+    ]);
+    expect(result.actionTokens.map(({ decision }) => decision)).toEqual(result.allowedDecisions);
+    expect((result.card.actions as Array<{ title: string }>).map(({ title }) => title)).toEqual([
+      "Allow once",
+      "Allow 15 min",
+      "Allow for this session",
+      "Always",
+      "Deny",
+    ]);
+    const body = result.card.body as Array<{ text?: string }>;
+    expect(
+      body
+        .slice(4, 24)
+        .map(({ text }) => text)
+        .join("\n"),
+    ).toBe(view.description);
+  });
   it("renders an exec command, ordered metadata, and only the available namespaced actions", () => {
     const result = buildMSTeamsPendingApprovalCard({
       view: createExecPendingView(),

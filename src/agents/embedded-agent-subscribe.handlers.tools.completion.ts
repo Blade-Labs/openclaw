@@ -96,6 +96,7 @@ import { parseExecApprovalResultText } from "./exec-approval-result.js";
 import { readMcpConnectAction } from "./mcp-connect-action.js";
 import { readMcpAppChannelView } from "./mcp-ui-resource.js";
 import type { AgentEvent } from "./runtime/index.js";
+import { projectToolExecutionReceipt } from "./tool-effect-receipt.js";
 import {
   createToolValidationErrorSummary,
   hasTerminalControlCharacter,
@@ -625,6 +626,7 @@ export async function handleToolExecutionEnd(
   const hookRunnerAfter = ctx.hookRunner ?? (await loadHookRunnerGlobal()).getGlobalHookRunner();
   if (hookRunnerAfter?.hasHooks("after_tool_call")) {
     const durationMs = startData?.startTime != null ? Date.now() - startData.startTime : undefined;
+    const executionReceipt = projectToolExecutionReceipt(terminal.effectReceipt);
     const hookEvent: PluginHookAfterToolCallEvent = {
       toolName,
       params: startArgs,
@@ -633,6 +635,7 @@ export async function handleToolExecutionEnd(
       result: sanitizedResult,
       error: isToolError ? extractToolErrorMessage(sanitizedResult) : undefined,
       durationMs,
+      ...(executionReceipt ? { executionReceipt } : {}),
     };
     void hookRunnerAfter
       .runAfterToolCall(hookEvent, {

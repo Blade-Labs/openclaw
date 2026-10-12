@@ -1,7 +1,21 @@
 import { createRequire } from "node:module";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { withToolEffectBoundary } from "../agents/tool-effect-receipt.js";
 import { ToolInputError, type AnyAgentTool } from "../agents/tools/common.js";
+import { setEmbeddedMode } from "../infra/embedded-mode.js";
+import {
+  EmbeddedPluginApprovalBroker,
+  setEmbeddedPluginApprovalBroker,
+} from "../infra/embedded-plugin-approval-broker.js";
+import {
+  initializeGlobalHookRunner,
+  resetGlobalHookRunner,
+} from "../plugins/hook-runner-global.js";
+import type { PluginHookAfterToolCallEvent } from "../plugins/hook-types.js";
+import { addTestHook } from "../plugins/hooks.test-helpers.js";
+import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import { SecretSurfaceUnavailableError } from "../secrets/runtime-degraded-state.js";
+import { createDeferredCore } from "../shared/deferred.js";
 import { handleMcpJsonRpc } from "./mcp-http.handlers.js";
 
 const undiciErrors = (
@@ -12,7 +26,7 @@ const undiciErrors = (
 
 type LoopbackOptions = Pick<
   Parameters<typeof handleMcpJsonRpc>[0],
-  "authorizeToolCall" | "onToolCallResult" | "signal"
+  "authorizeToolCall" | "onToolCallResult" | "signal" | "hookContext"
 >;
 
 function createFailingTool(params: {
@@ -169,4 +183,90 @@ describe("Gateway MCP network execution error boundary", () => {
       expect.objectContaining({ outcome: "unknown", result: abort }),
     );
   });
+});
+
+describe("Gateway MCP observed execution receipts", () => {
+  afterEach(() => {
+    setEmbeddedMode(false);
+    setEmbeddedPluginApprovalBroker(null);
+    resetGlobalHookRunner();
+  });
+
+  it.each(["success", "failed-before-effect", "uncertain-error"] as const)(
+    "runs registered policy, approval, and dispatch before publishing %s",
+    async (mode) => {
+      const seen = createDeferredCore<PluginHookAfterToolCallEvent>();
+      const registry = createEmptyPluginRegistry();
+      const writes: string[] = [];
+      let policyCommitted = false;
+      addTestHook({
+        registry,
+        pluginId: "synthetic-policy",
+        hookName: "before_tool_call",
+        handler: () => ({
+          requireApproval: {
+            title: "Synthetic write",
+            description: "Exact fixture operation",
+            onResolution: async () => {
+              policyCommitted = true;
+            },
+          },
+        }),
+      });
+      addTestHook({
+        registry,
+        pluginId: "synthetic-policy",
+        hookName: "after_tool_call",
+        handler: (event: PluginHookAfterToolCallEvent) => {
+          seen.resolve(event);
+        },
+      });
+      initializeGlobalHookRunner(registry);
+      const broker = new EmbeddedPluginApprovalBroker();
+      setEmbeddedMode(true);
+      setEmbeddedPluginApprovalBroker(broker);
+      const unsubscribe = broker.subscribe((event) => {
+        if (event.event === "plugin.approval.requested") {
+          broker.resolve(event.payload.id, "allow-once");
+        }
+      });
+      const tool: AnyAgentTool = {
+        name: "message",
+        label: "Synthetic writer",
+        description: "Synthetic message writer",
+        parameters: { type: "object", properties: {} } as never,
+        execute: async () =>
+          withToolEffectBoundary(async (onEffectsStart) => {
+            expect(policyCommitted).toBe(true);
+            if (mode === "failed-before-effect") {
+              throw new Error("Synthetic refusal");
+            }
+            onEffectsStart();
+            writes.push("Synthetic message");
+            if (mode === "uncertain-error") {
+              throw new Error("Synthetic error after write");
+            }
+            return { content: [{ type: "text", text: "Sent" }], details: { ok: true } };
+          }),
+      };
+      try {
+        const response = await callLoopbackTool(tool, {
+          hookContext: { runId: "synthetic-run", sessionKey: "synthetic-session", agentId: "main" },
+        });
+        const event = await seen.promise;
+        expect(response.result.isError).toBe(mode !== "success");
+        expect(writes).toHaveLength(mode === "failed-before-effect" ? 0 : 1);
+        if (mode === "success") {
+          expect(event.executionReceipt).toEqual({ outcome: "succeeded" });
+        } else if (mode === "failed-before-effect") {
+          expect(event.executionReceipt).toEqual({ outcome: "failed" });
+        } else {
+          expect(event).not.toHaveProperty("executionReceipt");
+        }
+      } finally {
+        unsubscribe();
+        broker.stop();
+      }
+    },
+  );
 });

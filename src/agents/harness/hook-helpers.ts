@@ -15,6 +15,11 @@ import { extractAssistantTranscriptSourceText } from "../../shared/chat-message-
 import { consumeAdjustedParamsForToolCall } from "../agent-tools.before-tool-call.js";
 import { consumeSourceForToolCall } from "../agent-tools.before-tool-call.state.js";
 import type { AgentMessage } from "../runtime/index.js";
+import {
+  projectToolExecutionReceipt,
+  readToolEffectReceipt,
+  type ToolEffectReceipt,
+} from "../tool-effect-receipt.js";
 
 const log = createSubsystemLogger("agents/harness");
 
@@ -31,6 +36,7 @@ export async function runAgentHarnessAfterToolCallHook(params: {
   source?: TurnSourceProvenance;
   result?: unknown;
   error?: string;
+  effectReceipt?: ToolEffectReceipt;
   startedAt?: number;
 }): Promise<void> {
   const adjustedArgs = consumeAdjustedParamsForToolCall(params.toolCallId, params.runId);
@@ -47,6 +53,9 @@ export async function runAgentHarnessAfterToolCallHook(params: {
   try {
     const eventArgs = structuredClone(resolvedArgs);
     const eventResult = cloneHookIsolationValue("after_tool_call", params.result);
+    const executionReceipt = projectToolExecutionReceipt(
+      params.effectReceipt ?? readToolEffectReceipt(params.result),
+    );
     await hookRunner.runAfterToolCall(
       {
         toolName: params.toolName,
@@ -55,6 +64,7 @@ export async function runAgentHarnessAfterToolCallHook(params: {
         toolCallId: params.toolCallId,
         ...(eventResult ? { result: eventResult } : {}),
         ...(params.error ? { error: params.error } : {}),
+        ...(executionReceipt ? { executionReceipt } : {}),
         ...(params.startedAt != null ? { durationMs: Date.now() - params.startedAt } : {}),
       },
       {

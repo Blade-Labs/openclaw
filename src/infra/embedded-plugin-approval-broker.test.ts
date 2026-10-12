@@ -70,6 +70,76 @@ afterEach(() => {
 });
 
 describe("EmbeddedPluginApprovalBroker", () => {
+  it.each(["description", "grantScopeSummary"] as const)(
+    "enforces raw Unicode and escaped budgets for %s before emitting a card",
+    async (field) => {
+      const broker = new EmbeddedPluginApprovalBroker();
+      const observer = vi.fn();
+      broker.subscribe(observer);
+      const request = (value: string) => ({
+        ...requestPayload(),
+        grantEligible: true,
+        grantScopeSummary: "Synthetic scope",
+        [field]: value,
+      });
+      try {
+        for (const value of ["🚀".repeat(4_097), "\u200B".repeat(512) + "x"]) {
+          await expect(
+            broker.request({ request: request(value), timeoutMs: 5_000 }),
+          ).rejects.toThrow("display limit exceeded");
+        }
+        expect(observer).not.toHaveBeenCalled();
+        for (const value of ["🚀".repeat(4_096), "\u200B".repeat(512)]) {
+          const pending = broker.request({ request: request(value), timeoutMs: 5_000 });
+          const approval = expectDefined(broker.listPending()[0], "bounded Unicode approval");
+          expect(Array.from(approval.request[field]!)).toHaveLength(4_096);
+          expect(broker.resolve(approval.id, "deny")).toBe(true);
+          await expect(pending).resolves.toMatchObject({ decision: "deny" });
+        }
+      } finally {
+        broker.stop();
+      }
+    },
+  );
+  it.each(["description", "grantScopeSummary"] as const)(
+    "rejects raw over-budget whitespace before trimming %s",
+    async (field) => {
+      const broker = new EmbeddedPluginApprovalBroker();
+      const observer = vi.fn();
+      broker.subscribe(observer);
+      try {
+        for (const leading of [false, true]) {
+          for (const length of [4_096, 4_097]) {
+            const value = leading ? " " + "x".repeat(length - 1) : "x".repeat(length - 1) + " ";
+            const pending = broker.request({
+              request: {
+                ...requestPayload(),
+                grantEligible: true,
+                grantScopeSummary: "Synthetic scope",
+                [field]: value,
+              },
+              timeoutMs: 5_000,
+            });
+            if (length === 4_097) {
+              await expect(pending).rejects.toThrow("display limit exceeded");
+              expect(broker.listPending()).toEqual([]);
+            } else {
+              const record = expectDefined(broker.listPending()[0], "bounded raw approval");
+              expect(record.request[field]).toBe(value.trim());
+              expect(broker.resolve(record.id, "deny")).toBe(true);
+              await expect(pending).resolves.toMatchObject({ decision: "deny" });
+            }
+          }
+        }
+        expect(
+          observer.mock.calls.filter(([event]) => event.event === "plugin.approval.requested"),
+        ).toHaveLength(2);
+      } finally {
+        broker.stop();
+      }
+    },
+  );
+
   it("lists, emits, and resolves pending approvals", async () => {
     const broker = new EmbeddedPluginApprovalBroker();
     const events: Array<{ event: string; payload: unknown }> = [];
@@ -160,6 +230,8 @@ describe("EmbeddedPluginApprovalBroker", () => {
               request: {
                 ...requestPayload(),
                 allowedDecisions: ["allow-once", "allow-always", "deny"],
+                grantEligible: true,
+                grantScopeSummary: "Synthetic scoped delegation",
               },
               timeoutMs: 5_000,
             });
@@ -214,6 +286,14 @@ describe("EmbeddedPluginApprovalBroker", () => {
                 outcome.approvalExecutions?.[0],
                 "local execution custody",
               );
+              expect(outcome.receipt).toMatchObject({
+                approvalId: record.id,
+                decision: "allow-once",
+                createdAtMs: record.createdAtMs,
+                expiresAtMs: record.expiresAtMs,
+                resolvedAtMs: expect.any(Number),
+                resolvedByActor: { kind: "runtime", clientId: "tui:embedded" },
+              });
               expect(JSON.stringify(outcome)).toBe(
                 JSON.stringify({ id: record.id, decision: "allow-once" }),
               );

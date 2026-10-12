@@ -19,11 +19,16 @@ import type { CommandHandler } from "./commands-types.js";
 const COMMAND_REGEX = /^\/?approve(?:\s|$)/i;
 const FOREIGN_COMMAND_MENTION_REGEX = /^\/approve@([^\s]+)(?:\s|$)/i;
 
-const DECISION_ALIASES: Record<string, "allow-once" | "allow-always" | "deny"> = {
+const DECISION_ALIASES: Record<
+  string,
+  "allow-once" | "allow-15m" | "allow-session" | "allow-always" | "deny"
+> = {
   allow: "allow-once",
   once: "allow-once",
   "allow-once": "allow-once",
   allowonce: "allow-once",
+  "allow-15m": "allow-15m",
+  "allow-session": "allow-session",
   always: "allow-always",
   "allow-always": "allow-always",
   allowalways: "allow-always",
@@ -33,7 +38,11 @@ const DECISION_ALIASES: Record<string, "allow-once" | "allow-always" | "deny"> =
 };
 
 type ParsedApproveCommand =
-  | { ok: true; id: string; decision: "allow-once" | "allow-always" | "deny" }
+  | {
+      ok: true;
+      id: string;
+      decision: "allow-once" | "allow-15m" | "allow-session" | "allow-always" | "deny";
+    }
   | { ok: false; error: string };
 
 const APPROVE_USAGE_TEXT =
@@ -258,7 +267,7 @@ export async function handleApproveCommandFromContext(
 
   const resolvedBy = buildResolvedByLabel(params);
   const callApprovalMethod = async (resolveMethod: ChannelApprovalKind): Promise<void> => {
-    await resolveApprovalOverGateway({
+    const options = {
       cfg: params.cfg,
       approvalId: parsed.id,
       decision: parsed.decision,
@@ -269,16 +278,26 @@ export async function handleApproveCommandFromContext(
             senderId: params.command.senderId,
           }
         : {}),
-      resolveMethod,
       ...(actor ? { admittedActor: actor } : {}),
       clientDisplayName: `Chat approval (${resolvedBy})`,
-    });
+    };
+    if (parsed.decision === "allow-15m" || parsed.decision === "allow-session") {
+      await resolveApprovalOverGateway({ ...options, approvalKind: resolveMethod });
+    } else {
+      await resolveApprovalOverGateway({ ...options, resolveMethod });
+    }
   };
 
   const methods = resolveAuthorizedApprovalKinds({
     execAuthorization: execApprovalAuthorization,
     pluginAuthorization: pluginApprovalAuthorization,
   }).filter((approvalKind) => {
+    if (
+      (parsed.decision === "allow-15m" || parsed.decision === "allow-session") &&
+      approvalKind !== "plugin"
+    ) {
+      return false;
+    }
     const behavior = commandBehaviors.get(approvalKind);
     return !behavior || behavior.kind === "allow";
   });

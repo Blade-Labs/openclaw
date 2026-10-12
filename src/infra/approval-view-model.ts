@@ -48,6 +48,9 @@ function buildExecMetadata(request: ExecApprovalRequest): ApprovalMetadataView[]
 
 function buildPluginMetadata(request: PluginApprovalRequest): ApprovalMetadataView[] {
   const metadata: ApprovalMetadataView[] = [];
+  if (request.request.grantEligible && request.request.grantScopeSummary) {
+    metadata.push({ label: "Delegation", value: request.request.grantScopeSummary });
+  }
   const severity = request.request.severity ?? "warning";
   metadata.push({
     label: "Severity",

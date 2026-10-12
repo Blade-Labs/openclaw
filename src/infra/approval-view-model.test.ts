@@ -6,6 +6,41 @@ import type { ExecApprovalRequest } from "./exec-approvals.js";
 import type { PluginApprovalRequest } from "./plugin-approvals.js";
 
 describe("buildPendingApprovalView", () => {
+  it.each([false, true])(
+    "renders Policy grant eligibility %s with only its offered choices",
+    (grantEligible) => {
+      const grantScopeSummary = "Project 4 approved fields; future values may differ.";
+      const view = buildPendingApprovalView({
+        id: "plugin:scoped",
+        createdAtMs: 1,
+        expiresAtMs: 2,
+        request: {
+          title: "Exact field writes",
+          description: "Known writes",
+          grantEligible,
+          grantScopeSummary,
+          allowedDecisions: ["allow-once", "allow-15m", "allow-session", "allow-always", "deny"],
+        },
+      });
+      expect(view.actions.map(({ decision, label }) => [decision, label])).toEqual(
+        grantEligible
+          ? [
+              ["allow-once", "Allow once"],
+              ["allow-15m", "Allow 15 min"],
+              ["allow-session", "Allow for this session"],
+              ["allow-always", "Always"],
+              ["deny", "Deny"],
+            ]
+          : [
+              ["allow-once", "Allow once"],
+              ["deny", "Deny"],
+            ],
+      );
+      expect(view.metadata.filter(({ label }) => label === "Delegation")).toEqual(
+        grantEligible ? [{ label: "Delegation", value: grantScopeSummary }] : [],
+      );
+    },
+  );
   it("passes command analysis through exec approval views", () => {
     const request: ExecApprovalRequest = {
       id: "approval-id",

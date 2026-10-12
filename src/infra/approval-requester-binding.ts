@@ -37,7 +37,7 @@ export type ApprovalRequestPolicy =
   | Readonly<{
       requireResolverMatch: true;
       delivery: "requester";
-      allowedDecisions: readonly ["allow-once", "deny"];
+      allowedDecisions: readonly ApprovalDecision[];
     }>;
 
 export type ApprovalRequestAuthorization = Readonly<{

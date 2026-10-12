@@ -88,6 +88,47 @@ describe("plugin-sdk/approval-renderers", () => {
 
   it.each([
     {
+      grantEligible: true,
+      offered: ["allow-once", "allow-15m", "allow-session", "allow-always", "deny"],
+      override: ["allow-session"],
+      expected: ["allow-session", "deny"],
+    },
+    {
+      grantEligible: false,
+      offered: ["allow-once", "deny"],
+      override: ["allow-always"],
+      expected: ["deny"],
+    },
+  ] as const)(
+    "keeps typed plugin override choices within the request ($expected)",
+    ({ grantEligible, offered, override, expected }) => {
+      const payload = buildTypedPluginApprovalPendingReplyPayload({
+        request: {
+          id: "plugin:restricted",
+          request: {
+            title: "Project fields",
+            description: "Known writes",
+            grantEligible,
+            grantScopeSummary: "Project 4 approved fields.",
+            allowedDecisions: offered,
+          },
+          createdAtMs: 1_000,
+          expiresAtMs: 6_000,
+        },
+        nowMs: 1_000,
+        allowedDecisions: override,
+      });
+      expect(payload.channelData?.execApproval).toMatchObject({ allowedDecisions: expected });
+      expect(payload.presentation).toMatchObject({
+        blocks: [
+          { type: "buttons", buttons: expected.map((decision) => ({ action: { decision } })) },
+        ],
+      });
+    },
+  );
+
+  it.each([
+    {
       name: "builds shared approval payloads with typed plugin decisions",
       payload: buildTypedApprovalPendingReplyPayload({
         approvalKind: "plugin",
@@ -102,7 +143,7 @@ describe("plugin-sdk/approval-renderers", () => {
             type: "buttons",
             buttons: [
               {
-                label: "Allow Once",
+                label: "Allow once",
                 action: {
                   type: "approval",
                   approvalId: "plugin:approval-123",
@@ -112,7 +153,7 @@ describe("plugin-sdk/approval-renderers", () => {
                 style: "success",
               },
               {
-                label: "Allow Always",
+                label: "Always",
                 action: {
                   type: "approval",
                   approvalId: "plugin:approval-123",
@@ -164,7 +205,7 @@ describe("plugin-sdk/approval-renderers", () => {
             type: "buttons",
             buttons: [
               {
-                label: "Allow Once",
+                label: "Allow once",
                 action: {
                   type: "approval",
                   approvalId: "plugin-approval-123",
@@ -172,16 +213,6 @@ describe("plugin-sdk/approval-renderers", () => {
                   decision: "allow-once",
                 },
                 style: "success",
-              },
-              {
-                label: "Allow Always",
-                action: {
-                  type: "approval",
-                  approvalId: "plugin-approval-123",
-                  approvalKind: "plugin",
-                  decision: "allow-always",
-                },
-                style: "primary",
               },
               {
                 label: "Deny",
@@ -203,7 +234,7 @@ describe("plugin-sdk/approval-renderers", () => {
           approvalId: "plugin-approval-123",
           approvalKind: "plugin",
           approvalSlug: "custom-slug",
-          allowedDecisions: ["allow-once", "allow-always", "deny"],
+          allowedDecisions: ["allow-once", "deny"],
           sessionKey: undefined,
           state: "pending",
         },
@@ -238,7 +269,7 @@ describe("plugin-sdk/approval-renderers", () => {
             type: "buttons",
             buttons: [
               {
-                label: "Allow Once",
+                label: "Allow once",
                 action: {
                   type: "approval",
                   approvalId: "plugin-approval-123",

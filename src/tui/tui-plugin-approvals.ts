@@ -33,6 +33,7 @@ class PluginApprovalPrompt implements Component {
   private readonly title: Text;
   private readonly metadata: Text;
   private readonly description: Text;
+  private readonly grantScopeSummary: Text;
   private readonly confirmation = new Text();
 
   constructor(
@@ -55,6 +56,10 @@ class PluginApprovalPrompt implements Component {
     this.title = new Text(theme.header(`${surfaceLabel}: ${title}`));
     this.metadata = new Text(theme.dim(metadata.join("\n")));
     this.description = new Text(theme.system(description ? `Request: ${description}` : ""));
+    const grantScopeSummary = sanitizeApprovalText(approval.request.grantScopeSummary ?? "");
+    this.grantScopeSummary = new Text(
+      theme.system(grantScopeSummary ? `Delegation: ${grantScopeSummary}` : ""),
+    );
   }
 
   setConfirmation(text: string): void {
@@ -65,17 +70,20 @@ class PluginApprovalPrompt implements Component {
     this.title.invalidate();
     this.metadata.invalidate();
     this.description.invalidate();
+    this.grantScopeSummary.invalidate();
     this.confirmation.invalidate();
     this.selector.invalidate();
   }
 
   render(width: number): string[] {
     const description = this.description.render(width);
+    const grantScopeSummary = this.grantScopeSummary.render(width);
     const confirmation = this.confirmation.render(width);
     return [
       ...this.title.render(width),
       ...this.metadata.render(width),
       ...(description.some((line) => line.trim()) ? description : []),
+      ...(grantScopeSummary.some((line) => line.trim()) ? grantScopeSummary : []),
       ...(confirmation.some((line) => line.trim()) ? ["", ...confirmation] : []),
       "",
       ...this.selector.render(width),
@@ -109,13 +117,23 @@ type TuiPluginApprovalControllerDeps = {
   clearTimeoutFn?: (timer: ApprovalTimer) => void;
 };
 
-const DEFAULT_DECISIONS: readonly TuiApprovalDecision[] = ["allow-once", "allow-always", "deny"];
+const DEFAULT_DECISIONS: readonly TuiApprovalDecision[] = ["allow-once", "deny"];
 
 const DECISION_ITEMS: Record<TuiApprovalDecision, SelectItem> = {
   "allow-once": {
     value: "allow-once",
     label: "Allow once",
     description: "Approve this change",
+  },
+  "allow-15m": {
+    value: "allow-15m",
+    label: "Allow 15 min",
+    description: "Approve matching changes for 15 minutes",
+  },
+  "allow-session": {
+    value: "allow-session",
+    label: "Allow for this session",
+    description: "Approve matching changes for this session",
   },
   "allow-always": {
     value: "allow-always",
@@ -130,7 +148,13 @@ const DECISION_ITEMS: Record<TuiApprovalDecision, SelectItem> = {
 };
 
 function parseDecision(value: unknown): TuiApprovalDecision | null {
-  return value === "allow-once" || value === "allow-always" || value === "deny" ? value : null;
+  return value === "allow-once" ||
+    value === "allow-15m" ||
+    value === "allow-session" ||
+    value === "allow-always" ||
+    value === "deny"
+    ? value
+    : null;
 }
 
 function parseAllowedDecisions(value: unknown): TuiApprovalDecision[] | undefined {
@@ -170,6 +194,8 @@ function parseTuiPluginApproval(payload: unknown): TuiPluginApproval | null {
     request: {
       title,
       description: typeof request.description === "string" ? request.description : null,
+      grantScopeSummary:
+        typeof request.grantScopeSummary === "string" ? request.grantScopeSummary : null,
       pluginId: typeof request.pluginId === "string" ? request.pluginId : null,
       severity: parseSeverity(request.severity),
       toolName: typeof request.toolName === "string" ? request.toolName : null,
@@ -193,6 +219,12 @@ function parseResolvedApprovalId(payload: unknown): string | null {
 function decisionLabel(decision: TuiApprovalDecision): string {
   if (decision === "allow-once") {
     return "allowed once";
+  }
+  if (decision === "allow-15m") {
+    return "allowed for 15 minutes";
+  }
+  if (decision === "allow-session") {
+    return "allowed for this session";
   }
   if (decision === "allow-always") {
     return "always allowed";

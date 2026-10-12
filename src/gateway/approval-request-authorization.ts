@@ -15,6 +15,10 @@ import {
 } from "../infra/agent-run-registry.js";
 import type { ApprovalRequestAuthorization } from "../infra/approval-requester-binding.js";
 import type { ChannelApprovalKind } from "../infra/approval-types.js";
+import {
+  isScopedPluginGrantApproval,
+  SCOPED_PLUGIN_APPROVAL_DECISIONS,
+} from "../infra/plugin-approvals.js";
 import type { AgentRuntimeIdentity } from "./agent-runtime-identity-token.js";
 import { requiresApprovalRequesterMatch } from "./approval-request-policy.js";
 import { ApprovalRequesterPolicyError } from "./approval-requester-policy.js";
@@ -110,7 +114,22 @@ export function bindApprovalRequestAuthorization<T>(
     prepared?: ReturnType<typeof prepareApprovalRequestAuthorization>;
   } & Parameters<typeof prepareApprovalRequestAuthorization>[0],
 ): void {
-  const prepared = params.prepared ?? prepareApprovalRequestAuthorization(params);
+  const original = params.prepared ?? prepareApprovalRequestAuthorization(params);
+  const prepared =
+    params.approvalKind === "plugin" &&
+    isScopedPluginGrantApproval(params.record.request) &&
+    original.authorization.policy.requireResolverMatch
+      ? {
+          ...original,
+          authorization: Object.freeze({
+            ...original.authorization,
+            policy: Object.freeze({
+              ...original.authorization.policy,
+              allowedDecisions: SCOPED_PLUGIN_APPROVAL_DECISIONS,
+            }),
+          }),
+        }
+      : original;
   Object.defineProperty(params.record, "authorization", {
     value: prepared.authorization,
     enumerable: true,

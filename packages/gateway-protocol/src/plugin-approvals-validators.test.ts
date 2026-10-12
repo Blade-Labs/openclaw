@@ -22,7 +22,7 @@ describe("plugin approval protocol validators", () => {
   it("validates bounded reviewer-only detail independently from the description", () => {
     const request = {
       title: "Apply workspace skill proposal",
-      description: "d".repeat(512),
+      description: "d".repeat(4_096),
     };
 
     expect(validatePluginApprovalRequestParams(request)).toBe(true);
@@ -33,9 +33,22 @@ describe("plugin approval protocol validators", () => {
     expect(validatePluginApprovalRequestParams({ ...request, detail: "x".repeat(16_385) })).toBe(
       false,
     );
-    expect(validatePluginApprovalRequestParams({ ...request, description: "d".repeat(513) })).toBe(
-      false,
-    );
+    expect(
+      validatePluginApprovalRequestParams({ ...request, description: "d".repeat(4_097) }),
+    ).toBe(false);
+  });
+
+  it.each(["x", "🛡️", "🚀"])("counts Unicode code points for %s descriptions", (text) => {
+    const unit = Array.from(text)[0]!;
+    expect(
+      validatePluginApprovalRequestParams({ title: "Batch", description: unit.repeat(4_096) }),
+    ).toBe(true);
+    expect(
+      validatePluginApprovalRequestParams({ title: "Batch", description: unit.repeat(4_097) }),
+    ).toBe(false);
+    expect(
+      validatePluginApprovalRequestParams({ title: "Batch", description: unit.repeat(513) }),
+    ).toBe(true);
   });
 
   it.each(nullableMetadataFields)("accepts explicit null for optional %s metadata", (field) => {

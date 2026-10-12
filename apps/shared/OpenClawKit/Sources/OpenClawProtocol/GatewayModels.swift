@@ -38,6 +38,8 @@ public enum AgentKind: String, Codable, Sendable {
 
 public enum ApprovalAllowDecision: String, Codable, Sendable {
     case allowOnce = "allow-once"
+    case allow15m = "allow-15m"
+    case allowSession = "allow-session"
     case allowAlways = "allow-always"
 }
 
@@ -52,6 +54,8 @@ public enum ApprovalCancelledReason: String, Codable, Sendable {
 
 public enum ApprovalDecision: String, Codable, Sendable {
     case allowOnce = "allow-once"
+    case allow15m = "allow-15m"
+    case allowSession = "allow-session"
     case allowAlways = "allow-always"
     case deny = "deny"
 }
@@ -113,6 +117,12 @@ public enum EnvironmentStatus: String, Codable, Sendable {
     case starting = "starting"
     case stopping = "stopping"
     case error = "error"
+}
+
+public enum ExecApprovalDecision: String, Codable, Sendable {
+    case allowOnce = "allow-once"
+    case allowAlways = "allow-always"
+    case deny = "deny"
 }
 
 public enum GitHubIdentityScope: String, Codable, Sendable {
@@ -7408,7 +7418,7 @@ public struct ExecApprovalPresentation: Codable, Sendable {
     public let nodeid: AnyCodable?
     public let agentid: AnyCodable?
     public let scope: ApprovalScope?
-    public let alloweddecisions: [ApprovalDecision]
+    public let alloweddecisions: [ExecApprovalDecision]
 
     public init(
         kind: String,
@@ -7419,7 +7429,7 @@ public struct ExecApprovalPresentation: Codable, Sendable {
         nodeid: AnyCodable? = nil,
         agentid: AnyCodable? = nil,
         scope: ApprovalScope? = nil,
-        alloweddecisions: [ApprovalDecision])
+        alloweddecisions: [ExecApprovalDecision])
     {
         self.kind = kind
         self.commandtext = commandtext
@@ -10058,11 +10068,11 @@ public struct PersonalGitHubStatus: Codable, Sendable {
 
 public struct PluginApprovalExternalResolution: Codable, Sendable {
     public let label: String
-    public let decisions: [ApprovalAllowDecision]
+    public let decisions: [AnyCodable]
 
     public init(
         label: String,
-        decisions: [ApprovalAllowDecision])
+        decisions: [AnyCodable])
     {
         self.label = label
         self.decisions = decisions
@@ -10073,6 +10083,8 @@ public struct PluginApprovalPresentation: Codable, Sendable {
     public let kind: String
     public let title: String
     public let description: String
+    public let granteligible: Bool?
+    public let grantscopesummary: String?
     public let detail: String?
     public let severity: PluginApprovalSeverity
     public let pluginid: AnyCodable?
@@ -10086,6 +10098,8 @@ public struct PluginApprovalPresentation: Codable, Sendable {
         kind: String,
         title: String,
         description: String,
+        granteligible: Bool? = nil,
+        grantscopesummary: String? = nil,
         detail: String? = nil,
         severity: PluginApprovalSeverity,
         pluginid: AnyCodable? = nil,
@@ -10098,6 +10112,8 @@ public struct PluginApprovalPresentation: Codable, Sendable {
         self.kind = kind
         self.title = title
         self.description = description
+        self.granteligible = granteligible
+        self.grantscopesummary = grantscopesummary
         self.detail = detail
         self.severity = severity
         self.pluginid = pluginid
@@ -10112,6 +10128,8 @@ public struct PluginApprovalPresentation: Codable, Sendable {
         case kind
         case title
         case description
+        case granteligible = "grantEligible"
+        case grantscopesummary = "grantScopeSummary"
         case detail
         case severity
         case pluginid = "pluginId"
@@ -10133,6 +10151,8 @@ public struct PluginApprovalRequestParams: Codable, Sendable {
     public let toolname: String?
     public let toolcallid: String?
     public let mcptool: [String: AnyCodable]?
+    public let granteligible: Bool?
+    public let grantscopesummary: String?
     public let alloweddecisions: [String]?
     public let agentid: String?
     public let sessionkey: String?
@@ -10154,6 +10174,8 @@ public struct PluginApprovalRequestParams: Codable, Sendable {
         toolname: String? = nil,
         toolcallid: String? = nil,
         mcptool: [String: AnyCodable]? = nil,
+        granteligible: Bool? = nil,
+        grantscopesummary: String? = nil,
         alloweddecisions: [String]? = nil,
         agentid: String? = nil,
         sessionkey: String? = nil,
@@ -10174,6 +10196,8 @@ public struct PluginApprovalRequestParams: Codable, Sendable {
         self.toolname = toolname
         self.toolcallid = toolcallid
         self.mcptool = mcptool
+        self.granteligible = granteligible
+        self.grantscopesummary = grantscopesummary
         self.alloweddecisions = alloweddecisions
         self.agentid = agentid
         self.sessionkey = sessionkey
@@ -10196,6 +10220,8 @@ public struct PluginApprovalRequestParams: Codable, Sendable {
         case toolname = "toolName"
         case toolcallid = "toolCallId"
         case mcptool = "mcpTool"
+        case granteligible = "grantEligible"
+        case grantscopesummary = "grantScopeSummary"
         case alloweddecisions = "allowedDecisions"
         case agentid = "agentId"
         case sessionkey = "sessionKey"

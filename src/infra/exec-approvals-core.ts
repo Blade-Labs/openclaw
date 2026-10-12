@@ -14,7 +14,12 @@ export type ExecTarget = "auto" | ExecHost;
 export type ExecSecurity = "deny" | "allowlist" | "full";
 export type ExecAsk = "off" | "on-miss" | "always";
 export type ExecMode = "deny" | "allowlist" | "ask" | "auto" | "full";
-export type ExecApprovalDecision = "allow-once" | "allow-always" | "deny";
+export type ExecApprovalDecision =
+  | "allow-once"
+  | "allow-15m"
+  | "allow-session"
+  | "allow-always"
+  | "deny";
 export type ExecApprovalUnavailableDecision = "allow-always";
 
 export const EXEC_TARGET_VALUES: readonly ExecTarget[] = ["auto", "sandbox", "gateway", "node"];

@@ -15,6 +15,7 @@ import {
   sanitizeExecApprovalWarningText,
 } from "./exec-approval-text-sanitize.js";
 import type { ExecApprovalRequestPayload } from "./exec-approvals.js";
+import { resolveCanonicalPluginApprovalRequestAllowedDecisions } from "./plugin-approval-canonical-decisions.js";
 import {
   PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH,
   PLUGIN_APPROVAL_TITLE_MAX_LENGTH,
@@ -92,7 +93,10 @@ function buildExecApprovalPresentation(params: {
     nodeId: sanitizeOptionalSingleLine(request.nodeId),
     agentId: sanitizeOptionalSingleLine(request.agentId),
     ...(scope ? { scope } : {}),
-    allowedDecisions: normalizeDecisionList(params.allowedDecisions),
+    allowedDecisions: normalizeDecisionList(params.allowedDecisions).filter(
+      (decision): decision is "allow-once" | "allow-always" | "deny" =>
+        decision === "allow-once" || decision === "allow-always" || decision === "deny",
+    ),
   };
 }
 
@@ -104,6 +108,14 @@ function buildPluginApprovalPresentation(params: {
     return null;
   }
   const request = params.request as PluginApprovalRequestPayload;
+  if (
+    (typeof request.description === "string" &&
+      exceedsApprovalTextLimit(request.description, PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH)) ||
+    (typeof request.grantScopeSummary === "string" &&
+      exceedsApprovalTextLimit(request.grantScopeSummary, PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH))
+  ) {
+    return null;
+  }
   const rawTitle = normalizeOptionalString(request.title);
   const rawDescription = normalizeOptionalString(request.description);
   if (!rawTitle || !rawDescription) {
@@ -116,6 +128,21 @@ function buildPluginApprovalPresentation(params: {
   if (
     exceedsApprovalTextLimit(title, PLUGIN_APPROVAL_TITLE_MAX_LENGTH) ||
     exceedsApprovalTextLimit(description, PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH)
+  ) {
+    return null;
+  }
+  const rawGrantScope = request.grantEligible
+    ? normalizeOptionalString(request.grantScopeSummary)
+    : undefined;
+  if (request.grantEligible && !rawGrantScope) {
+    return null;
+  }
+  const grantScopeSummary = rawGrantScope
+    ? sanitizeExecApprovalWarningText(rawGrantScope)
+    : undefined;
+  if (
+    grantScopeSummary &&
+    exceedsApprovalTextLimit(grantScopeSummary, PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH)
   ) {
     return null;
   }
@@ -138,13 +165,22 @@ function buildPluginApprovalPresentation(params: {
     kind: "plugin",
     title,
     description,
+    ...(request.grantEligible === false ? { grantEligible: false } : {}),
+    ...(request.grantEligible && request.grantScopeSummary
+      ? {
+          grantEligible: true,
+          grantScopeSummary: grantScopeSummary!,
+        }
+      : {}),
     ...(detail ? { detail } : {}),
     severity,
     pluginId: sanitizeOptionalSingleLine(request.pluginId),
     toolName: sanitizeOptionalSingleLine(request.toolName),
     agentId: sanitizeOptionalSingleLine(request.agentId),
     ...(scope ? { scope } : {}),
-    allowedDecisions: normalizeDecisionList(params.allowedDecisions),
+    allowedDecisions: normalizeDecisionList(params.allowedDecisions).filter((decision) =>
+      resolveCanonicalPluginApprovalRequestAllowedDecisions(request).includes(decision),
+    ),
     ...(externalResolution
       ? {
           externalResolution: {

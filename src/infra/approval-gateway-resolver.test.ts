@@ -55,6 +55,28 @@ describe("resolveApprovalOverGateway", () => {
     });
   });
 
+  it.each(["allow-15m", "allow-session"] as const)(
+    "carries scoped plugin %s and rejects it for exec",
+    async (decision) => {
+      await resolveApprovalOverGateway({
+        cfg: {},
+        approvalId: "plugin:scoped",
+        approvalKind: "plugin",
+        decision,
+      });
+      expect(hoisted.clientRequest).toHaveBeenCalledWith("approval.resolve", {
+        id: "plugin:scoped",
+        kind: "plugin",
+        decision,
+      });
+      hoisted.clientRequest.mockClear();
+      await expect(
+        resolveApprovalOverGateway({ cfg: {}, approvalId: "exec", approvalKind: "exec", decision }),
+      ).rejects.toThrow("valid decision");
+      expect(hoisted.clientRequest).not.toHaveBeenCalled();
+    },
+  );
+
   it("resolves an explicit exec kind through the canonical method", async () => {
     const result = await resolveApprovalOverGateway({
       cfg: { gateway: { auth: { token: "cfg-token" } } } as never,

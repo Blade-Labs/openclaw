@@ -419,20 +419,17 @@ describe("native hook relay approval id binding", () => {
       });
       const before = vi.fn();
       const after = vi.fn();
-      initializeGlobalHookRunner(
-        createMockPluginRegistry([
-          ...(observers === "after-only"
-            ? []
-            : [
-                {
-                  hookName: "before_tool_call" as const,
-                  handler: before,
-                  matcher: [observers === "broader-after" ? "apply_patch" : "exec"],
-                },
-              ]),
-          { hookName: "after_tool_call", handler: after, matcher: ["apply_patch", "exec"] },
-        ]),
-      );
+      const hooks: Parameters<typeof createMockPluginRegistry>[0] = [
+        { hookName: "after_tool_call", handler: after, matcher: ["apply_patch", "exec"] },
+      ];
+      if (observers !== "after-only") {
+        hooks.unshift({
+          hookName: "before_tool_call",
+          handler: before,
+          matcher: [observers === "broader-after" ? "apply_patch" : "exec"],
+        });
+      }
+      initializeGlobalHookRunner(createMockPluginRegistry(hooks));
       const relay = registerOwnedNativeHookRelay({
         provider: "codex",
         relayId: "synthetic-source-relay",

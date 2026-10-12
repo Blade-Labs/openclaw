@@ -54,6 +54,7 @@ import {
 } from "../plugins/hook-before-tool-call-result.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import { createHookRunner, type HookRunner } from "../plugins/hooks.js";
+import { addTestHook } from "../plugins/hooks.test-helpers.js";
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
 import { setPluginToolMeta } from "../plugins/tool-metadata.js";
@@ -3341,80 +3342,192 @@ describe("before_tool_call requireApproval handling", () => {
     expect(onResolution).toHaveBeenCalledWith("allow-once");
   });
 
-  it("allows allow-always decisions for tool approvals", async () => {
-    const onResolution = vi.fn();
-
-    hookRunner.runBeforeToolCall.mockResolvedValue({
-      requireApproval: {
-        title: "Needs durable approval",
-        description: "Check this durable approval",
-        onResolution,
-      },
-    });
-
-    mockCallGateway.mockResolvedValueOnce({ id: "server-id-allow-always", status: "accepted" });
-    mockCallGateway.mockResolvedValueOnce({
-      id: "server-id-allow-always",
-      decision: "allow-always",
-    });
-
-    const result = await runBeforeToolCallHook({
-      toolName: "bash",
-      params: { command: "echo ok" },
-      ctx: { agentId: "main", sessionKey: "main" },
-    });
-
-    expect(result).toEqual({
-      blocked: false,
-      params: { command: "echo ok" },
-      approvalResolution: "allow-always",
-    });
-    expect(onResolution).toHaveBeenCalledWith("allow-always");
-  });
-
-  it("does not await onResolution before returning approval outcome", async () => {
-    const onResolution = vi.fn(() => new Promise<void>(() => {}));
-
-    hookRunner.runBeforeToolCall.mockResolvedValue({
-      requireApproval: {
-        title: "Non-blocking callback",
-        description: "Should not block tool execution",
-        onResolution,
-      },
-    });
-
-    mockCallGateway.mockResolvedValueOnce({ id: "server-id-r1-nonblocking", status: "accepted" });
-    mockCallGateway.mockResolvedValueOnce({
-      id: "server-id-r1-nonblocking",
-      decision: "allow-once",
-    });
-
-    let timeoutId: NodeJS.Timeout | undefined;
-    try {
-      const result = await Promise.race([
-        runBeforeToolCallHook({
-          toolName: "bash",
-          params: {},
-          ctx: { agentId: "main", sessionKey: "main" },
-        }),
-        new Promise<never>((_, reject) => {
-          timeoutId = setTimeout(
-            () => reject(new Error("runBeforeToolCallHook waited for onResolution")),
-            250,
-          );
-        }),
-      ]);
-
-      expect(result).toEqual({
-        blocked: false,
-        params: {},
-        approvalResolution: "allow-once",
+  it.each(["allow-once", "allow-15m", "allow-session", "allow-always", "deny"] as const)(
+    "round-trips scoped %s with the host receipt",
+    async (decision) => {
+      const onResolution = vi.fn();
+      hookRunner.runBeforeToolCall.mockResolvedValue({
+        requireApproval: {
+          title: "Scoped approval",
+          description: "Known project fields",
+          grantEligible: true,
+          grantScopeSummary: "Project 4 approved fields; future values may differ.",
+          onResolution,
+        },
       });
-      expect(onResolution).toHaveBeenCalledWith("allow-once");
-    } finally {
-      if (timeoutId) {
-        clearTimeout(timeoutId);
+      const resolvedByActor = {
+        kind: "channel",
+        channel: "msteams",
+        accountId: "default",
+        senderId: "synthetic-owner",
+        actorKind: "human",
+      };
+      mockCallGateway.mockResolvedValueOnce({ id: "scoped-id", status: "accepted" });
+      mockCallGateway.mockResolvedValueOnce({
+        id: "scoped-id",
+        decision,
+        resolvedByActor,
+        createdAtMs: 1_000,
+        expiresAtMs: 121_000,
+        resolvedAtMs: 2_000,
+        terminalReason: "user",
+      });
+      const result = await runBeforeToolCallHook({
+        toolName: "projects_write",
+        params: { field: "status" },
+        ctx: { agentId: "main", sessionKey: "main" },
+      });
+      expect(result.blocked).toBe(decision === "deny");
+      if (decision !== "deny") {
+        expect(result).toMatchObject({ approvalResolution: decision });
       }
+      expect(onResolution).toHaveBeenCalledWith(decision, {
+        approvalId: "scoped-id",
+        decision,
+        resolvedByActor,
+        createdAtMs: 1_000,
+        expiresAtMs: 121_000,
+        resolvedAtMs: 2_000,
+        terminalReason: "user",
+        ...(decision === "deny" ? { dispatch: "failed-before-dispatch" } : {}),
+      });
+      const receipt = onResolution.mock.calls[0]?.[1];
+      expect(receipt).not.toHaveProperty("delivered");
+      expect(receipt).not.toHaveProperty("displayUpdate");
+      if (decision !== "deny") {
+        expect(receipt).not.toHaveProperty("dispatch");
+      }
+      expect(mockCallGateway.mock.calls[0]?.[2]).toMatchObject({
+        grantEligible: true,
+        grantScopeSummary: "Project 4 approved fields; future values may differ.",
+        allowedDecisions: ["allow-once", "allow-15m", "allow-session", "allow-always", "deny"],
+      });
+    },
+  );
+
+  it.for(["resolve", "throw", "reject", "timeout", "abort", "abort-throw"] as const)(
+    "awaits the registered policy callback before dispatch (%s)",
+    async (mode, test) => {
+      const manager = createTestApprovalManager<PluginApprovalRequestPayload>(test, {
+        approvalKind: "plugin",
+      });
+      const record = manager.create({ title: "Synthetic", description: "Exact write" }, 60_000);
+      await manager.register(record, 60_000);
+      await manager.resolve(record.id, "allow-once", "synthetic-owner");
+      const context = createGatewayRequestContext(
+        makeContextParams({ pluginApprovalManager: manager }),
+      );
+      const entered = createDeferredCore();
+      const release = createDeferredCore();
+      const controller = new AbortController();
+      const onResolution = vi.fn(() => {
+        entered.resolve();
+        if (mode === "abort-throw") {
+          controller.abort();
+          throw new Error("Synthetic policy failure");
+        }
+        if (mode === "throw") {
+          throw new Error("Synthetic policy failure");
+        }
+        if (mode === "reject") {
+          return Promise.reject(new Error("Synthetic policy failure"));
+        }
+        return release.promise;
+      });
+      const registry = createEmptyPluginRegistry();
+      addTestHook({
+        registry,
+        pluginId: "synthetic-policy",
+        hookName: "before_tool_call",
+        handler: () => ({
+          requireApproval: {
+            title: "Synthetic",
+            description: "Exact write",
+            timeoutMs: 1_000,
+            onResolution,
+          },
+        }),
+      });
+      const runner = createHookRunner(registry);
+      mockGetGlobalHookRunner.mockReturnValue(runner);
+      setGlobalHookRunnerForTest(runner);
+      mockCallGateway.mockResolvedValueOnce({ id: record.id, decision: "allow-once" });
+      const execute = vi.fn().mockResolvedValue({ content: [], details: { ok: true } });
+      const tool = wrapToolWithBeforeToolCallHook(asAgentTool({ name: "synthetic", execute }), {
+        agentId: "main",
+        sessionKey: "synthetic-session",
+        loopDetection: { enabled: false },
+      });
+      // Virtual time proves the bound without a real sleep or a long CI wait.
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      const running = withGatewayToolCallerIdentity(
+        {
+          agentId: "main",
+          sessionKey: "synthetic-session",
+          gatewayContextResolver: () => context,
+        },
+        () => tool.execute("synthetic-callback", {}, controller.signal, undefined),
+      );
+      const settled = running.then(
+        () => null,
+        (error: unknown) => error,
+      );
+      try {
+        await entered.promise;
+        await vi.advanceTimersByTimeAsync(0);
+        expect(execute).not.toHaveBeenCalled();
+        if (mode === "resolve") {
+          release.resolve();
+          expect(await settled).toBeNull();
+          expect(execute).toHaveBeenCalledOnce();
+          expect(manager.getLiveSnapshot(record.id)?.consumedAtMs).toBeTruthy();
+        } else {
+          if (mode === "timeout") {
+            await vi.advanceTimersByTimeAsync(1_000);
+          } else if (mode === "abort") {
+            controller.abort();
+          }
+          expect(await settled).toMatchObject({
+            message: expect.stringContaining("resolution callback failed; tool call did not run"),
+          });
+          expect(execute).not.toHaveBeenCalled();
+          expect(manager.getLiveSnapshot(record.id)?.consumedAtMs).toBeFalsy();
+          // A callback completing after the gate closed cannot execute the write.
+          release.resolve();
+          await release.promise;
+          expect(execute).not.toHaveBeenCalled();
+        }
+        expect(onResolution).toHaveBeenCalledExactlyOnceWith("allow-once");
+      } finally {
+        release.resolve();
+        vi.useRealTimers();
+        await settled;
+      }
+    },
+  );
+
+  it("preserves timeout notification after the decision wait spends its budget", async () => {
+    const onResolution = vi.fn();
+    hookRunner.runBeforeToolCall.mockResolvedValue({
+      requireApproval: {
+        title: "Synthetic",
+        description: "Exact write",
+        timeoutMs: 1_000,
+        onResolution,
+      },
+    });
+    mockCallGateway.mockResolvedValueOnce({ id: "elapsed-timeout" });
+    mockCallGateway.mockImplementationOnce(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+      return { id: "elapsed-timeout", decision: null };
+    });
+    vi.useFakeTimers();
+    try {
+      const result = await runBeforeToolCallHook({ toolName: "synthetic", params: {} });
+      expect(result).toMatchObject({ blocked: true, reason: "Approval timed out" });
+      expect(onResolution).toHaveBeenCalledExactlyOnceWith("timeout");
+    } finally {
+      vi.useRealTimers();
     }
   });
 
@@ -3439,6 +3552,45 @@ describe("before_tool_call requireApproval handling", () => {
     });
 
     expect(onResolution).toHaveBeenCalledWith("deny");
+  });
+
+  it("retains factual receipt for a known request that has no approval route", async () => {
+    const onResolution = vi.fn();
+    hookRunner.runBeforeToolCall.mockResolvedValue({
+      requireApproval: {
+        title: "Review request",
+        description: "Known route failure",
+        onResolution,
+      },
+    });
+    mockCallGateway.mockResolvedValueOnce({
+      id: "known-no-route",
+      decision: null,
+      createdAtMs: 1_000,
+      expiresAtMs: 2_000,
+      resolvedAtMs: 1_500,
+      terminalReason: "no-route",
+    });
+    const result = await runBeforeToolCallHook({
+      toolName: "projects_write",
+      params: {},
+      ctx: { agentId: "main", sessionKey: "main" },
+    });
+    expect(result.blocked).toBe(true);
+    expect(onResolution).toHaveBeenCalledWith("cancelled", {
+      approvalId: "known-no-route",
+      decision: null,
+      createdAtMs: 1_000,
+      expiresAtMs: 2_000,
+      resolvedAtMs: 1_500,
+      terminalReason: "no-route",
+      dispatch: "failed-before-dispatch",
+    });
+    expect(mockCallGateway).toHaveBeenCalledTimes(1);
+    expect(mockCallGateway.mock.calls[0]?.[2]).toMatchObject({
+      grantEligible: false,
+      allowedDecisions: ["allow-once", "deny"],
+    });
   });
 
   it("calls onResolution with timeout when decision is null", async () => {

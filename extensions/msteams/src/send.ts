@@ -11,6 +11,7 @@ import {
 import { PlatformMessageNotDispatchedError } from "openclaw/plugin-sdk/error-runtime";
 import { resolveMarkdownTableMode } from "openclaw/plugin-sdk/markdown-table-runtime";
 import type { OutboundMediaLoadOptions } from "openclaw/plugin-sdk/outbound-media";
+import { retryAsync } from "openclaw/plugin-sdk/retry-runtime";
 import { loadOutboundMediaFromUrl, type OpenClawConfig } from "../runtime-api.js";
 import {
   classifyMSTeamsSendError,
@@ -672,29 +673,110 @@ export async function editAdaptiveCardMSTeams(
   });
 }
 
+const MAX_EDIT_RETRY_AFTER_MS = 60_000;
+
+type PendingMSTeamsEdit = {
+  activity: Record<string, unknown>;
+  payloadKey: string;
+  promise: Promise<MSTeamsMessageMutationResult>;
+};
+
+// Resolution events and card submits share one edit owner for each activity.
+const pendingMSTeamsEdits = new Map<string, PendingMSTeamsEdit>();
+
 async function updateMSTeamsMessageActivity(
   params: MSTeamsMessageMutationParams & { activity: Record<string, unknown> },
 ): Promise<MSTeamsMessageMutationResult> {
   const { cfg, to, activityId, activity } = params;
-  const { app, conversationId, ref, log, sdkCloudOptions } = await resolveMSTeamsSendContext({
-    cfg,
-    to,
-  });
-
-  log.debug?.("editing proactive message", { conversationId, activityId });
-
-  try {
-    const baseRef = buildConversationReference(ref);
-    await updateMSTeamsActivityWithReference(app, baseRef, activityId, activity, {
-      serviceUrlBoundary: sdkCloudOptions,
-    });
-  } catch (err) {
-    throw createMSTeamsSendError("msteams edit", err);
+  const { app, appId, conversationId, ref, log, sdkCloudOptions } = await resolveMSTeamsSendContext(
+    {
+      cfg,
+      to,
+    },
+  );
+  const editKey = JSON.stringify([
+    appId,
+    sdkCloudOptions.cloud,
+    ref.tenantId,
+    ref.serviceUrl,
+    conversationId,
+    activityId,
+  ]);
+  const payloadKey = JSON.stringify(activity);
+  const existing = pendingMSTeamsEdits.get(editKey);
+  if (existing) {
+    existing.activity = activity;
+    existing.payloadKey = payloadKey;
+    return existing.promise;
   }
 
-  log.info("edited proactive message", { conversationId, activityId });
-
-  return { conversationId };
+  const pending: PendingMSTeamsEdit = {
+    activity,
+    payloadKey,
+    promise: Promise.resolve({ conversationId }),
+  };
+  pendingMSTeamsEdits.set(editKey, pending);
+  pending.promise = Promise.resolve().then(async () => {
+    log.debug?.("editing proactive message", { conversationId, activityId });
+    try {
+      const baseRef = buildConversationReference(ref);
+      let editedPayloadKey: string;
+      let remainingAttempts = 3;
+      do {
+        editedPayloadKey = await retryAsync(
+          async () => {
+            remainingAttempts -= 1;
+            const currentActivity = pending.activity;
+            const currentPayloadKey = pending.payloadKey;
+            await updateMSTeamsActivityWithReference(app, baseRef, activityId, currentActivity, {
+              serviceUrlBoundary: sdkCloudOptions,
+            });
+            return currentPayloadKey;
+          },
+          {
+            attempts: remainingAttempts,
+            minDelayMs: 400,
+            maxDelayMs: 30_000,
+            jitter: 0.2,
+            retryAfterMaxDelayMs: MAX_EDIT_RETRY_AFTER_MS,
+            shouldRetry: (error) => {
+              const classification = classifyMSTeamsSendError(error);
+              return (
+                classification.kind === "replay-safe" &&
+                (classification.retryAfterMs ?? 0) <= MAX_EDIT_RETRY_AFTER_MS
+              );
+            },
+            retryAfterMs: (error) => {
+              const classification = classifyMSTeamsSendError(error);
+              return classification.kind === "replay-safe"
+                ? classification.retryAfterMs
+                : undefined;
+            },
+            onRetry: ({ attempt, delayMs }) => {
+              log.debug?.("retrying proactive message edit", {
+                conversationId,
+                activityId,
+                attempt,
+                delayMs,
+              });
+            },
+          },
+        );
+        if (editedPayloadKey !== pending.payloadKey && remainingAttempts === 0) {
+          throw new Error("Concurrent message edits exhausted the edit attempt budget");
+        }
+        // A changed payload arriving during the PUT must be applied after it,
+        // while identical concurrent updates share the completed request.
+      } while (editedPayloadKey !== pending.payloadKey);
+      log.info("edited proactive message", { conversationId, activityId });
+      return { conversationId };
+    } catch (err) {
+      throw createMSTeamsSendError("msteams edit", err);
+    } finally {
+      pendingMSTeamsEdits.delete(editKey);
+    }
+  });
+  return pending.promise;
 }
 
 /**

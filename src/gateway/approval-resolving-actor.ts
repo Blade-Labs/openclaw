@@ -40,7 +40,7 @@ export function prepareApprovalResolvingActor(params: {
   context: GatewayRequestContext;
   approvalKind: ChannelApprovalKind;
   authorization?: ApprovalRequestAuthorization;
-  decision: "allow-once" | "allow-always" | "deny";
+  decision: "allow-once" | "allow-15m" | "allow-session" | "allow-always" | "deny";
 }): { actor: ApprovalResolvingActor; assertCurrent: () => void } {
   const channel = params.client?.internal?.approvalActor;
   let admitted: ReturnType<typeof readAdmittedChannelApprovalActor>;

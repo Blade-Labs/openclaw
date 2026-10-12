@@ -105,7 +105,11 @@ export async function resolveApprovalOverGateway(
   if (
     params.decision !== "allow-once" &&
     params.decision !== "allow-always" &&
-    params.decision !== "deny"
+    params.decision !== "deny" &&
+    !(
+      canonicalKind === "plugin" &&
+      (params.decision === "allow-15m" || params.decision === "allow-session")
+    )
   ) {
     throw new Error("approval resolution requires a valid decision");
   }

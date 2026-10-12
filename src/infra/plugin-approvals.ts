@@ -5,6 +5,7 @@ import type {
   ApprovalResolvingActor,
 } from "./approval-requester-binding.js";
 import { summarizeApprovalScope, type ApprovalScope } from "./approval-scope.js";
+import { sanitizeExecApprovalWarningText } from "./exec-approval-text-sanitize.js";
 import type { ExecApprovalDecision } from "./exec-approvals-core.js";
 
 // Plugin approval types and renderers mirror exec approval decisions while
@@ -49,6 +50,11 @@ export type PluginApprovalRequestPayload = {
   /** Exact MCP persistence intent; the host separately binds live tool-call proof. */
   mcpTool?: { server: string; tool: string };
   allowedDecisions?: readonly ExecApprovalDecision[] | null;
+  /** Host-authenticated native callback/MCP contract; never accepted from RPC input. */
+  nativeApproval?: true;
+  /** Trusted Policy declaration; grant creation and matching remain plugin-owned. */
+  grantEligible?: boolean;
+  grantScopeSummary?: string;
   /** Trusted in-process metadata; public Gateway callers cannot submit this field. */
   externalResolution?: {
     label: string;
@@ -90,14 +96,37 @@ export type PluginApprovalResolved = {
 export const DEFAULT_PLUGIN_APPROVAL_TIMEOUT_MS = 120_000;
 export const MAX_PLUGIN_APPROVAL_TIMEOUT_MS = 600_000;
 export const PLUGIN_APPROVAL_TITLE_MAX_LENGTH = 80;
-export const PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH = 512;
+export const PLUGIN_APPROVAL_DESCRIPTION_MAX_LENGTH = 4_096;
 export const PLUGIN_APPROVAL_DETAIL_MAX_LENGTH = 16_384;
 const PLUGIN_APPROVAL_DETAIL_TRUNCATION_SUFFIX = "…[truncated]";
 export const DEFAULT_PLUGIN_APPROVAL_DECISIONS = [
   "allow-once",
+  "deny",
+] as const satisfies readonly ExecApprovalDecision[];
+
+export const SCOPED_PLUGIN_APPROVAL_DECISIONS = [
+  "allow-once",
+  "allow-15m",
+  "allow-session",
   "allow-always",
   "deny",
 ] as const satisfies readonly ExecApprovalDecision[];
+
+/** A declaration is useful only with the scope the reviewer is delegating. */
+export function isScopedPluginGrantApproval(value: unknown): value is {
+  grantEligible: true;
+  grantScopeSummary: string;
+} {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "grantEligible" in value &&
+    value.grantEligible === true &&
+    "grantScopeSummary" in value &&
+    typeof value.grantScopeSummary === "string" &&
+    value.grantScopeSummary.trim().length > 0
+  );
+}
 
 /** Caps reviewer-only plugin detail by Unicode code point without splitting surrogate pairs. */
 export function truncatePluginApprovalDetail(value: string): string {
@@ -134,6 +163,12 @@ export function approvalDecisionLabel(decision: ExecApprovalDecision): string {
   if (decision === "allow-once") {
     return "allowed once";
   }
+  if (decision === "allow-15m") {
+    return "allowed for 15 minutes";
+  }
+  if (decision === "allow-session") {
+    return "allowed for this session";
+  }
   if (decision === "allow-always") {
     return "allowed always";
   }
@@ -143,12 +178,31 @@ export function approvalDecisionLabel(decision: ExecApprovalDecision): string {
 /** Resolve explicit plugin approval decisions or fall back to defaults. */
 export function resolvePluginApprovalRequestAllowedDecisions(params?: {
   allowedDecisions?: readonly ExecApprovalDecision[] | readonly string[] | null;
+  grantEligible?: boolean;
+  grantScopeSummary?: string;
+  mcpTool?: { server: string; tool: string };
+  placementGrant?: unknown;
+  nativeApproval?: true;
 }): readonly ExecApprovalDecision[] {
+  if (isScopedPluginGrantApproval(params)) {
+    return SCOPED_PLUGIN_APPROVAL_DECISIONS;
+  }
+  // Only host-bound native callbacks, MCP invocations, and placement grants retain legacy Always.
+  const legacyGrant =
+    params?.grantEligible === undefined &&
+    (params?.nativeApproval === true || Boolean(params?.placementGrant)) &&
+    (!Array.isArray(params?.allowedDecisions) ||
+      params.allowedDecisions.every(
+        (decision) =>
+          decision === "allow-once" || decision === "allow-always" || decision === "deny",
+      ));
   const explicit: ExecApprovalDecision[] = [];
   if (Array.isArray(params?.allowedDecisions)) {
     for (const decision of params.allowedDecisions) {
       if (
-        (decision === "allow-once" || decision === "allow-always" || decision === "deny") &&
+        (decision === "allow-once" ||
+          (legacyGrant && decision === "allow-always") ||
+          decision === "deny") &&
         !explicit.includes(decision)
       ) {
         explicit.push(decision);
@@ -170,6 +224,9 @@ export function buildPluginApprovalRequestMessage(
   lines.push(`Title: ${request.request.title}`);
   // Reviewer-only detail stays off channel messages; channels receive the bounded description.
   lines.push(`Description: ${request.request.description}`);
+  if (isScopedPluginGrantApproval(request.request)) {
+    lines.push(`Delegation: ${sanitizeExecApprovalWarningText(request.request.grantScopeSummary)}`);
+  }
   if (request.request.scope) {
     lines.push(`Scope: ${summarizeApprovalScope(request.request.scope)}`);
   }

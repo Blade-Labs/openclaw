@@ -87,6 +87,7 @@ export type {
 export {
   PluginApprovalResolutions,
   type PluginApprovalResolution,
+  type PluginApprovalReceipt,
   type PluginHookBeforeToolCallResult,
 } from "./hook-before-tool-call-result.js";
 export type {
@@ -762,6 +763,9 @@ export type PluginHookBeforeToolCallEvent = {
   derivedPaths?: readonly string[];
 };
 
+/** Host-observed outcome; tool errors with uncertain effects have no receipt. */
+export type PluginHookExecutionReceipt = Readonly<{ outcome: "succeeded" | "failed" }>;
+
 export type PluginHookAfterToolCallEvent = {
   toolName: string;
   params: Record<string, unknown>;
@@ -770,6 +774,7 @@ export type PluginHookAfterToolCallEvent = {
   result?: unknown;
   error?: string;
   durationMs?: number;
+  executionReceipt?: PluginHookExecutionReceipt;
 };
 
 export type PluginHookToolResultPersistContext = {

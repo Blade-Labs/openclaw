@@ -4,9 +4,12 @@ import crypto from "node:crypto";
 import { ContentBlockSchema, type ContentBlock } from "@modelcontextprotocol/sdk/types.js";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { runBeforeToolCallHook, type HookContext } from "../agents/agent-tools.before-tool-call.js";
+import { redeemApprovalExecutions } from "../agents/approval-execution.js";
 import { extractToolErrorMessage } from "../agents/embedded-agent-tool-results.js";
 import { runAgentHarnessAfterToolCallHook } from "../agents/harness/hook-helpers.js";
 import { copyInternalToolResultState } from "../agents/runtime/internal-hooks.js";
+import { buildToolEffectReceipt, readToolEffectReceipt } from "../agents/tool-effect-receipt.js";
+import { buildToolMutationState } from "../agents/tool-mutation.js";
 import {
   formatToolExecutionErrorMessage,
   protectNetworkToolExecutionError,
@@ -142,11 +145,21 @@ export async function handleMcpJsonRpc(params: {
       const toolCallId = `mcp-${crypto.randomUUID()}`;
       const startedAt = Date.now();
       let executedToolArgs = toolArgs;
+      let executionStarted = false;
       const reportToolCallResult = (
         outcome: McpLoopbackToolCallOutcome,
         result: unknown,
         error?: string,
       ) => {
+        const mutation = buildToolMutationState(toolName, executedToolArgs);
+        const effectReceipt =
+          readToolEffectReceipt(result) ??
+          buildToolEffectReceipt({
+            executionStarted,
+            mutatingAction: mutation.mutatingAction,
+            replaySafe: mutation.replaySafe,
+            outcome: outcome.outcome === "completed" ? "success" : "failure",
+          });
         void runAgentHarnessAfterToolCallHook({
           toolName,
           toolCallId,
@@ -158,6 +171,7 @@ export async function handleMcpJsonRpc(params: {
           startArgs: executedToolArgs,
           result,
           error,
+          effectReceipt,
           startedAt,
         }).catch(() => {});
         try {
@@ -170,6 +184,17 @@ export async function handleMcpJsonRpc(params: {
           // Observability callbacks must never alter the tool result returned to the MCP client.
         }
       };
+      const rejectExpiredAuthorization = () => {
+        reportToolCallResult(
+          { outcome: "blocked", deniedReason: "client-grant-revoked" },
+          undefined,
+          "Tool call authorization expired",
+        );
+        return jsonRpcResult(id, {
+          content: [{ type: "text", text: "Tool call authorization expired" }],
+          isError: true,
+        });
+      };
       try {
         const preparedToolArgs = tool.prepareBeforeToolCallParams
           ? await tool.prepareBeforeToolCallParams(toolArgs, {
@@ -179,6 +204,10 @@ export async function handleMcpJsonRpc(params: {
             })
           : toolArgs;
         executedToolArgs = preparedToolArgs as Record<string, unknown>;
+        params.signal?.throwIfAborted();
+        if (params.authorizeToolCall && !params.authorizeToolCall()) {
+          return rejectExpiredAuthorization();
+        }
         // Gateway before-tool hooks still run for loopback MCP calls so policy
         // and audit behavior matches native tool calls from normal chat runs.
         // Preserve prepared params so exec can restore private workdir/env state after hooks.
@@ -215,19 +244,17 @@ export async function handleMcpJsonRpc(params: {
         } catch {
           // Observability callbacks must never alter the tool result returned to the MCP client.
         }
+        const assertApprovalCurrent = await redeemApprovalExecutions(
+          hookResult.approvalExecutions ?? [],
+        );
+        params.signal?.throwIfAborted();
         if (params.authorizeToolCall && !params.authorizeToolCall()) {
-          reportToolCallResult(
-            { outcome: "blocked", deniedReason: "client-grant-revoked" },
-            undefined,
-            "Tool call authorization expired",
-          );
-          return jsonRpcResult(id, {
-            content: [{ type: "text", text: "Tool call authorization expired" }],
-            isError: true,
-          });
+          return rejectExpiredAuthorization();
         }
         let result: Awaited<ReturnType<typeof tool.execute>>;
         try {
+          assertApprovalCurrent();
+          executionStarted = true;
           result = await tool.execute(toolCallId, finalizedToolArgs, params.signal);
         } catch (error) {
           throw tool.resultContentSource === "network"

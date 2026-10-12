@@ -400,7 +400,7 @@ private func execApprovalPresentation(
     commandPreview: String? = nil,
     warningText: String? = nil,
     agentID: String? = "main",
-    allowedDecisions: [ApprovalDecision] = [.allowOnce, .deny]) -> ApprovalPresentation
+    allowedDecisions: [OpenClawProtocol.ExecApprovalDecision] = [.allowOnce, .deny]) -> ApprovalPresentation
 {
     .exec(ExecApprovalPresentation(
         kind: ApprovalKind.exec.rawValue,
@@ -415,17 +415,22 @@ private func execApprovalPresentation(
 
 private func pluginApprovalPresentation(
     title: String,
-    description: String) -> ApprovalPresentation
+    description: String,
+    grantEligible: Bool? = nil,
+    grantScopeSummary: String? = nil,
+    allowedDecisions: [ApprovalDecision] = [.allowOnce, .deny]) -> ApprovalPresentation
 {
     .plugin(PluginApprovalPresentation(
         kind: ApprovalKind.plugin.rawValue,
         title: title,
         description: description,
+        granteligible: grantEligible,
+        grantscopesummary: grantScopeSummary,
         severity: .warning,
         pluginid: AnyCodable("example"),
         toolname: AnyCodable("guarded"),
         agentid: AnyCodable("main"),
-        alloweddecisions: [.allowOnce, .deny]))
+        alloweddecisions: allowedDecisions))
 }
 
 private func systemAgentApprovalPresentation() -> ApprovalPresentation {
@@ -476,7 +481,7 @@ private func makePendingExecApprovalJSON(
     commandPreview: String? = nil,
     warningText: String? = nil,
     agentID: String? = "main",
-    allowedDecisions: [ApprovalDecision] = [.allowOnce, .deny]) -> String
+    allowedDecisions: [OpenClawProtocol.ExecApprovalDecision] = [.allowOnce, .deny]) -> String
 {
     makePendingApprovalJSON(
         id: approvalID,
@@ -493,7 +498,7 @@ private func makeDeniedExecApprovalJSON(
     commandText: String,
     commandPreview: String? = nil,
     warningText: String? = nil,
-    allowedDecisions: [ApprovalDecision] = [.allowOnce, .deny],
+    allowedDecisions: [OpenClawProtocol.ExecApprovalDecision] = [.allowOnce, .deny],
     expiresAtMs: Int = 200,
     applied: Bool? = nil) -> String
 {
@@ -1894,12 +1899,15 @@ private final class TimingOutDeviceStatusService: DeviceStatusServicing {
             approvalID: "approval-unified") == nil)
     }
 
-    @Test @MainActor func `plugin notification prompt resolves with plugin kind`() async throws {
+    @Test @MainActor func `five-choice plugin notification uses safe native consent and retains delegation`() async throws {
         let pluginJSON = makePendingApprovalJSON(
             id: "approval-plugin",
             presentation: pluginApprovalPresentation(
                 title: "Allow guarded plugin tool?",
-                description: "The plugin wants to perform a guarded action."))
+                description: "The plugin wants to perform a guarded action.",
+                grantEligible: true,
+                grantScopeSummary: "Update the selected project Status field; later values may differ.",
+                allowedDecisions: [.allowOnce, .allow15m, .allowSession, .allowAlways, .deny]))
         let capture = ApprovalResolutionCapture()
         let (watchService, appModel) = makeWatchModel(
             notificationCenter: MockBootstrapNotificationCenter())
@@ -1918,10 +1926,23 @@ private final class TimingOutDeviceStatusService: DeviceStatusServicing {
         #expect(prompt.kind == "plugin")
         #expect(prompt.commandText == "Allow guarded plugin tool?")
         #expect(prompt.descriptionText == "The plugin wants to perform a guarded action.")
+        #expect(prompt.grantScopeSummary == "Update the selected project Status field; later values may differ.")
+        #expect(prompt.reusableConsentAvailable == true)
+        #expect(prompt.allowedDecisions == ["allow-once", "deny"])
         #expect(prompt.allowsAllowOnce)
         #expect(!prompt.allowsAllowAlways)
         #expect(prompt.allowsDeny)
         #expect(watchService.lastSentExecApprovalPrompt == nil)
+
+        let restoredPrompt = try JSONDecoder().decode(
+            NodeAppModel.ExecApprovalPrompt.self,
+            from: JSONEncoder().encode(prompt))
+        #expect(restoredPrompt.grantScopeSummary == prompt.grantScopeSummary)
+        #expect(restoredPrompt.reusableConsentAvailable == true)
+        for unsupportedDecision in ["allow-15m", "allow-session", "allow-always"] {
+            await appModel.resolvePendingExecApprovalPrompt(decision: unsupportedDecision)
+        }
+        #expect(await capture.recordedKind() == nil)
 
         await appModel.resolvePendingExecApprovalPrompt(decision: "deny")
 
@@ -1930,25 +1951,32 @@ private final class TimingOutDeviceStatusService: DeviceStatusServicing {
         #expect(watchService.lastSentExecApprovalResolved == nil)
     }
 
-    @Test @MainActor func `persisted plugin approval restores into phone inbox only`() throws {
+    @Test @MainActor func `persisted legacy and scoped plugin approvals restore with safe native consent`() throws {
         NodeAppModel._test_resetPersistedWatchExecApprovalBridgeState()
         defer { NodeAppModel._test_resetPersistedWatchExecApprovalBridgeState() }
 
-        let firstWatchService = MockWatchMessagingService()
-        let firstModel = NodeAppModel(watchMessagingService: firstWatchService)
-        firstModel.connectedGatewayID = "test-gateway"
-        try firstModel._test_presentExecApprovalPrompt(#require(
-            NodeAppModel._test_makeExecApprovalPrompt(
-                id: "approval-plugin-restored",
-                kind: .plugin,
-                commandText: "Allow guarded plugin tool?",
-                allowedDecisions: ["allow-once", "deny"],
-                descriptionText: "The plugin wants to perform a guarded action.",
-                pluginId: "example",
-                toolName: "guarded",
-                pluginSeverity: "warning",
-                expiresAtMs: 4_000_000_000_000)))
-        #expect(firstWatchService.lastSentExecApprovalPrompt == nil)
+        NodeAppModel._test_setPersistedWatchExecApprovalBridgeStateJSON(#"""
+        {
+          "approvals": [{
+            "id": "approval-plugin-restored",
+            "kind": "plugin",
+            "gatewayStableID": "test-gateway",
+            "commandText": "Allow guarded plugin tool?",
+            "descriptionText": "The plugin wants to perform a guarded action.",
+            "allowedDecisions": ["allow-once", "allow-always", "deny"],
+            "expiresAtMs": 4000000000000
+          }, {
+            "id": "approval-plugin-scoped-restored",
+            "kind": "plugin",
+            "gatewayStableID": "test-gateway",
+            "commandText": "Set Status",
+            "descriptionText": "Set the selected project item to Backlog.",
+            "grantScopeSummary": "Update the selected project Status field; later values may differ.",
+            "allowedDecisions": ["allow-once", "allow-15m", "allow-session", "allow-always", "deny"],
+            "expiresAtMs": 4000000000000
+          }]
+        }
+        """#)
 
         let restoredWatchService = MockWatchMessagingService()
         let restoredModel = NodeAppModel(watchMessagingService: restoredWatchService)
@@ -1956,11 +1984,27 @@ private final class TimingOutDeviceStatusService: DeviceStatusServicing {
 
         #expect(restoredModel._test_pendingExecApprovalInboxItems().map(\.id) == [
             "approval-plugin-restored",
+            "approval-plugin-scoped-restored",
         ])
-        restoredModel._test_presentPendingExecApprovalFromInbox(
-            approvalID: "approval-plugin-restored",
-            gatewayStableID: "test-gateway")
-        #expect(restoredModel.pendingExecApprovalPrompt?.kind == "plugin")
+        for item in restoredModel.pendingExecApprovalInboxItems {
+            #expect(item.prompt.allowedDecisions == ["allow-once", "deny"])
+            #expect(!item.prompt.allowsAllowAlways)
+            #expect(item.prompt.reusableConsentAvailable == true)
+            restoredModel._test_presentPendingExecApprovalFromInbox(
+                approvalID: item.prompt.id,
+                gatewayStableID: "test-gateway")
+            let presented = try #require(restoredModel.pendingExecApprovalPrompt)
+            #expect(presented.kind == "plugin")
+            #expect(presented.allowedDecisions == ["allow-once", "deny"])
+            #expect(!presented.allowsAllowAlways)
+            #expect(presented.reusableConsentAvailable == true)
+            if presented.id == "approval-plugin-scoped-restored" {
+                #expect(presented.grantScopeSummary ==
+                    "Update the selected project Status field; later values may differ.")
+            } else {
+                #expect(presented.grantScopeSummary == nil)
+            }
+        }
         #expect(restoredWatchService.lastSentExecApprovalPrompt == nil)
     }
 
@@ -1971,6 +2015,8 @@ private final class TimingOutDeviceStatusService: DeviceStatusServicing {
             ["accept", "deny"],
             [" allow-once ", "deny"],
             ["allow-once", "deny "],
+            ["allow-once", "allow-15m", "deny"],
+            ["allow-once", "allow-session", "deny"],
         ] {
             #expect(NodeAppModel._test_makeExecApprovalPrompt(
                 id: "approval-malformed",
@@ -2116,6 +2162,32 @@ private final class TimingOutDeviceStatusService: DeviceStatusServicing {
         #expect(pluginResult.status == "denied")
         #expect(pluginResult.decision == "deny")
         #expect(pluginResult.text == "This approval was already denied.")
+        for (decision, expectedText) in [
+            (ApprovalAllowDecision.allow15m, "This approval was already allowed for 15 minutes."),
+            (ApprovalAllowDecision.allowSession, "This approval was already allowed for this session."),
+        ] {
+            let recorded = AllowedApprovalSnapshot(
+                id: "approval-race",
+                urlpath: "/approve/approval-race",
+                createdatms: 100,
+                expiresatms: 200,
+                presentation: pluginApprovalPresentation(
+                    title: "Set Status",
+                    description: "Set the selected project item to Backlog.",
+                    grantEligible: true,
+                    grantScopeSummary: "Update the selected project Status field; later values may differ.",
+                    allowedDecisions: [.allowOnce, .allow15m, .allowSession, .allowAlways, .deny]),
+                resolvedatms: 150,
+                status: "allowed",
+                decision: decision,
+                reason: .user)
+            let bounded = try #require(NodeAppModel._test_decodeUnifiedExecApprovalResolution(
+                encodedFixtureJSON(ApprovalResolveResult(applied: false, approval: .allowed(recorded))),
+                approvalID: "approval-race"))
+            #expect(bounded.status == "allowed")
+            #expect(bounded.decision == decision.rawValue)
+            #expect(bounded.text == expectedText)
+        }
     }
 
     @Test @MainActor func `legacy approval resolve acknowledgment uses neutral gateway attribution`() async throws {

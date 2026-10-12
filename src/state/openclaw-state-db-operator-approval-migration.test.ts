@@ -1,8 +1,10 @@
 // Operator-approval kind migration: exact-legacy fail-closed repair.
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
+import { runStateSchemaMigrationTransaction } from "./openclaw-state-db-maintenance.js";
 import {
   assertCanonicalOperatorApprovalKinds,
+  migratePluginApprovalDecisions,
   repairOperatorApprovalSchema,
 } from "./openclaw-state-db-operator-approval-migration.js";
 import { OPENCLAW_STATE_SCHEMA_SQL } from "./openclaw-state-schema.js";
@@ -20,6 +22,12 @@ function canonicalOperatorApprovalCreateSql(): string {
 
 function legacyTwoKindCreateSql(): string {
   return canonicalOperatorApprovalCreateSql()
+    .replaceAll(
+      "'allow-once', 'allow-15m', 'allow-session', 'allow-always'",
+      "'allow-once', 'allow-always'",
+    )
+    .replace("\n  CHECK (kind = 'plugin' OR decision NOT IN ('allow-15m', 'allow-session')),", "")
+    .replace("AND (decision = 'allow-once' OR kind = 'plugin')", "AND decision = 'allow-once'")
     .replace(/\) STRICT;$/u, ");")
     .replace(/'exec',\s*'plugin',\s*'system-agent'/, "'exec', 'plugin'");
 }
@@ -80,6 +88,45 @@ function expectAlterAppendedLegacyRepair(strict: boolean): void {
 }
 
 describe("repairOperatorApprovalKinds", () => {
+  it("migrates the recognized pre-STRICT three-kind approval table inside schema admission", () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      db.exec(
+        legacyTwoKindCreateSql().replace("'exec', 'plugin'", "'exec', 'plugin', 'system-agent'"),
+      );
+      seedRow(db, "plugin");
+      db.exec(
+        'UPDATE operator_approvals SET authorization_json = \'{"requester":"original"}\', resolver_actor_json = \'{"senderId":"owner"}\'; PRAGMA foreign_keys = ON;',
+      );
+      const before = db.prepare("SELECT * FROM operator_approvals").all();
+      expect(
+        runStateSchemaMigrationTransaction(
+          db,
+          ":memory:",
+          () => migratePluginApprovalDecisions(db, 2),
+          {
+            databaseLabel: ":memory:",
+            operationLabel: "state.schema.ensure",
+            busyTimeoutMs: 5000,
+          },
+        ),
+      ).toBe(true);
+      expect(db.prepare("SELECT * FROM operator_approvals").all()).toEqual(before);
+      expect(
+        db.prepare("SELECT strict FROM pragma_table_list WHERE name = 'operator_approvals'").get(),
+      ).toMatchObject({ strict: 1 });
+      expect(db.prepare("PRAGMA foreign_keys").get()).toMatchObject({ foreign_keys: 1 });
+      db.prepare(
+        "UPDATE operator_approvals SET status = 'allowed', decision = 'allow-session', terminal_reason = 'user', resolved_at_ms = 1, resolver_kind = 'channel', consumed_at_ms = 1, consumed_by = 'run'",
+      ).run();
+      expect(
+        db.prepare("SELECT decision, consumed_by FROM operator_approvals").get(),
+      ).toMatchObject({ decision: "allow-session", consumed_by: "run" });
+    } finally {
+      db.close();
+    }
+  });
+
   it("migrates the exact legacy two-kind schema and preserves rows", () => {
     const db = new DatabaseSync(":memory:");
     db.exec(legacyTwoKindCreateSql());

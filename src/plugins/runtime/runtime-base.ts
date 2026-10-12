@@ -1,4 +1,5 @@
 import { resolveStateDir } from "../../config/paths.js";
+import { createRuntimeApprovalUX } from "./runtime-approval-ux.js";
 import { createRuntimeConfig } from "./runtime-config.js";
 import { createRuntimeSystem } from "./runtime-system.js";
 import type { PluginRuntime } from "./types.js";
@@ -10,10 +11,14 @@ function unavailable(method: string): () => never {
 }
 
 /** Host-owned facades survive later path-loaded runtime materialization unchanged. */
-export function createRuntimeBase(): Pick<PluginRuntime, "config" | "state" | "system"> {
+export function createRuntimeBase(): Pick<
+  PluginRuntime,
+  "config" | "state" | "system" | "approvalUX"
+> {
   let system: PluginRuntime["system"] | undefined;
   return {
     config: createRuntimeConfig(),
+    approvalUX: createRuntimeApprovalUX(),
     // Only the registry proxy grants storage, never the base runtime directly.
     state: {
       resolveStateDir,

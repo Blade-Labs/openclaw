@@ -5,6 +5,11 @@ import { resolvePluginApprovalRequestAllowedDecisions } from "./plugin-approvals
 /** Add the fail-closed deny verdict to the normalized plugin decision set. */
 export function resolveCanonicalPluginApprovalRequestAllowedDecisions(params?: {
   allowedDecisions?: readonly ExecApprovalDecision[] | readonly string[] | null;
+  grantEligible?: boolean;
+  grantScopeSummary?: string;
+  mcpTool?: { server: string; tool: string };
+  placementGrant?: unknown;
+  nativeApproval?: true;
 }): readonly ExecApprovalDecision[] {
   const allowedDecisions = resolvePluginApprovalRequestAllowedDecisions(params);
   return allowedDecisions.includes("deny") ? allowedDecisions : [...allowedDecisions, "deny"];

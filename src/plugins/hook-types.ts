@@ -333,6 +333,12 @@ export type PluginHookAgentContext = {
   chatId?: string;
   /** Sender identity for channel-originated runs when available. */
   senderId?: string;
+  /** Existing command authorization result, supplied by reset command hooks. */
+  isAuthorizedSender?: boolean;
+  /** Live admitted human actor, supplied by reset command hooks; never inferred from routing. */
+  actorKind?: "human";
+  /** Reset command mode; soft preserves transcript context. */
+  resetMode?: "hard" | "soft";
   trigger?: string;
   channelId?: string;
   /**

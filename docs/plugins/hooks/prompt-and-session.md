@@ -305,6 +305,23 @@ Conversation access and prompt mutation have separate permission gates; see
 
 ### Session extensions and next-turn injections
 
+For `/new` and `/reset`, `before_reset` keeps its event payload
+`{ sessionFile, messages, reason }` and adds optional context fields:
+`senderId` is the opaque admitted channel actor ID used by Policy;
+`isAuthorizedSender` is the command authorization result, not plugin ownership;
+`trigger` is `user` only for `external_user` input provenance, otherwise the
+known internal turn source or absent. `actorKind: "human"` requires a live
+admitted human channel actor and excludes bots, replayed or recovered commands,
+system events, and Gateway `chat.send`. `resetMode` is `hard` for `/new` and
+ordinary `/reset`, or `soft` for `/reset soft`, which preserves transcript
+context while retaining `reason: "reset"`.
+
+The command awaits `before_reset` before completing or continuing to prompt
+construction, with a five-second overall timeout using the shared hook timeout
+helper. Per-handler timeouts still apply. Errors and timeout are logged and
+the reset continues. Timed-out plugin work is not canceled; plugins should
+bound their own asynchronous work before recording state.
+
 Workflow plugins can persist small JSON-compatible session state with
 `api.session.state.registerSessionExtension(...)` and update it through the
 Gateway `sessions.pluginPatch` method. Session rows project registered

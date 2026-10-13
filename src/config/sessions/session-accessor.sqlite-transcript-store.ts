@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { sql } from "kysely";
 import type { AgentMessage } from "../../agents/runtime/index.js";
 import { getCodeModeSourceAppend } from "../../agents/transcript-code-mode-source.js";
 import { redactTranscriptMessage } from "../../agents/transcript-redact.js";
@@ -72,7 +73,11 @@ export function readTranscriptHistoryFacts(
   options: { afterSeq?: number; seqs?: readonly number[] } = {},
 ): Map<string, TranscriptEvent> {
   const db = getSessionKysely(database.db);
-  const navigation = transcriptEventNavigationSql();
+  // Replacement may repair malformed rows; invalid JSON cannot supply history authority.
+  const rawNavigation = transcriptEventNavigationSql();
+  const navigation =
+    /* kysely-allow-raw: reject malformed envelope facts before native JSON extraction during repair. */
+    sql<string>`CASE WHEN json_valid(${rawNavigation}) THEN ${rawNavigation} ELSE '{}' END`;
   const canonical = transcriptEventJsonSql(database.db);
   const rows = executeSqliteQuerySync(
     database.db,
@@ -113,8 +118,6 @@ function nextHistorySeq(database: OpenClawAgentDatabase, sessionId: string): num
 
 /** Rewrites preserve committed identity facts, never caller-supplied history authority. */
 export function preserveTranscriptHistoryFacts(
-  database: OpenClawAgentDatabase,
-  sessionId: string,
   event: TranscriptEvent,
   original?: TranscriptEvent,
 ): TranscriptEvent {
@@ -152,7 +155,7 @@ export function preserveTranscriptHistoryFacts(
       ? Number.isSafeInteger(original.historySeq)
         ? { historySeq: original.historySeq }
         : {}
-      : { historySeq: nextHistorySeq(database, sessionId) }),
+      : {}),
   };
 }
 
@@ -161,6 +164,10 @@ type TranscriptAppendOptions = {
   eventJson?: string;
   preparedPayload?: PreparedTranscriptPayload;
   allowStoredAlias?: boolean;
+  /** Only the message append owner assigns host order to a fresh user turn. */
+  assignUserHistorySeq?: boolean;
+  /** The synchronous session runtime assigns order without human-reset provenance. */
+  assignResetHistorySeq?: boolean;
   /** Only the guarded reset lifecycle owner may author affirmative reset provenance. */
   allowHumanResetSource?: boolean;
   idempotencyKeyMode?: "dedupe" | "preserve-owner" | "relocate-owner";
@@ -299,28 +306,41 @@ function appendTranscriptEvent(
   const seq = cursor.nextSeq ?? readNextTranscriptSeq(database, scope.sessionId);
   cursor.insertEvent ??= createTranscriptEventInserter(database.db, scope.sessionId);
   let eventJson = options.eventJson;
-  if (
-    isRecord(persistedEvent) &&
-    (persistedEvent.type === "reset" ||
-      (persistedEvent.type === "message" &&
-        isRecord(persistedEvent.message) &&
-        persistedEvent.message.role === "user"))
-  ) {
-    const historySeq = nextHistorySeq(database, scope.sessionId);
-    if (
-      persistedEvent.type === "reset" &&
-      (!options.allowHumanResetSource || Object.hasOwn(persistedEvent, "historySeq"))
-    ) {
+  if (isRecord(persistedEvent)) {
+    const originalEnvelope = persistedEvent;
+    const userTurn =
+      originalEnvelope.type === "message" &&
+      isRecord(originalEnvelope.message) &&
+      originalEnvelope.message.role === "user";
+    const humanReset =
+      originalEnvelope.type === "reset" &&
+      options.allowHumanResetSource === true &&
+      !Object.hasOwn(originalEnvelope, "historySeq") &&
+      originalEnvelope.source === "human-command" &&
+      typeof originalEnvelope.actorId === "string" &&
+      originalEnvelope.actorId.length > 0;
+    if ((userTurn && options.assignUserHistorySeq) || humanReset) {
+      persistedEvent = {
+        ...originalEnvelope,
+        historySeq: nextHistorySeq(database, scope.sessionId),
+      };
+      eventJson = JSON.stringify(persistedEvent);
+    } else if (originalEnvelope.type === "reset") {
       const {
         source: _source,
         actorId: _actorId,
         historySeq: _historySeq,
-        ...copiedReset
-      } = persistedEvent;
-      persistedEvent = copiedReset;
+        ...reset
+      } = originalEnvelope;
+      persistedEvent = options.assignResetHistorySeq
+        ? { ...reset, historySeq: nextHistorySeq(database, scope.sessionId) }
+        : reset;
+      eventJson = JSON.stringify(persistedEvent);
+    } else if (Object.hasOwn(originalEnvelope, "historySeq")) {
+      const { historySeq: _historySeq, ...envelope } = originalEnvelope;
+      persistedEvent = envelope;
+      eventJson = JSON.stringify(envelope);
     }
-    persistedEvent = { ...persistedEvent, historySeq };
-    eventJson = JSON.stringify(persistedEvent);
   }
   eventJson ??= JSON.stringify(persistedEvent);
   cursor.insertEvent({
@@ -568,12 +588,7 @@ export function replaceSqliteTranscriptEventsInTransaction(
   for (const [eventIndex, event] of events.entries()) {
     if (
       appendTranscriptEventRowInTransaction(
-        preserveTranscriptHistoryFacts(
-          database,
-          resolved.sessionId,
-          event,
-          originals.get(readTranscriptEventId(event) ?? ""),
-        ),
+        preserveTranscriptHistoryFacts(event, originals.get(readTranscriptEventId(event) ?? "")),
         seq,
         state,
         options.createdAtByIndex?.[eventIndex],
@@ -628,8 +643,6 @@ export function rewriteSqliteTranscriptEventRowsInTransaction(
   const rewrites = rows.map((row) => {
     const eventJson = JSON.stringify(
       preserveTranscriptHistoryFacts(
-        database,
-        resolved.sessionId,
         canonicalizeTranscriptEventMedia(row.event),
         originals.get(readTranscriptEventId(row.event) ?? ""),
       ),

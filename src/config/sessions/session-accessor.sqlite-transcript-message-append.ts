@@ -267,6 +267,7 @@ export function appendTranscriptMessageInTransaction<TMessage>(
   }
   const appended = appendTranscriptEventInTransaction(database, resolved, event, {
     eventJson,
+    assignUserHistorySeq: true,
     preparedPayload: preparedMessage?.physicalPayload,
     idempotencyKeyMode:
       options.idempotencyLookup === "caller-checked"

@@ -535,12 +535,7 @@ export function replaceSqliteTranscriptSuffixInTransaction(
         storedEventSeq?: number;
         messageIdempotencyKey?: string;
       } = {
-        event: preserveTranscriptHistoryFacts(
-          database,
-          resolved.sessionId,
-          event,
-          originalEvents.get(eventId ?? ""),
-        ),
+        event: preserveTranscriptHistoryFacts(event, originalEvents.get(eventId ?? "")),
         seq,
         createdAt,
       };

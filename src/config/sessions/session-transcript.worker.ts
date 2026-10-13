@@ -325,7 +325,7 @@ serveWorkerTasks(
               "agent",
               request.database.path,
               {
-                env: request.target.env,
+                env: request.kind === "hook-history" ? undefined : request.target.env,
               },
             );
             if (quarantine) {

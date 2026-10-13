@@ -150,7 +150,9 @@ export function prepareTranscriptRewriteSync(
           delete entry.historySeq;
           Object.assign(entry, readCommittedTranscriptHistoryFacts(result));
         } else {
-          const canonical = appendTranscriptEventInTransaction(current, resolved, entry);
+          const canonical = appendTranscriptEventInTransaction(current, resolved, entry, {
+            assignResetHistorySeq: true,
+          });
           if (!canonical) {
             throw new Error("Transcript rewrite entry was not appended");
           }

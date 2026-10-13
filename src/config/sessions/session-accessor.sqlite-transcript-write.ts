@@ -395,12 +395,10 @@ export function appendTranscriptEventSnapshotSync(
         event,
         options,
       );
-      const canonical = appendTranscriptEventInTransaction(
-        database,
-        resolved,
-        resolvedEvent,
-        projection,
-      );
+      const canonical = appendTranscriptEventInTransaction(database, resolved, resolvedEvent, {
+        ...projection,
+        assignResetHistorySeq: true,
+      });
       if (canonical === false) {
         return { appended: false };
       }

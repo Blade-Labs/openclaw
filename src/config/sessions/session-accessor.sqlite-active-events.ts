@@ -125,7 +125,7 @@ function readHookHistoryEvidence(
           .where("active.event_seq", "=", window.boundarySeq),
       )
     : undefined;
-  const trustedBoundary =
+  const trustedBoundary: PluginHookHistoryEvidence["boundary"] =
     boundary?.type === "reset" &&
     typeof boundary.id === "string" &&
     boundary.context === "clear" &&
@@ -184,7 +184,8 @@ function readHookHistoryEvidence(
     if (row.type === "message" && row.role === "user") {
       turnsSinceBoundary++;
       if (
-        admission?.entryId === row.id &&
+        admission !== undefined &&
+        admission.entryId === row.id &&
         typeof row.historySeq === "number" &&
         Number.isSafeInteger(row.historySeq)
       ) {

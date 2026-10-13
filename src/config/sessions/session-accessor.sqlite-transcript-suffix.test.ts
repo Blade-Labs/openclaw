@@ -1,3 +1,4 @@
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { trackSqliteStatementExecutions } from "../../../test/helpers/sqlite-statement-execution-counter.js";
 import { clearNodeSqliteKyselyCacheForDatabase } from "../../infra/kysely-sync.js";
@@ -48,6 +49,7 @@ const rewriteEvents = [
 async function withRewriteFixture(
   run: (fixture: {
     db: ReturnType<typeof openOpenClawAgentDatabase>["db"];
+    canonical: (events: readonly TranscriptEvent[]) => TranscriptEvent[];
     snapshot: () => {
       raw: Array<Record<string, unknown>>;
       storage: Array<Record<string, unknown>>;
@@ -73,6 +75,23 @@ async function withRewriteFixture(
     runOpenClawAgentWriteTransaction((database) => {
       appendTranscriptEventsInTransaction(database, scope, events);
     }, scope);
+    const committedEvents = new Map(
+      readTranscriptStorageRows(owner, scope.sessionId).flatMap((row) => {
+        const event: unknown = JSON.parse(row.eventJson);
+        return isRecord(event) && typeof event.id === "string" ? [[event.id, event] as const] : [];
+      }),
+    );
+    // Bind planned bodies to their seed's host envelope, without rereading changed test state.
+    const canonical = (planned: readonly TranscriptEvent[]) =>
+      planned.map((event) => {
+        if (!isRecord(event) || typeof event.id !== "string") {
+          return event;
+        }
+        const original = committedEvents.get(event.id);
+        return original?.historySeq === undefined
+          ? event
+          : { ...event, historySeq: original.historySeq };
+      });
     const snapshot = () => ({
       raw: readTranscriptStorageRows(owner, scope.sessionId).map((row) => ({
         session_id: scope.sessionId,
@@ -97,7 +116,7 @@ async function withRewriteFixture(
       generation: readTranscriptGenerationInTransaction(owner, scope.sessionId),
       updatedAt: readTranscriptMutationStateInTransaction(owner, scope.sessionId).updatedAt,
     });
-    await run({ db, snapshot, scope });
+    await run({ db, snapshot, scope, canonical });
   });
 }
 
@@ -125,8 +144,47 @@ function replaceTranscriptSuffixForTest(
 }
 
 describe("SQLite exact transcript suffix replacement", () => {
+  it("retains legacy human-command fields when reparenting an unchanged reset identity", async () => {
+    const events = [
+      ...rewriteEvents.slice(0, 2),
+      { type: "reset", id: "legacy-reset", parentId: "user", reason: "new", context: "clear" },
+      {
+        type: "message",
+        id: "current",
+        parentId: "legacy-reset",
+        message: { role: "user", content: "current" },
+      },
+    ];
+    await withRewriteFixture(({ db, scope, snapshot }) => {
+      // Model a persisted Round 1 envelope, before actor/order fields existed.
+      const legacy = { ...events[2], source: "human-command" };
+      const json = JSON.stringify(legacy);
+      db.prepare(
+        `UPDATE transcript_events SET event_json = ?, event_zstd = NULL,
+          event_utf8_bytes = ?, navigation_json = NULL
+          WHERE session_id = ? AND seq = 2`,
+      ).run(json, Buffer.byteLength(json), scope.sessionId);
+      const expected = snapshot().raw.map(
+        (row) => JSON.parse(String(row.event_json)) as TranscriptEvent,
+      );
+      const next = expected
+        .filter((event) => isRecord(event) && event.id !== "user")
+        .map((event) =>
+          isRecord(event) && event.id === "legacy-reset" ? { ...event, parentId: "root" } : event,
+        );
+      replaceTranscriptSuffixForTest(scope, expected, next);
+      expect(snapshot().raw.map((row) => JSON.parse(String(row.event_json)))).toEqual(next);
+      const retained = snapshot()
+        .raw.map((row) => JSON.parse(String(row.event_json)))
+        .find((event) => event.id === "legacy-reset");
+      expect(retained).toMatchObject({ source: "human-command", context: "clear" });
+      expect(retained).not.toHaveProperty("actorId");
+      expect(retained).not.toHaveProperty("historySeq");
+    }, events);
+  });
+
   it("rejects a changed mutation fence while planning an incremental suffix", async () => {
-    await withRewriteFixture(({ db, scope }) => {
+    await withRewriteFixture(({ db, scope, canonical }) => {
       clearNodeSqliteKyselyCacheForDatabase(db);
       const originalPrepare = db.prepare.bind(db);
       let changedFence = false;
@@ -150,8 +208,8 @@ describe("SQLite exact transcript suffix replacement", () => {
           prepareSqliteTranscriptSuffixMutation(
             openOpenClawAgentDatabase(scope),
             scope,
-            rewriteEvents,
-            rewriteEvents.slice(0, -1),
+            canonical(rewriteEvents),
+            canonical(rewriteEvents.slice(0, -1)),
             rewriteEvents.length - 1,
           ),
         ).toThrow(`SQLite transcript changed while planning suffix removal for ${scope.sessionId}`);
@@ -181,9 +239,14 @@ describe("SQLite exact transcript suffix replacement", () => {
         message: { role: "assistant", content: "inactive tail" },
       },
     ] as const;
-    await withRewriteFixture(async ({ db, snapshot, scope }) => {
+    await withRewriteFixture(async ({ db, snapshot, scope, canonical }) => {
       await waitForSessionTranscriptIndexReconcile(scope);
-      replaceTranscriptSuffixForTest(scope, events, events.slice(0, -1), events.length - 1);
+      replaceTranscriptSuffixForTest(
+        scope,
+        canonical(events),
+        canonical(events.slice(0, -1)),
+        events.length - 1,
+      );
 
       expect(snapshot().raw).toHaveLength(events.length - 1);
       await waitForSessionTranscriptIndexReconcile(scope);
@@ -224,9 +287,14 @@ describe("SQLite exact transcript suffix replacement", () => {
     const events = [...rewriteEvents, activeChild, redirectedRoot, removedTail] as const;
     const nextEvents = [...rewriteEvents, changedActiveChild, redirectedRoot] as const;
 
-    await withRewriteFixture(async ({ db, snapshot, scope }) => {
+    await withRewriteFixture(async ({ db, snapshot, scope, canonical }) => {
       await waitForSessionTranscriptIndexReconcile(scope);
-      replaceTranscriptSuffixForTest(scope, events, nextEvents, rewriteEvents.length);
+      replaceTranscriptSuffixForTest(
+        scope,
+        canonical(events),
+        canonical(nextEvents),
+        rewriteEvents.length,
+      );
 
       expect(snapshot().raw).toHaveLength(nextEvents.length);
       expect(sessionTranscriptIndexNeedsReconcile(db, scope.sessionId)).toBe(true);
@@ -258,9 +326,14 @@ describe("SQLite exact transcript suffix replacement", () => {
     const events = [...rewriteEvents, inactiveEvent, activeEvent] as const;
     const nextEvents = [...rewriteEvents, activeEvent] as const;
 
-    await withRewriteFixture(async ({ db, snapshot, scope }) => {
+    await withRewriteFixture(async ({ db, snapshot, scope, canonical }) => {
       await waitForSessionTranscriptIndexReconcile(scope);
-      replaceTranscriptSuffixForTest(scope, events, nextEvents, rewriteEvents.length);
+      replaceTranscriptSuffixForTest(
+        scope,
+        canonical(events),
+        canonical(nextEvents),
+        rewriteEvents.length,
+      );
 
       expect(snapshot().raw).toHaveLength(nextEvents.length);
       await waitForSessionTranscriptIndexReconcile(scope);
@@ -289,9 +362,14 @@ describe("SQLite exact transcript suffix replacement", () => {
     } as const;
     const events = [...rewriteEvents, activeRoot] as const;
 
-    await withRewriteFixture(async ({ db, snapshot, scope }) => {
+    await withRewriteFixture(async ({ db, snapshot, scope, canonical }) => {
       await waitForSessionTranscriptIndexReconcile(scope);
-      replaceTranscriptSuffixForTest(scope, events, rewriteEvents, rewriteEvents.length);
+      replaceTranscriptSuffixForTest(
+        scope,
+        canonical(events),
+        canonical(rewriteEvents),
+        rewriteEvents.length,
+      );
 
       expect(snapshot().raw).toHaveLength(rewriteEvents.length);
       expect(sessionTranscriptIndexNeedsReconcile(db, scope.sessionId)).toBe(true);
@@ -328,9 +406,9 @@ describe("SQLite exact transcript suffix replacement", () => {
     const events = [rewriteEvents[0], rewriteEvents[1], inactiveEvent, activeEvent] as const;
     const nextEvents = [rewriteEvents[0], rewriteEvents[1], activeEvent] as const;
 
-    await withRewriteFixture(async ({ db, snapshot, scope }) => {
+    await withRewriteFixture(async ({ db, snapshot, scope, canonical }) => {
       await waitForSessionTranscriptIndexReconcile(scope);
-      replaceTranscriptSuffixForTest(scope, events, nextEvents, 2);
+      replaceTranscriptSuffixForTest(scope, canonical(events), canonical(nextEvents), 2);
 
       expect(snapshot().raw).toHaveLength(nextEvents.length);
       await waitForSessionTranscriptIndexReconcile(scope);
@@ -381,7 +459,7 @@ describe("SQLite exact transcript suffix replacement", () => {
       ],
     },
   ])("plans only the removable suffix above the $name limit", async ({ events }) => {
-    await withRewriteFixture(({ db, scope }) => {
+    await withRewriteFixture(({ db, scope, canonical }) => {
       const work = trackSqliteStatementExecutions(
         db,
         ["fullTranscript", "prefixScan", "sizeScan"],
@@ -407,8 +485,8 @@ describe("SQLite exact transcript suffix replacement", () => {
         const plan = prepareSqliteTranscriptSuffixMutation(
           openOpenClawAgentDatabase(scope),
           scope,
-          events,
-          events.slice(0, -1),
+          canonical(events),
+          canonical(events.slice(0, -1)),
           events.length - 1,
         );
         expect(plan.incremental).toBeDefined();
@@ -442,7 +520,7 @@ describe("SQLite exact transcript suffix replacement", () => {
       const expected = [rewriteEvents[0], rewriteEvents[1], plannedTail];
       const next = [rewriteEvents[0], { ...plannedTail, parentId: "root" }];
       const retainedIds = data === undefined ? [] : [tail.id];
-      await withRewriteFixture(({ db, snapshot, scope }) => {
+      await withRewriteFixture(({ db, snapshot, scope, canonical }) => {
         const before = snapshot();
         const beforeStats = readTranscriptStatsSync(scope);
         expect(before.storage[2]?.event_json === null).toBe(compressed);
@@ -451,8 +529,8 @@ describe("SQLite exact transcript suffix replacement", () => {
           const plan = prepareSqliteTranscriptSuffixMutation(
             openOpenClawAgentDatabase(scope),
             scope,
-            expected,
-            next,
+            canonical(expected),
+            canonical(next),
             1,
             undefined,
             false,
@@ -467,7 +545,7 @@ describe("SQLite exact transcript suffix replacement", () => {
           expect(snapshot()).toEqual(before);
           expect(readTranscriptStatsSync(scope)).toEqual(beforeStats);
         }
-        replaceTranscriptSuffixForTest(scope, expected, next, 1, retainedIds);
+        replaceTranscriptSuffixForTest(scope, canonical(expected), canonical(next), 1, retainedIds);
 
         const result = snapshot();
         const retainedJson = JSON.stringify({ ...tail, parentId: "root" });
@@ -500,14 +578,14 @@ describe("SQLite exact transcript suffix replacement", () => {
   );
 
   it("validates only the unchanged projection prefix for same-length suffix replacement", async () => {
-    await withRewriteFixture(({ db, snapshot, scope }) => {
+    await withRewriteFixture(({ db, snapshot, scope, canonical }) => {
       const replacementEvents = [
         rewriteEvents[0],
         { ...rewriteEvents[1], message: { role: "user", content: "updated question" } },
         { ...rewriteEvents[2], message: { role: "assistant", content: "updated answer" } },
       ] as const;
 
-      replaceTranscriptSuffixForTest(scope, rewriteEvents, replacementEvents);
+      replaceTranscriptSuffixForTest(scope, canonical(rewriteEvents), canonical(replacementEvents));
 
       const result = snapshot();
       expect(result).toMatchObject({
@@ -542,7 +620,7 @@ describe("SQLite exact transcript suffix replacement", () => {
         message: { role: "assistant", content: "original", idempotencyKey: "old-key" },
       },
     ] as const;
-    await withRewriteFixture(({ db, scope }) => {
+    await withRewriteFixture(({ db, scope, canonical }) => {
       const replacementEvents = [
         originalEvents[0],
         {
@@ -551,7 +629,11 @@ describe("SQLite exact transcript suffix replacement", () => {
         },
       ] as const;
 
-      replaceTranscriptSuffixForTest(scope, originalEvents, replacementEvents);
+      replaceTranscriptSuffixForTest(
+        scope,
+        canonical(originalEvents),
+        canonical(replacementEvents),
+      );
 
       expect(
         db
@@ -579,7 +661,7 @@ describe("SQLite exact transcript suffix replacement", () => {
         message: { role: "assistant", content: "owner", idempotencyKey: "old-key" },
       },
     ] as const;
-    await withRewriteFixture(({ db, scope }) => {
+    await withRewriteFixture(({ db, scope, canonical }) => {
       db.prepare(
         "UPDATE transcript_event_identities SET message_idempotency_key = NULL WHERE session_id = ? AND event_id = ?",
       ).run(scope.sessionId, "duplicate");
@@ -595,7 +677,11 @@ describe("SQLite exact transcript suffix replacement", () => {
         },
       ] as const;
 
-      replaceTranscriptSuffixForTest(scope, originalEvents, replacementEvents);
+      replaceTranscriptSuffixForTest(
+        scope,
+        canonical(originalEvents),
+        canonical(replacementEvents),
+      );
 
       expect(
         db
@@ -620,7 +706,7 @@ describe("SQLite exact transcript suffix replacement", () => {
         message: { role: "assistant", content: "original", idempotencyKey: "old-key" },
       },
     ] as const;
-    await withRewriteFixture(({ db, scope }) => {
+    await withRewriteFixture(({ db, scope, canonical }) => {
       const replacementEvents = [
         originalEvents[0],
         {
@@ -629,7 +715,11 @@ describe("SQLite exact transcript suffix replacement", () => {
         },
       ] as const;
 
-      replaceTranscriptSuffixForTest(scope, originalEvents, replacementEvents);
+      replaceTranscriptSuffixForTest(
+        scope,
+        canonical(originalEvents),
+        canonical(replacementEvents),
+      );
 
       expect(
         db
@@ -658,7 +748,7 @@ describe("SQLite exact transcript suffix replacement", () => {
         message: { role: "assistant", content: "owner", idempotencyKey: "retry" },
       },
     ] as const;
-    await withRewriteFixture(({ db, scope }) => {
+    await withRewriteFixture(({ db, scope, canonical }) => {
       db.prepare(
         "UPDATE transcript_events SET created_at = CASE seq WHEN 1 THEN 101 WHEN 3 THEN 303 ELSE created_at END WHERE session_id = ?",
       ).run(scope.sessionId);
@@ -669,11 +759,15 @@ describe("SQLite exact transcript suffix replacement", () => {
         "UPDATE transcript_event_identities SET message_idempotency_key = ?, created_at = 303 WHERE session_id = ? AND event_id = ?",
       ).run("retry", scope.sessionId, "owner");
 
-      replaceTranscriptSuffixForTest(scope, duplicateKeyEvents, [
-        duplicateKeyEvents[0],
-        duplicateKeyEvents[1],
-        { ...duplicateKeyEvents[3], parentId: "first" },
-      ]);
+      replaceTranscriptSuffixForTest(
+        scope,
+        canonical(duplicateKeyEvents),
+        canonical([
+          duplicateKeyEvents[0],
+          duplicateKeyEvents[1],
+          { ...duplicateKeyEvents[3], parentId: "first" },
+        ]),
+      );
 
       expect(
         db
@@ -709,17 +803,21 @@ describe("SQLite exact transcript suffix replacement", () => {
         message: { role: "assistant", content: "owner", idempotencyKey: "retry" },
       },
     ] as const;
-    await withRewriteFixture(({ db, scope }) => {
-      replaceTranscriptSuffixForTest(scope, duplicateKeyEvents, [
-        duplicateKeyEvents[0],
-        {
-          type: "message",
-          id: "new",
-          parentId: "root",
-          message: { role: "assistant", content: "new", idempotencyKey: "retry" },
-        },
-        { ...duplicateKeyEvents[2], parentId: "new" },
-      ]);
+    await withRewriteFixture(({ db, scope, canonical }) => {
+      replaceTranscriptSuffixForTest(
+        scope,
+        canonical(duplicateKeyEvents),
+        canonical([
+          duplicateKeyEvents[0],
+          {
+            type: "message",
+            id: "new",
+            parentId: "root",
+            message: { role: "assistant", content: "new", idempotencyKey: "retry" },
+          },
+          { ...duplicateKeyEvents[2], parentId: "new" },
+        ]),
+      );
 
       expect(
         db
@@ -750,11 +848,12 @@ describe("SQLite exact transcript suffix replacement", () => {
         message: { role: "assistant", content: "duplicate", idempotencyKey: "retry" },
       },
     ] as const;
-    await withRewriteFixture(({ db, scope }) => {
-      replaceTranscriptSuffixForTest(scope, duplicateKeyEvents, [
-        duplicateKeyEvents[0],
-        { ...duplicateKeyEvents[2], parentId: "root" },
-      ]);
+    await withRewriteFixture(({ db, scope, canonical }) => {
+      replaceTranscriptSuffixForTest(
+        scope,
+        canonical(duplicateKeyEvents),
+        canonical([duplicateKeyEvents[0], { ...duplicateKeyEvents[2], parentId: "root" }]),
+      );
 
       expect(
         db
@@ -782,7 +881,7 @@ describe("SQLite exact transcript suffix replacement", () => {
         message: { role: "assistant", content: "owner", idempotencyKey: "retry" },
       },
     ] as const;
-    await withRewriteFixture(({ db, scope }) => {
+    await withRewriteFixture(({ db, scope, canonical }) => {
       db.prepare(
         "UPDATE transcript_event_identities SET message_idempotency_key = NULL WHERE session_id = ? AND event_id = ?",
       ).run(scope.sessionId, "duplicate");
@@ -790,7 +889,12 @@ describe("SQLite exact transcript suffix replacement", () => {
         "UPDATE transcript_event_identities SET message_idempotency_key = ? WHERE session_id = ? AND event_id = ?",
       ).run("retry", scope.sessionId, "owner");
 
-      replaceTranscriptSuffixForTest(scope, duplicateKeyEvents, duplicateKeyEvents.slice(0, -1), 2);
+      replaceTranscriptSuffixForTest(
+        scope,
+        canonical(duplicateKeyEvents),
+        canonical(duplicateKeyEvents.slice(0, -1)),
+        2,
+      );
 
       expect(
         db
@@ -824,7 +928,7 @@ describe("SQLite exact transcript suffix replacement", () => {
         message: { role: "assistant", content: "owner", idempotencyKey: "retry" },
       },
     ] as const;
-    await withRewriteFixture(({ db, scope }) => {
+    await withRewriteFixture(({ db, scope, canonical }) => {
       db.prepare(
         "UPDATE transcript_event_identities SET message_idempotency_key = NULL WHERE session_id = ? AND event_id = ?",
       ).run(scope.sessionId, "duplicate");
@@ -842,7 +946,12 @@ describe("SQLite exact transcript suffix replacement", () => {
            )`,
       ).run("{", scope.sessionId, scope.sessionId, "corrupt-prefix");
 
-      replaceTranscriptSuffixForTest(scope, duplicateKeyEvents, duplicateKeyEvents.slice(0, -1), 3);
+      replaceTranscriptSuffixForTest(
+        scope,
+        canonical(duplicateKeyEvents),
+        canonical(duplicateKeyEvents.slice(0, -1)),
+        3,
+      );
 
       expect(
         db
@@ -873,7 +982,7 @@ describe("SQLite exact transcript suffix replacement", () => {
     };
     const duplicateKeyEvents = [rewriteEvents[0], ...prefix, owner];
     const duplicateId = prefix[0]!.id;
-    await withRewriteFixture(({ db, scope }) => {
+    await withRewriteFixture(({ db, scope, canonical }) => {
       db.prepare(
         "UPDATE transcript_event_identities SET message_idempotency_key = NULL WHERE session_id = ? AND event_id = ?",
       ).run(scope.sessionId, duplicateId);
@@ -882,8 +991,8 @@ describe("SQLite exact transcript suffix replacement", () => {
       ).run("retry", scope.sessionId, owner.id);
       replaceTranscriptSuffixForTest(
         scope,
-        duplicateKeyEvents,
-        duplicateKeyEvents.slice(0, -1),
+        canonical(duplicateKeyEvents),
+        canonical(duplicateKeyEvents.slice(0, -1)),
         duplicateKeyEvents.length - 1,
       );
       expect(
@@ -910,8 +1019,13 @@ describe("SQLite exact transcript suffix replacement", () => {
       message: { role: "assistant" as const, content: "owner", idempotencyKey: "unique" },
     };
     const events = [rewriteEvents[0], ...prefix, owner];
-    await withRewriteFixture(({ db, scope }) => {
-      replaceTranscriptSuffixForTest(scope, events, events.slice(0, -1), events.length - 1);
+    await withRewriteFixture(({ db, scope, canonical }) => {
+      replaceTranscriptSuffixForTest(
+        scope,
+        canonical(events),
+        canonical(events.slice(0, -1)),
+        events.length - 1,
+      );
 
       expect(
         db
@@ -940,7 +1054,7 @@ describe("SQLite exact transcript suffix replacement", () => {
           message: { role: "assistant", content: `removed ${index}` },
         })),
       ];
-      await withRewriteFixture(({ db, snapshot, scope }) => {
+      await withRewriteFixture(({ db, snapshot, scope, canonical }) => {
         const sibling = { ...scope, sessionId: "sibling", sessionKey: "agent:main:sibling" };
         runOpenClawAgentWriteTransaction((database) => {
           appendTranscriptEventsInTransaction(database, sibling, events);
@@ -971,7 +1085,12 @@ describe("SQLite exact transcript suffix replacement", () => {
           return "ftsDeletes";
         });
         try {
-          replaceTranscriptSuffixForTest(scope, events, events.slice(0, 2), 2);
+          replaceTranscriptSuffixForTest(
+            scope,
+            canonical(events),
+            canonical(events.slice(0, 2)),
+            2,
+          );
         } finally {
           work.restore();
         }
@@ -994,13 +1113,17 @@ describe("SQLite exact transcript suffix replacement", () => {
   );
 
   it("rotates generation when an already-dirty projection needs reconciliation", async () => {
-    await withRewriteFixture(async ({ db, snapshot, scope }) => {
+    await withRewriteFixture(async ({ db, snapshot, scope, canonical }) => {
       const before = snapshot();
       db.prepare(
         "UPDATE session_transcript_index_state SET needs_rebuild = 1 WHERE session_id = ?",
       ).run(scope.sessionId);
 
-      replaceTranscriptSuffixForTest(scope, rewriteEvents, rewriteEvents.slice(0, 2));
+      replaceTranscriptSuffixForTest(
+        scope,
+        canonical(rewriteEvents),
+        canonical(rewriteEvents.slice(0, 2)),
+      );
 
       const rotatedGeneration = snapshot().generation;
       expect(rotatedGeneration).not.toBe(before.generation);
@@ -1015,7 +1138,7 @@ describe("SQLite exact transcript suffix replacement", () => {
   });
 
   it("preserves retained row timestamps when an already-dirty projection needs reconciliation", async () => {
-    await withRewriteFixture(async ({ db, snapshot, scope }) => {
+    await withRewriteFixture(async ({ db, snapshot, scope, canonical }) => {
       db.prepare(
         "UPDATE transcript_events SET created_at = 303 WHERE session_id = ? AND seq = 2",
       ).run(scope.sessionId);
@@ -1027,7 +1150,12 @@ describe("SQLite exact transcript suffix replacement", () => {
       ).run(scope.sessionId);
       const retainedAnswer = { ...rewriteEvents[2], parentId: "root" };
 
-      replaceTranscriptSuffixForTest(scope, rewriteEvents, [rewriteEvents[0], retainedAnswer], 1);
+      replaceTranscriptSuffixForTest(
+        scope,
+        canonical(rewriteEvents),
+        canonical([rewriteEvents[0], retainedAnswer]),
+        1,
+      );
 
       expect(snapshot().raw).toEqual([
         expect.objectContaining({ seq: 0 }),

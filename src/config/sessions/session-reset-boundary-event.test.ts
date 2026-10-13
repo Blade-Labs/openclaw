@@ -39,6 +39,7 @@ describe("reset boundary planning", () => {
       const event = buildSessionResetBoundaryEvent({
         context: "clear",
         source: "human-command",
+        actorId: "reset-owner",
         events: [user, assistant],
         reason,
       });
@@ -48,6 +49,7 @@ describe("reset boundary planning", () => {
         reason,
         context: "clear",
         source: "human-command",
+        actorId: "reset-owner",
       });
       expect(event).not.toHaveProperty("firstKeptEntryId");
     },

@@ -53,14 +53,19 @@ import type { PluginJsonValue } from "./host-hook-json.js";
 
 /** Read-only CLI transcript facts for this hook's session and run; never admission authority. */
 export type PluginHookHistoryEvidence = Readonly<{
-  /** Only a committed explicit human command that cleared context; legacy events do not qualify. */
-  boundary?: Readonly<{ id: string; reason: "new" | "reset" }>;
+  /** Only a committed explicit human command that cleared context; legacy events do not qualify.
+   * actorId is the opaque authenticated transport actor, matching admitted turn-source identity.
+   * seq is host commit order, never physical row position: retained identities preserve it
+   * across rewrites and branch selection, and new commits never reuse an earlier order. */
+  boundary?: Readonly<{ id: string; reason: "new" | "reset"; actorId: string; seq: number }>;
   /** Every post-reset entry is represented in messages, with no retained prefix or omissions. */
   complete: boolean;
+  /** SHA-256 of UTF-8 JSON.stringify(messages) at dispatch; absent after a message mutation. */
+  messagesDigest?: string;
   /** Canonical post-reset user count, including omitted entries; null when unprovable. */
   turnsSinceBoundary: number | null;
-  /** Admission-receipt identity, present only if it is a user entry on this snapshot's window. */
-  currentEntry?: Readonly<{ id: string; isLastEntry: boolean }>;
+  /** Admission-receipt identity and the same host order, only for a user entry on this window. */
+  currentEntry?: Readonly<{ id: string; isLastEntry: boolean; seq: number }>;
 }>;
 import type {
   PluginAgentTurnPrepareEvent,

@@ -9,6 +9,7 @@ export type SessionResetBoundaryRequest =
       context: "clear";
       reason: Extract<SessionResetBoundaryReason, "new" | "reset">;
       source?: "human-command";
+      actorId?: string;
     }
   | {
       context: "preserve-tail";
@@ -23,6 +24,7 @@ type SessionResetBoundaryEvent = {
   reason: SessionResetBoundaryReason;
   context: "clear" | "preserve-tail";
   source?: "human-command";
+  actorId?: string;
   firstKeptEntryId?: string;
 };
 
@@ -100,7 +102,9 @@ export function buildSessionResetBoundaryEvent(
     timestamp: new Date().toISOString(),
     reason: params.reason,
     context: params.context,
-    ...(params.context === "clear" && params.source ? { source: params.source } : {}),
+    ...(params.context === "clear" && params.source && params.actorId
+      ? { source: params.source, actorId: params.actorId }
+      : {}),
     ...(firstKeptEntryId ? { firstKeptEntryId } : {}),
   };
 }

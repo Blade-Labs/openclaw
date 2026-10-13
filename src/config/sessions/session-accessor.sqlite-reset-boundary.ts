@@ -8,7 +8,7 @@ import type { SessionResetBoundaryWrite } from "./session-accessor.lifecycle-typ
 import { loadTranscriptEventsFromDatabase } from "./session-accessor.sqlite-read.js";
 import type { ResolvedTranscriptScope } from "./session-accessor.sqlite-scope.js";
 import {
-  appendTranscriptEventsInTransaction,
+  appendTranscriptEventInTransaction,
   ensureTranscriptHeader,
 } from "./session-accessor.sqlite-transcript-store.js";
 import { buildSessionResetBoundaryEvent } from "./session-reset-boundary-event.js";
@@ -34,7 +34,9 @@ export function appendSessionResetBoundary(
     }),
     ...boundary,
   });
-  if (appendTranscriptEventsInTransaction(database, scope, [event]) !== 1) {
+  if (
+    !appendTranscriptEventInTransaction(database, scope, event, { allowHumanResetSource: true })
+  ) {
     throw new Error("Failed to append reset boundary for " + scope.sessionKey);
   }
   if (

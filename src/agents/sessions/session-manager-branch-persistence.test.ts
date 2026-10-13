@@ -128,6 +128,33 @@ describe("SessionManager SQLite branch persistence", () => {
     ]);
   });
 
+  it("keeps canonical history order in the resident view before suffix removal", async () => {
+    const dir = tempDirs.make("openclaw-session-manager-");
+    const scope = {
+      agentId: "main",
+      sessionId: "resident-history-order",
+      sessionKey: "agent:main:resident-history-order",
+      storePath: path.join(dir, "sessions.json"),
+    };
+    await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
+    const manager = SessionManager.open(scope, dir);
+    const user = manager.appendMessage({ role: "user", content: "retained", timestamp: 1 });
+    const reset = manager.appendResetBoundary("reset");
+    const next = manager.appendMessage({ role: "user", content: "removed", timestamp: 2 });
+    const committed = await loadTranscriptEvents(scope);
+    for (const id of [user, reset, next]) {
+      expect(manager.getEntry(id)).toEqual(committed.find((event) => event.id === id));
+      expect(manager.getEntry(id)?.historySeq).toEqual(expect.any(Number));
+    }
+    expect(manager.removeTrailingEntries((entry) => entry.id === next || entry.id === reset)).toBe(
+      2,
+    );
+    await expect(loadTranscriptEvents(scope)).resolves.toEqual(
+      committed.filter((event) => event.id !== next && event.id !== reset),
+    );
+    expect(() => manager.prepareTranscriptRewrite()).not.toThrow();
+  });
+
   it("rejects a queued branch when lifecycle ownership changes before persistence", async () => {
     const dir = tempDirs.make("openclaw-session-manager-");
     const storePath = path.join(dir, "sessions.json");

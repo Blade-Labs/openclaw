@@ -7,8 +7,14 @@ import {
   appendTranscriptMessage,
   loadTranscriptEventsSync,
   resolveSessionTranscriptDatabasePath,
+  replaceTranscriptEvents,
+  replaceTranscriptSuffixEventsSync,
+  rewriteTranscriptEventRowsExact,
   upsertSessionEntryCore,
+  resetSessionEntryLifecycle,
 } from "../../config/sessions/session-accessor.js";
+import { loadTranscriptReadSnapshotSync } from "../../config/sessions/session-accessor.sqlite-read.js";
+import type { SessionResetBoundaryRequest } from "../../config/sessions/session-reset-boundary-event.js";
 import { buildSessionResetBoundaryEvent } from "../../config/sessions/session-reset-boundary-event.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import type { PersistedUserTurnMessage } from "../../sessions/user-turn-transcript.types.js";
@@ -78,6 +84,25 @@ async function createSession(messages: string[] = [], agentId = "main") {
     });
   }
   return { target, manager: SessionManager.open(target, dir), params: { sessionTarget: target } };
+}
+
+async function commitReset(
+  target: Awaited<ReturnType<typeof createSession>>["target"],
+  request: SessionResetBoundaryRequest,
+) {
+  await resetSessionEntryLifecycle({
+    agentId: target.agentId,
+    storePath: target.storePath,
+    target: { canonicalKey: target.sessionKey, storeKeys: [target.sessionKey] },
+    resetBoundary: { ...request, cwd: path.dirname(target.storePath) },
+    buildNextEntry: ({ currentEntry }) => ({
+      ...currentEntry!,
+      updatedAt: currentEntry!.updatedAt + 1,
+    }),
+  });
+  return loadTranscriptEventsSync(target).findLast(
+    (event) => (event as { type?: string }).type === "reset",
+  ) as ReturnType<typeof buildSessionResetBoundaryEvent> & { historySeq: number };
 }
 
 describe("CLI prompt hook history evidence", () => {
@@ -190,15 +215,11 @@ describe("CLI prompt hook history evidence", () => {
           ? {
               context: "clear" as const,
               reason: testCase.reason as "new" | "reset",
-              ...("source" in testCase ? { source: testCase.source } : {}),
+              ...("source" in testCase ? { source: testCase.source, actorId: "owner" } : {}),
             }
           : { context: "preserve-tail" as const, reason: testCase.reason as "idle" | "daily" };
-      const reset = buildSessionResetBoundaryEvent({
-        events: loadTranscriptEventsSync(target),
-        ...request,
-      });
+      const reset = await commitReset(target, request);
       resetId = reset.id;
-      await appendTranscriptEvent(target, reset);
     } else if ("legacy" in testCase) {
       await appendTranscriptEvent(target, {
         type: "reset",
@@ -259,10 +280,19 @@ describe("CLI prompt hook history evidence", () => {
     expect(admission).toBeDefined();
     const history = await loadCliSessionHookHistory({ ...params, currentAdmission: admission });
     expect(history.historyEvidence).toEqual({
-      ...(testCase.boundary ? { boundary: { id: resetId, reason: testCase.reason } } : {}),
+      ...(testCase.boundary
+        ? {
+            boundary: {
+              id: resetId,
+              reason: testCase.reason,
+              actorId: "owner",
+              seq: expect.any(Number),
+            },
+          }
+        : {}),
       complete: testCase.complete,
       turnsSinceBoundary: testCase.turns,
-      currentEntry: { id: admission!.entryId, isLastEntry: true },
+      currentEntry: { id: admission!.entryId, isLastEntry: true, seq: expect.any(Number) },
     });
     expect(history.messages.at(-1)).toMatchObject({ role: "user", content: "Hello" });
     if ("extra" in testCase && testCase.extra === "oversized") {
@@ -273,17 +303,165 @@ describe("CLI prompt hook history evidence", () => {
     }
   });
 
-  it("correlates admission rather than identical text, including later entries", async () => {
-    const { target, params } = await createSession();
-    await appendTranscriptEvent(
-      target,
-      buildSessionResetBoundaryEvent({
-        events: loadTranscriptEventsSync(target),
+  it("keeps an earlier branch boundary below the later public turn's durable order", async () => {
+    const { target, params } = await createSession(["root"]);
+    const reset = async () => {
+      const event = await commitReset(target, {
         context: "clear",
         reason: "new",
         source: "human-command",
-      }),
+        actorId: "owner",
+      });
+      return event.id;
+    };
+    const earlyReset = await reset();
+    await appendTranscriptMessage(target, {
+      eventId: "early-turn",
+      message: makeUserMessage("early", 1),
+    });
+    const early = await loadCliSessionHookHistory(params);
+    await reset();
+    const recorder = createUserTurnTranscriptRecorder({
+      target: { ...target, sessionEntry: undefined },
+      input: { text: "later public classification", timestamp: 2 },
+      updateMode: "none",
+    });
+    await recorder.persistApproved();
+    const later = await loadCliSessionHookHistory({
+      ...params,
+      currentAdmission: recorder.getAdmissionReceipt(),
+    });
+    const manager = SessionManager.open(target);
+    await manager.createBranchedSession("early-turn");
+    const branchTarget = { ...target, sessionId: manager.getSessionId() };
+    const selected = await loadCliSessionHookHistory({ sessionTarget: branchTarget });
+    expect(selected.historyEvidence).toMatchObject({
+      complete: true,
+      turnsSinceBoundary: 1,
+      boundary: { id: earlyReset, seq: early.historyEvidence.boundary!.seq },
+    });
+    expect(selected.historyEvidence.boundary!.seq).toBeLessThan(
+      later.historyEvidence.currentEntry!.seq,
     );
+    const fresh = await commitReset(branchTarget, {
+      context: "clear",
+      reason: "new",
+      source: "human-command",
+      actorId: "owner",
+    });
+    expect(fresh.historySeq).toBeGreaterThan(later.historyEvidence.currentEntry!.seq);
+  });
+
+  it("preserves committed order through full, suffix and exact rewrites and rejects copied reset authority", async () => {
+    const { target, params } = await createSession(["root"]);
+    const reset = await commitReset(target, {
+      context: "clear",
+      reason: "new",
+      source: "human-command",
+      actorId: "owner",
+    });
+    await appendTranscriptMessage(target, {
+      eventId: "public",
+      message: makeUserMessage("public", 1),
+    });
+    const before = (await loadCliSessionHookHistory(params)).historyEvidence.boundary!;
+    const snapshot = loadTranscriptReadSnapshotSync(target);
+    const forged = snapshot.events.map((event) => ({ ...(event as object), historySeq: 1 }));
+    await replaceTranscriptEvents(target, forged);
+    expect((await loadCliSessionHookHistory(params)).historyEvidence.boundary).toEqual(before);
+    await appendTranscriptMessage(target, {
+      eventId: "discarded-later-turn",
+      message: makeUserMessage("removed suffix", 2),
+    });
+    const suffix = loadTranscriptEventsSync(target);
+    const discardedOrder = (suffix.at(-1) as { historySeq: number }).historySeq;
+    expect(
+      replaceTranscriptSuffixEventsSync(
+        target,
+        suffix,
+        suffix
+          .slice(0, -1)
+          .map((event, index) => (index === 0 ? event : { ...(event as object), historySeq: 1 })),
+      ),
+    ).toBe(true);
+    expect((await loadCliSessionHookHistory(params)).historyEvidence.boundary).toEqual(before);
+    const exact = loadTranscriptReadSnapshotSync(target);
+    const event = exact.events.find((entry) => (entry as { id?: string }).id === reset.id)!;
+    await rewriteTranscriptEventRowsExact(target, {
+      expectedGeneration: exact.version.generation,
+      rows: [
+        {
+          event: { ...(event as object), historySeq: 1 },
+          expectedEventJson: JSON.stringify(event),
+          seq: exact.events.indexOf(event),
+        },
+      ],
+    });
+    expect((await loadCliSessionHookHistory(params)).historyEvidence.boundary).toEqual(before);
+    const events = loadTranscriptEventsSync(target);
+    await replaceTranscriptEvents(
+      target,
+      events.map((entry) =>
+        (entry as { id?: string }).id === reset.id
+          ? { ...(entry as object), id: "copied-reset", historySeq: Number.MAX_SAFE_INTEGER }
+          : entry,
+      ),
+    );
+    expect((await loadCliSessionHookHistory(params)).historyEvidence).toMatchObject({
+      complete: false,
+    });
+    expect((await loadCliSessionHookHistory(params)).historyEvidence).not.toHaveProperty(
+      "boundary",
+    );
+    const committedReset = event as Record<string, unknown>;
+    await appendTranscriptEvent(target, { ...committedReset, id: "replayed-reset" });
+    expect((await loadCliSessionHookHistory(params)).historyEvidence).not.toHaveProperty(
+      "boundary",
+    );
+    const { historySeq: _historySeq, ...unsequencedCopy } = committedReset;
+    await appendTranscriptEvent(target, { ...unsequencedCopy, id: "unsequenced-copy" });
+    expect((await loadCliSessionHookHistory(params)).historyEvidence).not.toHaveProperty(
+      "boundary",
+    );
+    const freshReset = await commitReset(target, {
+      context: "clear",
+      reason: "new",
+      source: "human-command",
+      actorId: "owner",
+    });
+    expect((await loadCliSessionHookHistory(params)).historyEvidence.boundary!.seq).toBeGreaterThan(
+      discardedOrder,
+    );
+    const fresh = loadTranscriptEventsSync(target);
+    await replaceTranscriptEvents(
+      target,
+      fresh.map((entry) =>
+        (entry as { id?: string }).id === freshReset.id
+          ? { ...(entry as object), context: "preserve-tail" }
+          : entry,
+      ),
+    );
+    await replaceTranscriptEvents(
+      target,
+      loadTranscriptEventsSync(target).map((entry) =>
+        (entry as { id?: string }).id === freshReset.id
+          ? { ...(entry as object), context: "clear" }
+          : entry,
+      ),
+    );
+    expect((await loadCliSessionHookHistory(params)).historyEvidence).not.toHaveProperty(
+      "boundary",
+    );
+  });
+
+  it("correlates admission rather than identical text, including later entries", async () => {
+    const { target, params } = await createSession();
+    await commitReset(target, {
+      context: "clear",
+      reason: "new",
+      source: "human-command",
+      actorId: "owner",
+    });
     const recorder = createUserTurnTranscriptRecorder({
       target: { ...target, sessionEntry: undefined },
       input: { text: "same", timestamp: 1 },

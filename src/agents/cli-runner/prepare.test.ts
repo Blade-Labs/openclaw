@@ -22,13 +22,12 @@ import type { ChannelPlugin } from "../../channels/plugins/types.plugin.js";
 import { getRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import { runWithCliHistoryWriter } from "../../config/sessions/cli-history-boundary.js";
 import {
-  appendTranscriptEvent,
+  resetSessionEntryLifecycle,
   loadSessionEntryReadOnly,
   loadTranscriptEventsSync,
   replaceSessionEntrySync,
   patchSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
-import { buildSessionResetBoundaryEvent } from "../../config/sessions/session-reset-boundary-event.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { LegacyContextEngine } from "../../context-engine/legacy.js";
 import {
@@ -2530,13 +2529,24 @@ describe("prepareCliRunContext", () => {
     "binds CLI history evidence to the prompt hook session (matches=%s)",
     async (matches) => {
       const { sessionTarget } = fixture.session;
-      const reset = buildSessionResetBoundaryEvent({
-        events: loadTranscriptEventsSync(sessionTarget),
-        context: "clear",
-        reason: "new",
-        source: "human-command",
+      await resetSessionEntryLifecycle({
+        agentId: sessionTarget.agentId,
+        storePath: sessionTarget.storePath,
+        target: { canonicalKey: sessionTarget.sessionKey, storeKeys: [sessionTarget.sessionKey] },
+        resetBoundary: {
+          context: "clear",
+          reason: "new",
+          source: "human-command",
+          actorId: "reset-owner",
+        },
+        buildNextEntry: ({ currentEntry }) => ({
+          ...currentEntry!,
+          updatedAt: currentEntry!.updatedAt + 1,
+        }),
       });
-      await appendTranscriptEvent(sessionTarget, reset);
+      const reset = loadTranscriptEventsSync(sessionTarget).findLast(
+        (event) => (event as { type?: string }).type === "reset",
+      ) as { id: string };
       const recorder = createUserTurnTranscriptRecorder({
         target: { ...sessionTarget, sessionEntry: undefined },
         input: { text: "latest ask", timestamp: 1 },
@@ -2558,10 +2568,19 @@ describe("prepareCliRunContext", () => {
       });
       const expected = matches
         ? {
-            boundary: { id: reset.id, reason: "new" },
+            boundary: {
+              id: reset.id,
+              reason: "new",
+              actorId: "reset-owner",
+              seq: expect.any(Number),
+            },
             complete: true,
             turnsSinceBoundary: 1,
-            currentEntry: { id: recorder.getAdmissionReceipt()!.entryId, isLastEntry: true },
+            currentEntry: {
+              id: recorder.getAdmissionReceipt()!.entryId,
+              isLastEntry: true,
+              seq: expect.any(Number),
+            },
           }
         : { complete: false, turnsSinceBoundary: null };
       const [event, ctx] = hookRunner.runBeforePromptBuild.mock.calls[0]!;

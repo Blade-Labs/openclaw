@@ -45,10 +45,14 @@ import { readTranscriptMirrorFacts } from "./session-accessor.sqlite-transcript-
 import { resolveTranscriptEventAppendParent } from "./session-accessor.sqlite-transcript-parent.js";
 import {
   readCommittedTranscriptMessageSequence,
+  rememberCommittedTranscriptHistoryFacts,
   rememberCommittedTranscriptMessageSequencesInTransaction,
 } from "./session-accessor.sqlite-transcript-sequences.js";
 import {
   readTranscriptGenerationInTransaction,
+  advanceTranscriptMutationAtInTransaction,
+  ensureTranscriptSessionRoot,
+  readTranscriptMutationStateInTransaction,
   readTranscriptContextVersionInTransaction,
 } from "./session-accessor.sqlite-transcript-state.js";
 import {
@@ -163,7 +167,19 @@ export async function replaceSessionWithBranchedTranscript(
           updatedAt: Date.now(),
         });
         assertLockedTranscriptWriteAllowed(database, nextResolved, nextScope);
-        replaceSqliteTranscriptEventsInTransaction(database, nextResolved, branch.events);
+        const sourceOrder = readTranscriptMutationStateInTransaction(
+          database,
+          resolved.sessionId,
+        ).updatedAt;
+        ensureTranscriptSessionRoot(database, nextResolved, Date.now());
+        if (sourceOrder !== null) {
+          advanceTranscriptMutationAtInTransaction(database, nextResolved.sessionId, sourceOrder, {
+            strictly: true,
+          });
+        }
+        replaceSqliteTranscriptEventsInTransaction(database, nextResolved, branch.events, {
+          historySourceSessionId: resolved.sessionId,
+        });
         assertActive?.();
         return {
           publish: prepareSessionIdentityPublication(
@@ -379,11 +395,26 @@ export function appendTranscriptEventSnapshotSync(
         event,
         options,
       );
-      if (
-        appendTranscriptEventInTransaction(database, resolved, resolvedEvent, projection) === false
-      ) {
+      const canonical = appendTranscriptEventInTransaction(
+        database,
+        resolved,
+        resolvedEvent,
+        projection,
+      );
+      if (canonical === false) {
         return { appended: false };
       }
+      const historyFacts =
+        resolvedEvent &&
+        typeof resolvedEvent === "object" &&
+        "type" in resolvedEvent &&
+        resolvedEvent.type === "reset"
+          ? (JSON.parse(canonical) as {
+              historySeq?: number;
+              source?: "human-command";
+              actorId?: string;
+            })
+          : {};
       if (
         resolvedEvent &&
         typeof resolvedEvent === "object" &&
@@ -391,9 +422,12 @@ export function appendTranscriptEventSnapshotSync(
         "parentId" in resolvedEvent &&
         (resolvedEvent.parentId === null || typeof resolvedEvent.parentId === "string")
       ) {
-        return { appended: true, effectiveParentId: resolvedEvent.parentId };
+        return rememberCommittedTranscriptHistoryFacts(
+          { appended: true as const, effectiveParentId: resolvedEvent.parentId },
+          historyFacts,
+        );
       }
-      return { appended: true };
+      return rememberCommittedTranscriptHistoryFacts({ appended: true as const }, historyFacts);
     },
     options.beforeCommitInTransaction,
     options.expectedMutationAt,

@@ -6,6 +6,7 @@ import type { SessionTranscriptContextVersion } from "../../config/sessions/sess
 import { publishCommittedSessionIdentity } from "../../config/sessions/session-accessor.sqlite-identity.js";
 import { requireTranscriptEventAppendSnapshot } from "../../config/sessions/session-accessor.sqlite-transcript-append-result.js";
 import type { PreparedTranscriptMessageAppend } from "../../config/sessions/session-accessor.sqlite-transcript-message-append.js";
+import { readCommittedTranscriptHistoryFacts } from "../../config/sessions/session-accessor.sqlite-transcript-sequences.js";
 import {
   appendTranscriptEventSnapshotSync,
   appendTranscriptMessageSnapshotSync,
@@ -419,6 +420,15 @@ export class SessionManagerPersistence extends SessionManagerCore {
         outcome,
         `Session transcript entry was not persisted: ${entry.id}`,
       );
+      const historyFacts = readCommittedTranscriptHistoryFacts(committed.result);
+      if (historyFacts) {
+        delete entry.historySeq;
+        Object.assign(entry, historyFacts);
+        if (entry.type === "reset") {
+          if (historyFacts.source === undefined) delete entry.source;
+          if (historyFacts.actorId === undefined) delete entry.actorId;
+        }
+      }
       const effectiveParentId =
         committed.result.effectiveParentId !== undefined
           ? committed.result.effectiveParentId
@@ -468,6 +478,8 @@ export class SessionManagerPersistence extends SessionManagerCore {
     }
     // Carry the canonical storage bytes even when adopting a context-excluded row.
     entry.message = result.message;
+    delete entry.historySeq;
+    Object.assign(entry, readCommittedTranscriptHistoryFacts(result));
     if (result.messageId !== entry.id) {
       const idempotencyKey =
         entry.message.role === "user" &&

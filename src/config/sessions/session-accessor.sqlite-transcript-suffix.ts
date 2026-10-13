@@ -19,6 +19,8 @@ import {
 } from "./session-accessor.sqlite-transcript-state.js";
 import {
   canonicalizeTranscriptEventMedia,
+  preserveTranscriptHistoryFacts,
+  readTranscriptHistoryFacts,
   insertTranscriptRowsWithoutProjectionInTransaction,
   scheduleTranscriptProjectionReconcile,
 } from "./session-accessor.sqlite-transcript-store.js";
@@ -491,6 +493,9 @@ export function replaceSqliteTranscriptSuffixInTransaction(
     }),
   );
 
+  const originalEvents = readTranscriptHistoryFacts(database, resolved.sessionId, {
+    afterSeq: plan.startSeq - 1,
+  });
   const stagedData = stageRetainedTranscriptData(
     database,
     resolved.sessionId,
@@ -529,7 +534,16 @@ export function replaceSqliteTranscriptSuffixInTransaction(
         createdAt: number;
         storedEventSeq?: number;
         messageIdempotencyKey?: string;
-      } = { event, seq, createdAt };
+      } = {
+        event: preserveTranscriptHistoryFacts(
+          database,
+          resolved.sessionId,
+          event,
+          originalEvents.get(eventId ?? ""),
+        ),
+        seq,
+        createdAt,
+      };
       if (storedEventSeq !== undefined) {
         row.storedEventSeq = storedEventSeq;
       }

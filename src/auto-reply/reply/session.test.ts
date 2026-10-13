@@ -5,16 +5,29 @@ import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  markMSTeamsAuthenticatedActivity,
+  markMSTeamsReplayedActivity,
+} from "../../../extensions/msteams/src/inbound.js";
+import {
+  resolveMSTeamsActorKind,
+  resolveMSTeamsInboundInputProvenance,
+} from "../../../extensions/msteams/src/monitor-handler/input-provenance.js";
 import * as mcpFixture from "../../agents/agent-bundle-mcp-manager.test-support.js";
 import { testing as sessionMcpTesting } from "../../agents/agent-bundle-mcp-runtime.js";
 import * as bootstrapCache from "../../agents/bootstrap-cache.js";
-import { loadCliSessionHistoryMessages } from "../../agents/cli-runner/session-history.js";
+import {
+  loadCliSessionHistoryMessages,
+  loadCliSessionHookHistory,
+} from "../../agents/cli-runner/session-history.js";
 import {
   clearEmbeddedSessionPromptStates,
   getEmbeddedSessionPromptState,
 } from "../../agents/embedded-agent-runner/session-prompt-state.js";
 import { resolveSandboxRuntimeStatus } from "../../agents/sandbox/runtime-status.js";
 import { buildChannelInboundEventContext } from "../../channels/inbound-event/context.js";
+import { createHostChannelInboundEventContextBuilder } from "../../channels/inbound-event/host-context-builder.js";
+import { createHostChannelIngressRuntime } from "../../channels/message-access/runtime.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import type { InternalSessionEntry as SessionEntry } from "../../config/sessions.js";
 import {
@@ -26,6 +39,12 @@ import {
   upsertSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
 import { runExclusiveSessionStoreWrite } from "../../config/sessions/store-writer.js";
+import { prepareChatSendUserTurn } from "../../gateway/server-methods/chat-send-user-turn.js";
+import {
+  createAttachments,
+  createClientInfo,
+  createUserTurnInputController,
+} from "../../gateway/server-methods/chat-send-user-turn.test-support.js";
 import { formatZonedTimestamp } from "../../infra/format-time/format-datetime.ts";
 import {
   testing as sessionBindingTesting,
@@ -38,6 +57,7 @@ import {
   peekSystemEvents,
   resetSystemEventsForTest,
 } from "../../infra/system-events.js";
+import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../../plugins/runtime.js";
 import { resolveAgentRoute } from "../../routing/resolve-route.js";
 import { MODEL_SELECTION_LOCKED_RESET_MESSAGE } from "../../sessions/model-overrides.js";
@@ -80,6 +100,49 @@ import {
   runExplicitResetCases,
   writeSessionStore as writeSessionStoreFast,
 } from "./test/session.test-support.js";
+
+async function admittedResetContext(
+  ctx: Record<string, unknown>,
+  actorKind: "human" | "bot" | "unknown" = "human",
+) {
+  const channel = String(ctx.Provider);
+  const sessionKey = String(ctx.SessionKey);
+  const senderId = String(ctx.SenderId ?? "reset-owner");
+  const owner = { channelId: channel, isLive: () => true };
+  const channelIngress = await createHostChannelIngressRuntime(owner).resolveStable({
+    channelId: channel,
+    accountId: "default",
+    source: { actorKind, eventKind: "message" },
+    identity: { authentication: "verified" },
+    subject: { stableId: senderId, authentication: { stableId: "verified" } },
+    conversation: { kind: "direct", id: "reset-dm" },
+    contextBinding: {
+      agentId: "main",
+      sessionKey,
+      messageId: "reset-command",
+      inboundEventKind: "user_request",
+    },
+    dmPolicy: "allowlist",
+    groupPolicy: "allowlist",
+    allowFrom: [senderId],
+  });
+  return await createHostChannelInboundEventContextBuilder(
+    buildChannelInboundEventContext,
+    owner,
+  )({
+    channel,
+    accountId: "default",
+    messageId: "reset-command",
+    from: String(ctx.From),
+    sender: { id: senderId },
+    conversation: { kind: "direct", id: "reset-dm" },
+    route: { agentId: "main", routeSessionKey: sessionKey },
+    reply: { to: String(ctx.To) },
+    message: { rawBody: String(ctx.RawBody) },
+    channelIngress,
+    extra: ctx,
+  });
+}
 
 const sessionForkMocks = vi.hoisted(() => ({
   forkSessionFromParent: vi.fn(),
@@ -3772,8 +3835,8 @@ describe("initSessionState reset authorization", () => {
             type: "reset",
             reason: body.slice(1),
             context: "clear",
-            source: "human-command",
           });
+          expect.soft(resets[0]).not.toHaveProperty("source");
         }
         expect.soft(acknowledgement?.shouldContinue).toBe(false);
         if (allowed) {
@@ -4463,6 +4526,122 @@ describe("initSessionState preserves behavior overrides across /new and /reset",
     expect(result.isNewSession).toBe(false);
     expect(result.sessionId).toBe(existingSessionId);
   });
+  it.each([
+    "human",
+    "bot",
+    "replay",
+    "recovered",
+    "gateway chat.send",
+    "unknown provenance",
+    "system",
+  ])("classifies reset history evidence for %s transport input", async (scenario) => {
+    const storePath = await createStorePath("openclaw-reset-evidence-negative-");
+    const sessionKey = "agent:main:msteams:dm:reset-owner";
+    const sessionId = "reset-evidence-session";
+    await seedSessionStoreWithOverrides({ storePath, sessionKey, sessionId, overrides: {} });
+    const cfg = { session: { store: storePath, idleMinutes: 999 } } as OpenClawConfig;
+    const rawCtx = {
+      Body: "/new",
+      RawBody: "/new",
+      CommandBody: "/new",
+      From: "msteams:reset-owner",
+      To: "user:reset-owner",
+      SenderId: "40a1a0ed-4ff2-4164-a219-55518990c197",
+      ChatType: "direct",
+      SessionKey: sessionKey,
+      Provider: "msteams",
+      Surface: "msteams",
+      CommandAuthorized: true,
+      ...(scenario === "gateway chat.send"
+        ? {
+            Provider: "webchat",
+            GatewayClientScopes: ["operator.admin"],
+            InputProvenance: { kind: "external_user", sourceChannel: "webchat" },
+          }
+        : {}),
+      ...(scenario === "recovered" ? { InputProvenance: { kind: "internal_system" } } : {}),
+      ...(scenario === "system" ? { InternalTurnSource: "exec" } : {}),
+    };
+    const activity = {
+      type: "message" as const,
+      id: "reset-command",
+      text: "/new",
+      channelId: "msteams",
+      from: {
+        id: "29:reset-owner",
+        aadObjectId: "40a1a0ed-4ff2-4164-a219-55518990c197",
+        ...(scenario === "bot" ? { role: "bot" as const } : {}),
+      },
+      recipient: { id: "28:bot" },
+      conversation: { id: "reset-dm", conversationType: "personal" },
+    };
+    if (scenario === "replay") {
+      markMSTeamsReplayedActivity(activity);
+    }
+    if (scenario !== "unknown provenance") {
+      markMSTeamsAuthenticatedActivity(activity);
+    }
+    const inputProvenance = resolveMSTeamsInboundInputProvenance({
+      activity,
+      isDirectMessage: true,
+      senderAdmitted: true,
+    });
+    const ctx =
+      scenario === "gateway chat.send"
+        ? prepareChatSendUserTurn({
+            request: {
+              inboundMessage: "/new",
+              clientInfo: createClientInfo(),
+              suppressCommandInterpretation: false,
+              systemInputProvenance: undefined,
+              systemProvenanceReceipt: undefined,
+            },
+            session: { agentId: "main", clientRunId: "automated-reset", sessionKey, cfg },
+            admission: {
+              originatingRoute: { originatingChannel: "webchat", explicitDeliverRoute: false },
+            },
+            attachments: createAttachments({ parsedMessage: "/new" }),
+            client: {
+              connect: {
+                minProtocol: 1,
+                maxProtocol: 1,
+                client: createClientInfo(),
+                scopes: ["operator.admin"],
+              },
+            },
+            logGateway: createSubsystemLogger("test/reset-evidence"),
+            userTurn: createUserTurnInputController("/new").controller,
+          }).ctx
+        : scenario === "recovered"
+          ? rawCtx
+          : await admittedResetContext(
+              { ...rawCtx, InputProvenance: inputProvenance },
+              resolveMSTeamsActorKind(activity),
+            );
+    const result = await initSessionState({ ctx, cfg });
+    const resets = (
+      await loadTranscriptEvents({ agentId: "main", storePath, sessionKey, sessionId })
+    ).filter((event) => isRecord(event) && event.type === "reset");
+    expect(result.resetTriggered).toBe(true);
+    expect(resets).toHaveLength(1);
+    const evidence = (
+      await loadCliSessionHookHistory({
+        sessionTarget: { agentId: "main", storePath, sessionKey, sessionId },
+      })
+    ).historyEvidence;
+    if (scenario === "human") {
+      expect(resets[0]).toMatchObject({ source: "human-command", actorId: rawCtx.SenderId });
+      expect(evidence.boundary).toMatchObject({
+        actorId: rawCtx.SenderId,
+        seq: expect.any(Number),
+      });
+    } else {
+      expect(resets[0]).not.toHaveProperty("source");
+      expect(resets[0]).not.toHaveProperty("actorId");
+      expect(evidence).not.toHaveProperty("boundary");
+    }
+  });
+
   it.each(["/new", "/reset"] as const)(
     "retains the transcript but clears prior context on %s",
     async (command) => {
@@ -4490,7 +4669,9 @@ describe("initSessionState preserves behavior overrides across /new and /reset",
       } as OpenClawConfig;
 
       const result = await initSessionState({
-        ctx: {
+        ctx: await admittedResetContext({
+          InputProvenance: { kind: "external_user", sourceChannel: "telegram" },
+          SenderId: "reset-owner",
           Body: command,
           RawBody: command,
           CommandBody: command,
@@ -4500,7 +4681,7 @@ describe("initSessionState preserves behavior overrides across /new and /reset",
           SessionKey: sessionKey,
           Provider: "telegram",
           Surface: "telegram",
-        },
+        }),
         cfg,
       });
 
@@ -4515,8 +4696,25 @@ describe("initSessionState preserves behavior overrides across /new and /reset",
       });
       expect(events.map((event) => (event as { type?: unknown }).type)).toContain("reset");
       const resetEvent = events.findLast((event) => (event as { type?: unknown }).type === "reset");
-      expect(resetEvent).toMatchObject({ reason: slug, context: "clear", source: "human-command" });
+      expect(resetEvent).toMatchObject({
+        reason: slug,
+        context: "clear",
+        source: "human-command",
+        actorId: "reset-owner",
+        historySeq: expect.any(Number),
+      });
       expect(resetEvent).not.toHaveProperty("firstKeptEntryId");
+      expect(
+        (
+          await loadCliSessionHookHistory({
+            sessionTarget: { agentId: "main", storePath, sessionKey, sessionId: existingSessionId },
+          })
+        ).historyEvidence.boundary,
+      ).toMatchObject({
+        id: (resetEvent as { id: string }).id,
+        actorId: "reset-owner",
+        seq: expect.any(Number),
+      });
       const archived = (await fs.readdir(path.dirname(storePath))).filter((entry) =>
         entry.startsWith(`${existingSessionId}.jsonl.reset.`),
       );

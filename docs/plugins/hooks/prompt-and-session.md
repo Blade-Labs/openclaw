@@ -78,10 +78,15 @@ bound to the hook context's `agentId`, `sessionKey`, `sessionId`, and `runId`.
 It describes the same committed canonical transcript snapshot as `messages`,
 before message projection and the 100-message / 5 MiB limits:
 
-- `boundary?: { id, reason }` identifies the latest persisted reset only when
+- `boundary?: { id, reason, actorId, seq }` identifies the latest persisted reset only when
   it records `context: "clear"`, `source: "human-command"`, and reason `new`
   or `reset`, with no retained anchor. The reset lifecycle writer records the
-  command source for authorized human `/new` and hard `/reset` commands.
+  command source only for authorized `/new` and hard `/reset` commands with
+  affirmative external-user provenance and a live transport-admitted human actor.
+  `actorId` is that authenticated sender's opaque ID, identical to
+  `source.inputs[].actor.senderId` seen by turn policy. Missing/unknown provenance,
+  bots, journal replays, recovered commands, system events, and Gateway `chat.send`
+  never establish this human command source.
   Soft reset does not append a transcript boundary. Automatic resets,
   idle/daily rollovers, restarts, compaction, and legacy events lacking these
   explicit facts cannot supply a boundary.
@@ -89,15 +94,30 @@ before message projection and the 100-message / 5 MiB limits:
   post-reset entry is represented in `messages`, with no budget omissions or
   retained prefix. Compaction, saved notes, and any other non-message records
   make it false, even if all projected messages fit the limits.
+- `messagesDigest?: string` is the SHA-256 digest of UTF-8 `JSON.stringify(messages)`
+  for the canonical projected messages delivered by hook dispatch. Consumers can
+  compare their message view to this digest. Dispatch computes it from the host
+  snapshot; caller-provided digests are replaced, and mutated views lose the digest.
 - `turnsSinceBoundary` counts all canonical post-reset user entries in host
   order, including oversized or count-limited entries. Without a reset, it
   counts from the beginning of the active path. `null` means the canonical
   count could not be established.
-- `currentEntry?: { id, isLastEntry }` correlates the persisted admission
+- `currentEntry?: { id, seq, isLastEntry }` correlates the persisted admission
   receipt to a post-reset user entry on that snapshot. `isLastEntry` compares
   it to the canonical leaf, including non-message entries. Equal text or
   timestamps do not establish this correlation. Without a valid persisted
-  admission, the field is absent.
+  admission or durable host order, the field is absent.
+
+`boundary.seq` and `currentEntry.seq` are comparable safe integer host event
+orders within the same native session lineage. They are allocated from the
+existing durable session mutation counter, not provider timestamps, active
+positions, or physical row numbers. A new ordered event always receives a
+larger value; deleted values are never reused. Full, suffix, and exact rewrites
+preserve committed order for retained identities and do not lower the allocator.
+A same-session leaf selection cannot cross the latest reset fence. Creating a
+new native session from an earlier branch preserves its original, lower event
+orders and inherits the source counter; an old reset does not become fresh.
+Legacy entries without host order cannot supply affirmative evidence.
 
 Caller-owned CLI session-manager views and missing transcript targets cannot
 certify committed history; they receive `complete: false`, no boundary or
@@ -106,11 +126,17 @@ the transcript target does not match the hook context's agent and session.
 The embedded runner and other harnesses omit `historyEvidence`. Absence is
 no evidence, never an empty or complete transcript. Evidence and its nested
 fields remain read-only through ordinary and authorized prompt-hook dispatch;
-message projection and budgets keep their existing behavior.
+message projection and budgets keep their existing behavior. Each dispatch keeps
+an isolated canonical message snapshot. If an earlier handler changes the shared
+message array or a nested message, later handlers receive only
+`{ complete: false, turnsSinceBoundary: null }`, without boundary or current-entry
+facts. That refusal remains latched for the rest of the dispatch.
 
 This envelope grants no authority. Plugins must still verify the current
-human, conversation, and run through existing admission contracts. A fresh
-generation rule must require complete history, the expected turn count and
+human, conversation, and run through existing admission contracts, match
+`boundary.actorId` to the admitted current owner, and require `boundary.seq` to be
+strictly greater than the stored host order of the last public classification.
+A fresh generation rule must require complete history, the expected turn count and
 current-entry correlation, and consume the boundary ID atomically with its
 generation record. Persist consumption so replay or restart cannot reuse an
 old reset. Do not qualify a singleton message from text equality alone.

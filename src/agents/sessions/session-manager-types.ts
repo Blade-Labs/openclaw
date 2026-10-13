@@ -21,6 +21,8 @@ export interface SessionEntryBase {
   id: string;
   parentId: string | null;
   timestamp: string;
+  /** Durable host order retained across transcript rewrites. */
+  historySeq?: number;
   /** This row consumes the raw side cursor instead of the visible leaf. */
   appendMode?: "side";
 }
@@ -62,6 +64,7 @@ export interface ResetEntry extends SessionEntryBase {
   reason: ResetReason;
   context?: "clear" | "preserve-tail";
   source?: "human-command";
+  actorId?: string;
   firstKeptEntryId?: string;
 }
 

@@ -10,10 +10,10 @@ describe("before_prompt_build reentrancy", () => {
     "preserves trusted evidence presence=%s across modifying plugins",
     async (present) => {
       const historyEvidence = {
-        boundary: { id: "committed-reset", reason: "new" as const },
+        boundary: { id: "committed-reset", reason: "new" as const, actorId: "owner", seq: 1 },
         complete: false,
         turnsSinceBoundary: 2,
-        currentEntry: { id: "current", isLastEntry: true },
+        currentEntry: { id: "current", isLastEntry: true, seq: 2 },
       };
       const observer = vi.fn((_event: PluginHookBeforePromptBuildEvent) => ({}));
       const mutations: boolean[] = [];
@@ -55,11 +55,64 @@ describe("before_prompt_build reentrancy", () => {
       const event = observer.mock.calls[0]![0];
       if (present) {
         expect(mutations).toEqual([false, false, false, false, false]);
-        expect(event.historyEvidence).toEqual(historyEvidence);
+        expect(event.historyEvidence).toEqual({ complete: false, turnsSinceBoundary: null });
       } else {
         expect(event).not.toHaveProperty("historyEvidence");
       }
       expect(event.messages).toEqual(["shared message mutation"]);
+    },
+  );
+  it.each(["remove", "nested edit"])(
+    "drops affirmative evidence after an earlier hook changes messages: %s",
+    async (mutation) => {
+      const evidence = {
+        boundary: { id: "reset", reason: "new" as const, actorId: "owner", seq: 1 },
+        complete: true,
+        messagesDigest: "caller-forged-digest",
+        turnsSinceBoundary: 1,
+        currentEntry: { id: "current", isLastEntry: true, seq: 2 },
+      };
+      const observed: PluginHookBeforePromptBuildEvent[] = [];
+      const originalMessages = [{ role: "user", content: [{ type: "text", text: "ask" }] }];
+      const runner = createHookRunner(
+        createMockPluginRegistry([
+          {
+            hookName: "before_prompt_build",
+            pluginId: "mutator",
+            priority: 10,
+            handler: (...args: unknown[]) => {
+              const event = args[0] as PluginHookBeforePromptBuildEvent;
+              observed.push(structuredClone(event));
+              if (mutation === "remove") {
+                event.messages.splice(0, 1);
+              } else {
+                (event.messages[0] as (typeof originalMessages)[0]).content[0]!.text = "changed";
+              }
+              return {};
+            },
+          },
+          {
+            hookName: "before_prompt_build",
+            pluginId: "observer",
+            handler: (...args: unknown[]) => {
+              observed.push(structuredClone(args[0] as PluginHookBeforePromptBuildEvent));
+              return {};
+            },
+          },
+        ]),
+      );
+      await runner.runBeforePromptBuild(
+        { prompt: "ask", messages: originalMessages, historyEvidence: evidence },
+        TEST_PLUGIN_AGENT_CTX,
+      );
+      expect(observed).toHaveLength(2);
+      expect(observed[0]?.historyEvidence).toEqual({
+        ...evidence,
+        messagesDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+      });
+      expect(observed[1]?.historyEvidence).toEqual({ complete: false, turnsSinceBoundary: null });
+      expect(originalMessages[0]?.content[0]?.text).toBe("ask");
+      expect(originalMessages).toHaveLength(1);
     },
   );
   it("runs each handler once when a handler starts a nested prompt build", async () => {

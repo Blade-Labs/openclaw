@@ -114,6 +114,10 @@ function readHookHistoryEvidence(
             eb.fn<unknown>("json_extract", [canonicalEvent, eb.val("$.context")]).as("context"),
             eb.fn<unknown>("json_extract", [canonicalEvent, eb.val("$.source")]).as("source"),
             eb.fn<unknown>("json_extract", [canonicalEvent, eb.val("$.reason")]).as("reason"),
+            eb.fn<unknown>("json_extract", [canonicalEvent, eb.val("$.actorId")]).as("actorId"),
+            eb
+              .fn<unknown>("json_extract", [canonicalEvent, eb.val("$.historySeq")])
+              .as("historySeq"),
             eb
               .fn<unknown>("json_extract", [canonicalEvent, eb.val("$.firstKeptEntryId")])
               .as("firstKeptEntryId"),
@@ -126,9 +130,18 @@ function readHookHistoryEvidence(
     typeof boundary.id === "string" &&
     boundary.context === "clear" &&
     boundary.source === "human-command" &&
+    typeof boundary.actorId === "string" &&
+    boundary.actorId.length > 0 &&
+    typeof boundary.historySeq === "number" &&
+    Number.isSafeInteger(boundary.historySeq) &&
     boundary.firstKeptEntryId === null &&
     (boundary.reason === "new" || boundary.reason === "reset")
-      ? { id: boundary.id, reason: boundary.reason }
+      ? {
+          id: boundary.id,
+          reason: boundary.reason,
+          actorId: boundary.actorId,
+          seq: boundary.historySeq,
+        }
       : undefined;
   const admission = resolveSqliteSessionTranscriptReadFence({
     database: projection.database,
@@ -153,6 +166,12 @@ function readHookHistoryEvidence(
         eb
           .fn<unknown>("json_extract", [
             transcriptEventNavigationSql("event"),
+            eb.val("$.historySeq"),
+          ])
+          .as("historySeq"),
+        eb
+          .fn<unknown>("json_extract", [
+            transcriptEventNavigationSql("event"),
             eb.val("$.message.role"),
           ])
           .as("role"),
@@ -164,9 +183,14 @@ function readHookHistoryEvidence(
     messagesOnly &&= row.type === "message";
     if (row.type === "message" && row.role === "user") {
       turnsSinceBoundary++;
-      if (admission?.entryId === row.id) {
+      if (
+        admission?.entryId === row.id &&
+        typeof row.historySeq === "number" &&
+        Number.isSafeInteger(row.historySeq)
+      ) {
         currentEntry = {
           id: admission.entryId,
+          seq: row.historySeq,
           isLastEntry: projection.state.leafEventId === row.id,
         };
       }

@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { clampPositiveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
 import { isPromiseLike } from "@openclaw/normalization-core/promise-like";
 import { createToolPolicyMatcher } from "../agents/tool-policy-match.js";
@@ -794,10 +795,24 @@ export function createHookRunner(
             messages: projectModelContextMessages(event.messages),
           })
         : event;
-    const historyEvidence =
+    let historyEvidence =
       hookName === "before_prompt_build" && "historyEvidence" in dispatchEvent
         ? deepFreezeHookValue(dispatchEvent.historyEvidence)
         : undefined;
+
+    const canonicalMessages =
+      historyEvidence !== undefined && "messages" in dispatchEvent
+        ? cloneHookIsolationValue(hookName, dispatchEvent.messages)
+        : undefined;
+
+    if (historyEvidence !== undefined && canonicalMessages !== undefined) {
+      historyEvidence = deepFreezeHookValue({
+        ...historyEvidence,
+        messagesDigest: createHash("sha256")
+          .update(JSON.stringify(canonicalMessages))
+          .digest("hex"),
+      });
+    }
 
     logger?.debug?.(`[hooks] running ${hookName} (${selectedHooks.length} handlers, sequential)`);
 
@@ -813,13 +828,20 @@ export function createHookRunner(
           : policy.isolateEventPerHandler
             ? cloneHookIsolationValue(hookName, dispatchEvent)
             : dispatchEvent;
-        // Isolation clones thaw descriptors. Preserve host evidence across handlers,
-        // including original absence, while messages keep their shared mutable array.
+        // Evidence describes the canonical message snapshot. Once any preceding handler
+        // changes it, later consumers receive unknown facts, even if another restores it.
         const handlerEvent =
-          hookName === "before_prompt_build" && historyEvidence === undefined
-            ? { ...selectedEvent }
-            : selectedEvent;
+          hookName === "before_prompt_build" ? { ...selectedEvent } : selectedEvent;
         if (hookName === "before_prompt_build") {
+          if (
+            historyEvidence !== undefined &&
+            !(
+              "messages" in handlerEvent &&
+              isDeepStrictEqual(handlerEvent.messages, canonicalMessages)
+            )
+          ) {
+            historyEvidence = deepFreezeHookValue({ complete: false, turnsSinceBoundary: null });
+          }
           if (historyEvidence === undefined) {
             Reflect.deleteProperty(handlerEvent, "historyEvidence");
           } else {

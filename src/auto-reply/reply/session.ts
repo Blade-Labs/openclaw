@@ -12,6 +12,8 @@ import { resetRegisteredAgentHarnessSessions } from "../../agents/harness/regist
 import { cleanupBrowserSessionsForLifecycleEnd } from "../../browser-lifecycle-cleanup.js";
 import { normalizeChatType } from "../../channels/chat-type.js";
 import { readConversationBindingRouteFacts } from "../../channels/conversation-binding-route-facts.js";
+import { readChannelContextApprovalActor } from "../../channels/message-access/admission-evidence.js";
+import { readAdmittedChannelApprovalActor } from "../../channels/message-access/approval-actor.js";
 import { resolveSessionParentSessionKey } from "../../channels/plugins/session-conversation.js";
 import { conversationRouteContextFromMsgContext } from "../../config/sessions/conversation-route-context.js";
 import { resolveGroupSessionKey } from "../../config/sessions/group.js";
@@ -1035,17 +1037,25 @@ async function initSessionStateAttemptLocked(
     previousSessionEndReason === "idle" || previousSessionEndReason === "daily"
       ? previousSessionEndReason
       : "reset";
+  const resetActorCarrier =
+    resetTriggered &&
+    !isSystemEvent &&
+    !ctx.InternalTurnSource &&
+    ctx.InputProvenance?.kind === "external_user" &&
+    (matchedResetTriggerLower === "/new" || matchedResetTriggerLower === "/reset")
+      ? readChannelContextApprovalActor(ctx)
+      : undefined;
+  const resetActor = resetActorCarrier
+    ? readAdmittedChannelApprovalActor(resetActorCarrier)
+    : undefined;
+  const humanResetActor = resetActor?.actor.actorKind === "human" ? resetActor : undefined;
   const resetBoundary: SessionResetBoundaryRequest | undefined = previousSessionEntry
     ? resetTriggered
       ? {
           context: "clear",
           reason: resolveExplicitSessionEndReason(matchedResetTriggerLower),
-          ...(!isSystemEvent &&
-          ctx.SenderIsBot !== true &&
-          classifySessionStateActor({ inputProvenance: ctx.InputProvenance }).actorType ===
-            "human" &&
-          (matchedResetTriggerLower === "/new" || matchedResetTriggerLower === "/reset")
-            ? { source: "human-command" as const }
+          ...(humanResetActor
+            ? { source: "human-command" as const, actorId: humanResetActor.actor.senderId }
             : {}),
         }
       : { context: "preserve-tail", reason: continuityReason }
@@ -1054,12 +1064,13 @@ async function initSessionStateAttemptLocked(
   let previousSessionMemory: SessionMemoryTranscript | undefined;
   let previousSessionResetMessages: unknown[] | undefined;
   const committed = await commitReplySessionInitialization({
-    commitGuard: !entry
-      ? () => {
-          params.signal?.throwIfAborted();
-          assertPreparedSkillLibrarySelection(ctx.SessionCreation?.skillLibrarySelections);
-        }
-      : undefined,
+    commitGuard: () => {
+      params.signal?.throwIfAborted();
+      humanResetActor?.assertCurrent();
+      if (!entry) {
+        assertPreparedSkillLibrarySelection(ctx.SessionCreation?.skillLibrarySelections);
+      }
+    },
     activeSessionKey: sessionKey,
     agentId,
     archivePreviousTranscript: false,

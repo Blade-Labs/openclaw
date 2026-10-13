@@ -22,6 +22,7 @@ import {
 } from "./session-accessor.sqlite-scope.js";
 import { appendTranscriptMessageInTransaction } from "./session-accessor.sqlite-transcript-message-append.js";
 import { resolveTranscriptMessageAppendParent } from "./session-accessor.sqlite-transcript-parent.js";
+import { readCommittedTranscriptHistoryFacts } from "./session-accessor.sqlite-transcript-sequences.js";
 import { readTranscriptContextVersionInTransaction } from "./session-accessor.sqlite-transcript-state.js";
 import {
   appendTranscriptEventInTransaction,
@@ -146,8 +147,19 @@ export function prepareTranscriptRewriteSync(
             throw new Error("Transcript rewrite message was not appended");
           }
           entry.message = result.message;
-        } else if (!appendTranscriptEventInTransaction(current, resolved, entry)) {
-          throw new Error("Transcript rewrite entry was not appended");
+          delete entry.historySeq;
+          Object.assign(entry, readCommittedTranscriptHistoryFacts(result));
+        } else {
+          const canonical = appendTranscriptEventInTransaction(current, resolved, entry);
+          if (!canonical) {
+            throw new Error("Transcript rewrite entry was not appended");
+          }
+          if (entry.type === "reset") {
+            // Replayed resets adopt the writer's order and stripped human provenance.
+            delete entry.source;
+            delete entry.actorId;
+            Object.assign(entry, JSON.parse(canonical));
+          }
         }
       }
       assertActive();

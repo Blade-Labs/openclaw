@@ -50,6 +50,7 @@ const TRANSCRIPT_NAVIGATION_KEYS = [
   "type",
   "id",
   "parentId",
+  "historySeq",
   "targetId",
   "appendParentId",
   "appendMode",

@@ -61,14 +61,108 @@ import {
   createTranscriptPayloadUpdater,
   prepareTranscriptPayload,
   transcriptEventJsonSql,
+  transcriptEventNavigationSql,
   type PreparedTranscriptPayload,
 } from "./transcript-payload.js";
+
+/** Read only envelope facts; retained message bodies stay in their canonical storage. */
+export function readTranscriptHistoryFacts(
+  database: OpenClawAgentDatabase,
+  sessionId: string,
+  options: { afterSeq?: number; seqs?: readonly number[] } = {},
+): Map<string, TranscriptEvent> {
+  const db = getSessionKysely(database.db);
+  const navigation = transcriptEventNavigationSql();
+  const canonical = transcriptEventJsonSql(database.db);
+  const rows = executeSqliteQuerySync(
+    database.db,
+    db
+      .selectFrom("transcript_events")
+      .select((eb) => [
+        ...(["id", "type", "historySeq"] as const).map((field) =>
+          eb.fn<unknown>("json_extract", [navigation, eb.val(`$.${field}`)]).as(field),
+        ),
+        ...(["source", "actorId", "reason", "context", "firstKeptEntryId"] as const).map((field) =>
+          eb
+            .case()
+            .when(eb.fn<unknown>("json_extract", [navigation, eb.val("$.type")]), "=", "reset")
+            .then(eb.fn<unknown>("json_extract", [canonical, eb.val(`$.${field}`)]))
+            .else(null)
+            .end()
+            .as(field),
+        ),
+      ])
+      .where("session_id", "=", sessionId)
+      .$if(options.afterSeq !== undefined, (query) => query.where("seq", ">", options.afterSeq!))
+      .$if(options.seqs !== undefined, (query) => query.where("seq", "in", [...options.seqs!])),
+  ).rows;
+  return new Map(
+    rows.flatMap((row) => (typeof row.id === "string" ? [[row.id, row] as const] : [])),
+  );
+}
+
+/** The window mutation clock survives row rewrites; physical row seq does not. */
+function nextHistorySeq(database: OpenClawAgentDatabase, sessionId: string): number {
+  touchTranscriptMutationInTransaction(database, sessionId);
+  const seq = readTranscriptMutationStateInTransaction(database, sessionId).updatedAt;
+  if (seq === null || !Number.isSafeInteger(seq)) {
+    throw new Error("Transcript history order is unavailable");
+  }
+  return seq;
+}
+
+/** Rewrites preserve committed identity facts, never caller-supplied history authority. */
+export function preserveTranscriptHistoryFacts(
+  database: OpenClawAgentDatabase,
+  sessionId: string,
+  event: TranscriptEvent,
+  original?: TranscriptEvent,
+): TranscriptEvent {
+  if (!isRecord(event)) {
+    return event;
+  }
+  const { historySeq: _historySeq, ...envelope } = event;
+  const retained = isRecord(original) && original.id === event.id && original.type === event.type;
+  if (event.type === "reset") {
+    const { source: _source, actorId: _actorId, ...reset } = envelope;
+    const sameBoundary =
+      retained &&
+      original.reason === event.reason &&
+      original.context === event.context &&
+      (original.firstKeptEntryId ?? undefined) === event.firstKeptEntryId;
+    return {
+      ...reset,
+      // Retained legacy facts stay byte-compatible; evidence readers still require
+      // affirmative actor identity and host order. Copies cannot gain these facts.
+      ...(sameBoundary && original.source === "human-command" ? { source: original.source } : {}),
+      ...(sameBoundary && typeof original.actorId === "string"
+        ? { actorId: original.actorId }
+        : {}),
+      ...(retained && Number.isSafeInteger(original.historySeq)
+        ? { historySeq: original.historySeq }
+        : {}),
+    };
+  }
+  if (event.type !== "message" || !isRecord(event.message) || event.message.role !== "user") {
+    return envelope;
+  }
+  return {
+    ...envelope,
+    ...(retained
+      ? Number.isSafeInteger(original.historySeq)
+        ? { historySeq: original.historySeq }
+        : {}
+      : { historySeq: nextHistorySeq(database, sessionId) }),
+  };
+}
 
 type TranscriptAppendOptions = {
   /** Exact event bytes, including canonical media, prepared by the message append owner. */
   eventJson?: string;
   preparedPayload?: PreparedTranscriptPayload;
   allowStoredAlias?: boolean;
+  /** Only the guarded reset lifecycle owner may author affirmative reset provenance. */
+  allowHumanResetSource?: boolean;
   idempotencyKeyMode?: "dedupe" | "preserve-owner" | "relocate-owner";
   onProjectionReconcileNeeded?: () => void;
   scheduleProjectionReconcile?: boolean;
@@ -167,7 +261,7 @@ function appendTranscriptEvent(
   options: TranscriptAppendOptions,
   cursor: TranscriptAppendCursor = {},
 ): string | false {
-  const persistedEvent =
+  let persistedEvent =
     options.eventJson === undefined ? canonicalizeTranscriptEventMedia(event) : event;
   const db = getSessionKysely(database.db);
   const createdAt = readEventTimestamp(persistedEvent) ?? Date.now();
@@ -204,7 +298,31 @@ function appendTranscriptEvent(
   }
   const seq = cursor.nextSeq ?? readNextTranscriptSeq(database, scope.sessionId);
   cursor.insertEvent ??= createTranscriptEventInserter(database.db, scope.sessionId);
-  const eventJson = options.eventJson ?? JSON.stringify(persistedEvent);
+  let eventJson = options.eventJson;
+  if (
+    isRecord(persistedEvent) &&
+    (persistedEvent.type === "reset" ||
+      (persistedEvent.type === "message" &&
+        isRecord(persistedEvent.message) &&
+        persistedEvent.message.role === "user"))
+  ) {
+    const historySeq = nextHistorySeq(database, scope.sessionId);
+    if (
+      persistedEvent.type === "reset" &&
+      (!options.allowHumanResetSource || Object.hasOwn(persistedEvent, "historySeq"))
+    ) {
+      const {
+        source: _source,
+        actorId: _actorId,
+        historySeq: _historySeq,
+        ...copiedReset
+      } = persistedEvent;
+      persistedEvent = copiedReset;
+    }
+    persistedEvent = { ...persistedEvent, historySeq };
+    eventJson = JSON.stringify(persistedEvent);
+  }
+  eventJson ??= JSON.stringify(persistedEvent);
   cursor.insertEvent({
     seq,
     eventJson,
@@ -393,6 +511,8 @@ export function replaceSqliteTranscriptEventsInTransaction(
   events: readonly TranscriptEvent[],
   options: {
     createdAtByIndex?: readonly number[];
+    /** Branch owner supplies the canonical source window, never caller event facts. */
+    historySourceSessionId?: string;
     /** Keep maintenance rewrites at their existing recency while invalidating stale projections. */
     preserveSessionWindowRecency?: boolean;
   } = {},
@@ -404,6 +524,10 @@ export function replaceSqliteTranscriptEventsInTransaction(
     options.preserveSessionWindowRecency === true
       ? readTranscriptMutationStateInTransaction(database, resolved.sessionId).updatedAt
       : undefined;
+  const originals = readTranscriptHistoryFacts(
+    database,
+    options.historySourceSessionId ?? resolved.sessionId,
+  );
   const previousGeneration = readTranscriptGenerationInTransaction(database, resolved.sessionId);
   const deleted = deleteTranscriptEventsInTransaction(database, resolved.sessionId);
   if (events.length === 0) {
@@ -444,7 +568,12 @@ export function replaceSqliteTranscriptEventsInTransaction(
   for (const [eventIndex, event] of events.entries()) {
     if (
       appendTranscriptEventRowInTransaction(
-        event,
+        preserveTranscriptHistoryFacts(
+          database,
+          resolved.sessionId,
+          event,
+          originals.get(readTranscriptEventId(event) ?? ""),
+        ),
         seq,
         state,
         options.createdAtByIndex?.[eventIndex],
@@ -493,8 +622,18 @@ export function rewriteSqliteTranscriptEventRowsInTransaction(
   if (rows.length === 0) {
     return;
   }
+  const originals = readTranscriptHistoryFacts(database, resolved.sessionId, {
+    seqs: rows.map((row) => row.seq),
+  });
   const rewrites = rows.map((row) => {
-    const eventJson = JSON.stringify(canonicalizeTranscriptEventMedia(row.event));
+    const eventJson = JSON.stringify(
+      preserveTranscriptHistoryFacts(
+        database,
+        resolved.sessionId,
+        canonicalizeTranscriptEventMedia(row.event),
+        originals.get(readTranscriptEventId(row.event) ?? ""),
+      ),
+    );
     return {
       ...row,
       eventJson,
@@ -642,7 +781,7 @@ function readTranscriptMessageByIdempotencyKey(
   database: Pick<OpenClawAgentDatabase, "db">,
   scope: ResolvedTranscriptScope,
   idempotencyKey: string,
-): { messageId: string; message: unknown } | undefined {
+): { messageId: string; message: unknown; historySeq?: number } | undefined {
   const identity = readIdempotencyKeyOwner(database, scope.sessionId, idempotencyKey);
   return identity ? readTranscriptMessageByIdentity(database, scope, identity) : undefined;
 }
@@ -652,7 +791,7 @@ export function readTranscriptMessageByScopedIdempotencyKey(
   scope: ResolvedTranscriptScope,
   idempotencyKey: string,
   lookup: TranscriptMessageAppendOptions<unknown>["idempotencyLookup"],
-): { messageId: string; message: unknown } | undefined {
+): { messageId: string; message: unknown; historySeq?: number } | undefined {
   if (lookup !== "scan-assistant") {
     return readTranscriptMessageByIdempotencyKey(database, scope, idempotencyKey);
   }
@@ -673,7 +812,7 @@ export function readTranscriptMessageByEventId(
   database: OpenClawAgentDatabase,
   scope: ResolvedTranscriptScope,
   eventId: string,
-): { messageId: string; message: unknown } | undefined {
+): { messageId: string; message: unknown; historySeq?: number } | undefined {
   const identity = readTranscriptIdentityByEventId(database, scope.sessionId, eventId);
   return identity ? readTranscriptMessageByIdentity(database, scope, identity) : undefined;
 }
@@ -682,7 +821,7 @@ function readTranscriptMessageByIdentity(
   database: Pick<OpenClawAgentDatabase, "db">,
   scope: ResolvedTranscriptScope,
   identity: { eventId: string; seq: number },
-): { messageId: string; message: unknown } | undefined {
+): { messageId: string; message: unknown; historySeq?: number } | undefined {
   const db = getSessionKysely(database.db);
   const eventRow = executeSqliteQueryTakeFirstSync(
     database.db,
@@ -695,8 +834,8 @@ function readTranscriptMessageByIdentity(
   if (!eventRow) {
     return undefined;
   }
-  const event = JSON.parse(eventRow.event_json) as { message?: unknown };
-  return { messageId: identity.eventId, message: event.message };
+  const event = JSON.parse(eventRow.event_json) as { message?: unknown; historySeq?: number };
+  return { messageId: identity.eventId, message: event.message, historySeq: event.historySeq };
 }
 
 function readTranscriptEventIdentity(event: unknown) {

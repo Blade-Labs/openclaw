@@ -30,6 +30,7 @@ import {
   isTranscriptEntryOnActivePathInTransaction,
   resolveTranscriptMessageAppendParent,
 } from "./session-accessor.sqlite-transcript-parent.js";
+import { rememberCommittedTranscriptHistoryFacts } from "./session-accessor.sqlite-transcript-sequences.js";
 import {
   appendTranscriptEventInTransaction,
   ensureTranscriptHeader,
@@ -167,7 +168,11 @@ export function appendTranscriptMessageInTransaction<TMessage>(
       entryId: params.messageId,
       message: params.message,
     });
-  const existingAppendResult = (found: { message: unknown; messageId: string }) => {
+  const existingAppendResult = (found: {
+    message: unknown;
+    messageId: string;
+    historySeq?: number;
+  }) => {
     const anchor = readAnchor(found);
     if (pending) {
       if (
@@ -186,15 +191,18 @@ export function appendTranscriptMessageInTransaction<TMessage>(
       }
       consumeSessionPendingInput(database, pending);
     }
-    return {
-      appended: false as const,
-      ...(anchor ? { anchor } : {}),
-      effectiveParentId:
-        readTranscriptIdentityByEventId(database, resolved.sessionId, found.messageId)?.parentId ??
-        null,
-      message: found.message as TMessage,
-      messageId: found.messageId,
-    };
+    return rememberCommittedTranscriptHistoryFacts(
+      {
+        appended: false as const,
+        ...(anchor ? { anchor } : {}),
+        effectiveParentId:
+          readTranscriptIdentityByEventId(database, resolved.sessionId, found.messageId)
+            ?.parentId ?? null,
+        message: found.message as TMessage,
+        messageId: found.messageId,
+      },
+      found,
+    );
   };
   const idempotencyKey = readMessageIdempotencyKey(options.message);
   if (idempotencyKey && options.idempotencyLookup !== "caller-checked") {
@@ -299,10 +307,12 @@ export function appendTranscriptMessageInTransaction<TMessage>(
   if (!appended) {
     throw new Error(`SQLite transcript append did not insert message ${messageId}.`);
   }
-  const persistedMessage =
-    preparedMessage?.persistedMessage ??
-    // SAFETY: Receipt custody comes from this event's exact committed JSON after storage normalization.
-    (JSON.parse(appended) as typeof event).message;
+  // Prepared assistant/tool payloads have no host history order. User receipts adopt
+  // the envelope from the same canonical bytes already needed for message custody.
+  const committedEvent: typeof event & { historySeq?: number } = preparedMessage
+    ? event
+    : (JSON.parse(appended) as typeof event & { historySeq?: number });
+  const persistedMessage = preparedMessage?.persistedMessage ?? committedEvent.message;
   const anchor = readAnchor({ message: persistedMessage, messageId });
   if (pending) {
     if (pending.stageRelocation) {
@@ -311,11 +321,14 @@ export function appendTranscriptMessageInTransaction<TMessage>(
       consumeSessionPendingInput(database, pending);
     }
   }
-  return {
-    appended: true,
-    ...(anchor ? { anchor } : {}),
-    effectiveParentId: parentId ?? null,
-    message: persistedMessage,
-    messageId,
-  };
+  return rememberCommittedTranscriptHistoryFacts(
+    {
+      appended: true,
+      ...(anchor ? { anchor } : {}),
+      effectiveParentId: parentId ?? null,
+      message: persistedMessage,
+      messageId,
+    },
+    committedEvent,
+  );
 }

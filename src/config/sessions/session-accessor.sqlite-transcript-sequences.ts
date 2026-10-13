@@ -21,7 +21,28 @@ import { readHotSessionTranscriptSnapshot } from "./session-cold-storage-read.js
 // Append results are public SDK contracts. Keep commit-only cursor metadata
 // attached to their object lifetime without changing the returned message shape.
 const committedTranscriptMessageSequences = new WeakMap<object, number>();
+const committedTranscriptHistoryFacts = new WeakMap<
+  object,
+  { historySeq?: number; source?: "human-command"; actorId?: string }
+>();
 const TRANSCRIPT_CURSOR_BATCH_SIZE = 64;
+
+/** Canonical envelope facts travel with private append receipts, never SDK message payloads. */
+export function rememberCommittedTranscriptHistoryFacts<T extends object>(
+  receipt: T,
+  event: { historySeq?: number; source?: "human-command"; actorId?: string },
+): T {
+  committedTranscriptHistoryFacts.set(receipt, {
+    ...(event.historySeq !== undefined ? { historySeq: event.historySeq } : {}),
+    ...(event.source !== undefined ? { source: event.source } : {}),
+    ...(event.actorId !== undefined ? { actorId: event.actorId } : {}),
+  });
+  return receipt;
+}
+
+export function readCommittedTranscriptHistoryFacts(receipt: object) {
+  return committedTranscriptHistoryFacts.get(receipt);
+}
 
 /** Reads the visible-message sequence captured from the final active branch. */
 export function readCommittedTranscriptMessageSequence(

@@ -24,6 +24,7 @@ import {
   type InputGateDecision,
   isHookDecision,
 } from "./hook-decision-types.js";
+import { invalidateHookHistoryEvidence } from "./hook-history-evidence.js";
 import { cloneHookIsolationValue, HookIsolationError } from "./hook-isolation.js";
 import type { GlobalHookRunnerRegistry, HookRunnerRegistry } from "./hook-registry.types.js";
 import { acceptPluginReplyPayload, toPluginReplyPayload } from "./hook-reply-payload.js";
@@ -805,7 +806,9 @@ export function createHookRunner(
         ? cloneHookIsolationValue(hookName, dispatchEvent.messages)
         : undefined;
 
-    if (historyEvidence !== undefined && canonicalMessages !== undefined) {
+    if (historyEvidence !== undefined && !historyEvidence.complete) {
+      historyEvidence = deepFreezeHookValue(invalidateHookHistoryEvidence(historyEvidence));
+    } else if (historyEvidence !== undefined && canonicalMessages !== undefined) {
       historyEvidence = deepFreezeHookValue({
         ...historyEvidence,
         messagesDigest: createHash("sha256")
@@ -829,7 +832,7 @@ export function createHookRunner(
             ? cloneHookIsolationValue(hookName, dispatchEvent)
             : dispatchEvent;
         // Evidence describes the canonical message snapshot. Once any preceding handler
-        // changes it, later consumers receive unknown facts, even if another restores it.
+        // changes it, later consumers retain only order, even if another restores it.
         const handlerEvent =
           hookName === "before_prompt_build" ? { ...selectedEvent } : selectedEvent;
         if (hookName === "before_prompt_build") {
@@ -840,7 +843,9 @@ export function createHookRunner(
               isDeepStrictEqual(handlerEvent.messages, canonicalMessages)
             )
           ) {
-            historyEvidence = deepFreezeHookValue({ complete: false, turnsSinceBoundary: null });
+            historyEvidence = deepFreezeHookValue(
+              invalidateHookHistoryEvidence({ ...historyEvidence, turnsSinceBoundary: null }),
+            );
           }
           if (historyEvidence === undefined) {
             Reflect.deleteProperty(handlerEvent, "historyEvidence");

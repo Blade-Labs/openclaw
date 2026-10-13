@@ -235,6 +235,7 @@ describe("CLI prompt hook history evidence", () => {
   ] as const)("accounts for $scenario before projecting hook messages", async (testCase) => {
     const { target, params } = await createSession(["public history"]);
     let resetId: string | undefined;
+    let resetSeq: number | undefined;
     if ("context" in testCase) {
       const request =
         testCase.context === "clear"
@@ -246,6 +247,7 @@ describe("CLI prompt hook history evidence", () => {
           : { context: "preserve-tail" as const, reason: testCase.reason as "idle" | "daily" };
       const reset = await commitReset(target, request);
       resetId = reset.id;
+      resetSeq = reset.historySeq;
     } else if ("legacy" in testCase) {
       await appendTranscriptEvent(target, {
         type: "reset",
@@ -305,20 +307,26 @@ describe("CLI prompt hook history evidence", () => {
     const admission = recorder.getAdmissionReceipt();
     expect(admission).toBeDefined();
     const history = await loadCliSessionHookHistory({ ...params, currentAdmission: admission });
+    const persistedCurrent = loadTranscriptEventsSync(target).find(
+      (event) => (event as { id?: string }).id === admission!.entryId,
+    ) as { historySeq: number };
+    expect(Number.isSafeInteger(persistedCurrent.historySeq)).toBe(true);
     expect(history.historyEvidence).toEqual({
-      ...(testCase.boundary
+      ...(testCase.complete && testCase.boundary
         ? {
             boundary: {
               id: resetId,
               reason: testCase.reason,
               actorId: "owner",
-              seq: expect.any(Number),
+              seq: resetSeq,
             },
           }
-        : {}),
+        : resetSeq !== undefined
+          ? { boundary: { seq: resetSeq } }
+          : {}),
       complete: testCase.complete,
       turnsSinceBoundary: testCase.turns,
-      currentEntry: { id: admission!.entryId, isLastEntry: true, seq: expect.any(Number) },
+      currentEntry: { id: admission!.entryId, isLastEntry: true, seq: persistedCurrent.historySeq },
     });
     expect(history.messages.at(-1)).toMatchObject({ role: "user", content: "Hello" });
     if ("extra" in testCase && testCase.extra === "oversized") {
@@ -579,9 +587,11 @@ describe("CLI prompt hook history evidence", () => {
           : entry,
       ),
     );
-    expect((await loadCliSessionHookHistory(params)).historyEvidence).not.toHaveProperty(
-      "boundary",
-    );
+    const rewrittenEvidence = (await loadCliSessionHookHistory(params)).historyEvidence;
+    expect(rewrittenEvidence.complete).toBe(false);
+    expect(rewrittenEvidence.boundary).toEqual({
+      seq: freshReset.historySeq,
+    });
   });
 
   it("correlates admission rather than identical text, including later entries", async () => {

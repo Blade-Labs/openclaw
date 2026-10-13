@@ -53,18 +53,24 @@ import type { PluginJsonValue } from "./host-hook-json.js";
 
 /** Read-only CLI transcript facts for this hook's session and run; never admission authority. */
 export type PluginHookHistoryEvidence = Readonly<{
-  /** Only a committed explicit human command that cleared context; legacy events do not qualify.
+  /** The full shape identifies a committed explicit human command that cleared context.
+   * Legacy events do not qualify.
    * actorId is the opaque authenticated transport actor, matching admitted turn-source identity.
    * seq is host commit order, never physical row position: retained identities preserve it
-   * across rewrites and branch selection, and new commits never reuse an earlier order. */
-  boundary?: Readonly<{ id: string; reason: "new" | "reset"; actorId: string; seq: number }>;
+   * across rewrites and branch selection, and new commits never reuse an earlier order.
+   * Non-affirmative evidence retains only seq; that boundary cannot qualify a reset. */
+  boundary?: Readonly<
+    | { id: string; reason: "new" | "reset"; actorId: string; seq: number }
+    | { seq: number; id?: never; reason?: never; actorId?: never }
+  >;
   /** Every post-reset entry is represented in messages, with no retained prefix or omissions. */
   complete: boolean;
-  /** SHA-256 of UTF-8 JSON.stringify(messages) at dispatch; absent after a message mutation. */
+  /** SHA-256 of UTF-8 JSON.stringify(messages) at dispatch; absent for non-affirmative evidence. */
   messagesDigest?: string;
   /** Canonical post-reset user count, including omitted entries; null when unprovable. */
   turnsSinceBoundary: number | null;
-  /** Admission-receipt identity and the same host order, only for a user entry on this window. */
+  /** Persisted admission identity and host order on this snapshot, retained even when
+   * evidence is non-affirmative or messages mutate. Ordering alone never permits promotion. */
   currentEntry?: Readonly<{ id: string; isLastEntry: boolean; seq: number }>;
 }>;
 import type {

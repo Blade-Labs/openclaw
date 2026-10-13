@@ -5,6 +5,7 @@ import {
   executeSqliteQueryTakeFirstSync,
   iterateSqliteQuerySync,
 } from "../../infra/kysely-sync.js";
+import { invalidateHookHistoryEvidence } from "../../plugins/hook-history-evidence.js";
 import type { PluginHookHistoryEvidence } from "../../plugins/hook-types.js";
 import type { TranscriptReadWindow } from "../../sessions/transcript-read-window.js";
 import { withCurrentProjectionSnapshot } from "./session-accessor.sqlite-active-projection.js";
@@ -198,7 +199,11 @@ function readHookHistoryEvidence(
     }
   }
   return {
-    ...(trustedBoundary ? { boundary: trustedBoundary } : {}),
+    ...(trustedBoundary
+      ? { boundary: trustedBoundary }
+      : typeof boundary?.historySeq === "number" && Number.isSafeInteger(boundary.historySeq)
+        ? { boundary: { seq: boundary.historySeq } }
+        : {}),
     complete:
       Boolean(trustedBoundary) &&
       messagesOnly &&
@@ -717,10 +722,10 @@ export function readSessionTranscriptBoundedMessageTailPage(
           totalMessages,
           ...(evidence
             ? {
-                historyEvidence: {
-                  ...evidence,
-                  complete: evidence.complete && totalMessages === 0,
-                },
+                historyEvidence:
+                  evidence.complete && totalMessages === 0
+                    ? evidence
+                    : invalidateHookHistoryEvidence(evidence),
               }
             : {}),
         };
@@ -763,10 +768,10 @@ export function readSessionTranscriptBoundedMessageTailPage(
         totalMessages,
         ...(evidence
           ? {
-              historyEvidence: {
-                ...evidence,
-                complete: evidence.complete && events.length === totalMessages,
-              },
+              historyEvidence:
+                evidence.complete && events.length === totalMessages
+                  ? evidence
+                  : invalidateHookHistoryEvidence(evidence),
             }
           : {}),
       };

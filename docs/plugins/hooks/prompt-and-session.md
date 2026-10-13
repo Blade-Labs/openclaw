@@ -78,7 +78,8 @@ bound to the hook context's `agentId`, `sessionKey`, `sessionId`, and `runId`.
 It describes the same committed canonical transcript snapshot as `messages`,
 before message projection and the 100-message / 5 MiB limits:
 
-- `boundary?: { id, reason, actorId, seq }` identifies the latest persisted reset only when
+- `boundary?: { id, reason, actorId, seq } | { seq }` supplies host order for the
+  latest persisted reset when durable order exists. The full shape qualifies it only when
   it records `context: "clear"`, `source: "human-command"`, and reason `new`
   or `reset`, with no retained anchor. The reset lifecycle writer records the
   command source only for authorized `/new` and hard `/reset` commands with
@@ -89,7 +90,9 @@ before message projection and the 100-message / 5 MiB limits:
   never establish this human command source.
   Soft reset does not append a transcript boundary. Automatic resets,
   idle/daily rollovers, restarts, compaction, and legacy events lacking these
-  explicit facts cannot supply a boundary.
+  explicit facts cannot supply a qualifying boundary.
+  Non-affirmative evidence exposes only `{ seq }`, omitting `id`, `reason`, and
+  `actorId`. That shape preserves ordering but cannot qualify a human reset.
 - `complete` is true only with that boundary and when every canonical
   post-reset entry is represented in `messages`, with no budget omissions or
   retained prefix. Compaction, saved notes, and any other non-message records
@@ -97,7 +100,8 @@ before message projection and the 100-message / 5 MiB limits:
 - `messagesDigest?: string` is the SHA-256 digest of UTF-8 `JSON.stringify(messages)`
   for the canonical projected messages delivered by hook dispatch. Consumers can
   compare their message view to this digest. Dispatch computes it from the host
-  snapshot; caller-provided digests are replaced, and mutated views lose the digest.
+  snapshot; caller-provided digests are replaced. Non-affirmative evidence,
+  including mutated views, has no digest.
 - `turnsSinceBoundary` counts all canonical post-reset user entries in host
   order, including oversized or count-limited entries. Without a reset, it
   counts from the beginning of the active path. `null` means the canonical
@@ -106,7 +110,9 @@ before message projection and the 100-message / 5 MiB limits:
   receipt to a post-reset user entry on that snapshot. `isLastEntry` compares
   it to the canonical leaf, including non-message entries. Equal text or
   timestamps do not establish this correlation. Without a valid persisted
-  admission or durable host order, the field is absent.
+  admission or durable host order, the field is absent. A persisted current
+  entry on this snapshot keeps all three fields when evidence is incomplete
+  or invalidated; ordering alone never permits memory promotion.
 
 `boundary.seq` and `currentEntry.seq` are comparable safe integer host event
 orders within the same native session lineage. They are allocated from the
@@ -128,9 +134,12 @@ no evidence, never an empty or complete transcript. Evidence and its nested
 fields remain read-only through ordinary and authorized prompt-hook dispatch;
 message projection and budgets keep their existing behavior. Each dispatch keeps
 an isolated canonical message snapshot. If an earlier handler changes the shared
-message array or a nested message, later handlers receive only
-`{ complete: false, turnsSinceBoundary: null }`, without boundary or current-entry
-facts. That refusal remains latched for the rest of the dispatch.
+message array or a nested message, later handlers receive `complete: false`,
+`turnsSinceBoundary: null`, no digest, the original `currentEntry`, and only
+`boundary: { seq }` if a boundary order exists. The preserved ordering facts
+still describe the isolated host snapshot, not the mutated messages. That
+refusal remains latched for the rest of the dispatch, even if a later handler
+restores the messages. Unmutated affirmative evidence retains its full shape.
 
 This envelope grants no authority. Plugins must still verify the current
 human, conversation, and run through existing admission contracts, match

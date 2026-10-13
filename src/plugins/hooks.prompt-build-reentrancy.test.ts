@@ -26,6 +26,12 @@ describe("before_prompt_build reentrancy", () => {
             handler: (...args: unknown[]) => {
               const event = args[0] as PluginHookBeforePromptBuildEvent;
               if (present) {
+                expect(event.historyEvidence).toEqual({
+                  boundary: { seq: historyEvidence.boundary.seq },
+                  complete: false,
+                  turnsSinceBoundary: historyEvidence.turnsSinceBoundary,
+                  currentEntry: historyEvidence.currentEntry,
+                });
                 mutations.push(
                   Reflect.set(event.historyEvidence!, "complete", true),
                   Reflect.set(event.historyEvidence!.boundary!, "id", "forged"),
@@ -55,15 +61,20 @@ describe("before_prompt_build reentrancy", () => {
       const event = observer.mock.calls[0]![0];
       if (present) {
         expect(mutations).toEqual([false, false, false, false, false]);
-        expect(event.historyEvidence).toEqual({ complete: false, turnsSinceBoundary: null });
+        expect(event.historyEvidence).toEqual({
+          boundary: { seq: historyEvidence.boundary.seq },
+          complete: false,
+          turnsSinceBoundary: null,
+          currentEntry: historyEvidence.currentEntry,
+        });
       } else {
         expect(event).not.toHaveProperty("historyEvidence");
       }
       expect(event.messages).toEqual(["shared message mutation"]);
     },
   );
-  it.each(["remove", "nested edit"])(
-    "drops affirmative evidence after an earlier hook changes messages: %s",
+  it.each(["none", "remove", "nested edit", "restore"])(
+    "preserves order and invalidates only affirmative evidence after message changes: %s",
     async (mutation) => {
       const evidence = {
         boundary: { id: "reset", reason: "new" as const, actorId: "owner", seq: 1 },
@@ -83,9 +94,9 @@ describe("before_prompt_build reentrancy", () => {
             handler: (...args: unknown[]) => {
               const event = args[0] as PluginHookBeforePromptBuildEvent;
               observed.push(structuredClone(event));
-              if (mutation === "remove") {
+              if (mutation === "remove" || mutation === "restore") {
                 event.messages.splice(0, 1);
-              } else {
+              } else if (mutation === "nested edit") {
                 (event.messages[0] as (typeof originalMessages)[0]).content[0]!.text = "changed";
               }
               return {};
@@ -94,6 +105,19 @@ describe("before_prompt_build reentrancy", () => {
           {
             hookName: "before_prompt_build",
             pluginId: "observer",
+            handler: (...args: unknown[]) => {
+              const event = args[0] as PluginHookBeforePromptBuildEvent;
+              observed.push(structuredClone(event));
+              if (mutation === "restore") {
+                event.messages.push(...structuredClone(originalMessages));
+              }
+              return {};
+            },
+          },
+          {
+            hookName: "before_prompt_build",
+            pluginId: "final-observer",
+            priority: -1,
             handler: (...args: unknown[]) => {
               observed.push(structuredClone(args[0] as PluginHookBeforePromptBuildEvent));
               return {};
@@ -105,12 +129,22 @@ describe("before_prompt_build reentrancy", () => {
         { prompt: "ask", messages: originalMessages, historyEvidence: evidence },
         TEST_PLUGIN_AGENT_CTX,
       );
-      expect(observed).toHaveLength(2);
+      expect(observed).toHaveLength(3);
       expect(observed[0]?.historyEvidence).toEqual({
         ...evidence,
         messagesDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
       });
-      expect(observed[1]?.historyEvidence).toEqual({ complete: false, turnsSinceBoundary: null });
+      const expected =
+        mutation === "none"
+          ? observed[0]?.historyEvidence
+          : {
+              boundary: { seq: evidence.boundary.seq },
+              complete: false,
+              turnsSinceBoundary: null,
+              currentEntry: evidence.currentEntry,
+            };
+      expect(observed[1]?.historyEvidence).toEqual(expected);
+      expect(observed[2]?.historyEvidence).toEqual(expected);
       expect(originalMessages[0]?.content[0]?.text).toBe("ask");
       expect(originalMessages).toHaveLength(1);
     },

@@ -362,10 +362,11 @@ export type PluginHookAgentContext = {
   /** Present only for post-policy prompt enrichment hooks that requested tool authority. */
   toolAuthority?: PluginHookToolAuthority;
   /**
-   * Present for before_prompt_build only. Checks this handler's result-acceptance lifetime,
-   * not tool authorization or eventual model consumption. Underlying work is not cancelled.
+   * Present for before_prompt_build and reset command before_reset hooks. Checks the host's
+   * invocation lifetime, not tool authorization or eventual model consumption. Reset hooks
+   * also receive a signal aborted when the bounded host wait ends.
    */
-  readonly hookInvocation?: Readonly<{ assertActive(): void }>;
+  readonly hookInvocation?: Readonly<{ signal?: AbortSignal; assertActive(): void }>;
 };
 
 export type PluginHookContextWindowSource =

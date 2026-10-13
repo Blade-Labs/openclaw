@@ -185,6 +185,13 @@ export async function emitResetCommandHooks(params: {
     } catch (err: unknown) {
       logVerbose(`before_reset: admitted actor unavailable (${String(err)})`);
     }
+    const invocation = new AbortController();
+    const hookInvocation = Object.freeze({
+      signal: invocation.signal,
+      assertActive() {
+        invocation.signal.throwIfAborted();
+      },
+    });
     try {
       // Await the bounded result without making scope cleanup join timed-out plugin work.
       await runOutsideAsyncWorkScope(() =>
@@ -192,6 +199,7 @@ export async function emitResetCommandHooks(params: {
           hookRunner.runBeforeReset(
             { sessionFile, messages, reason: params.action },
             {
+              hookInvocation,
               agentId,
               sessionKey: params.sessionKey,
               sessionId: prevEntry?.sessionId,
@@ -214,6 +222,9 @@ export async function emitResetCommandHooks(params: {
       );
     } catch (err: unknown) {
       logVerbose(`before_reset hook failed: ${String(err)}`);
+    } finally {
+      // Close the host wait even when the plugin's underlying work has not settled.
+      invocation.abort(new Error("reset hook invocation is no longer active"));
     }
   }
   return { routedReply };

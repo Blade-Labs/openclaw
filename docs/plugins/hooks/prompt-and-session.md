@@ -319,8 +319,12 @@ context while retaining `reason: "reset"`.
 The command awaits `before_reset` before completing or continuing to prompt
 construction, with a five-second overall timeout using the shared hook timeout
 helper. Per-handler timeouts still apply. Errors and timeout are logged and
-the reset continues. Timed-out plugin work is not canceled; plugins should
-bound their own asynchronous work before recording state.
+the reset continues. The command supplies `ctx.hookInvocation` with `signal`
+and `assertActive()`. The signal aborts and the assertion throws when the host
+wait ends, including timeout, failure, or normal hook completion. Pass the
+signal to cancellable work, and call `assertActive()` after awaited work and
+immediately before recording state. Revocation does not forcibly stop plugin
+work that ignores the signal.
 
 Workflow plugins can persist small JSON-compatible session state with
 `api.session.state.registerSessionExtension(...)` and update it through the

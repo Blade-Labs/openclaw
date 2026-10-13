@@ -335,10 +335,14 @@ describe("handleCommands reset hooks", () => {
     const started = createDeferred();
     const settle = createDeferred();
     const order: string[] = [];
-    pluginHooks.runBeforeReset.mockImplementationOnce(async () => {
-      order.push("hook started");
+    pluginHooks.runBeforeReset.mockImplementationOnce(async (_event, ctx) => {
       started.resolve();
+      expect(ctx.hookInvocation?.signal?.aborted).toBe(false);
+      expect(() => ctx.hookInvocation?.assertActive()).not.toThrow();
+      order.push("hook started");
       await settle.promise;
+      expect(ctx.hookInvocation?.signal?.aborted).toBe(false);
+      expect(() => ctx.hookInvocation?.assertActive()).not.toThrow();
       order.push("hook recorded reset");
     });
     const params = buildResetParams("/new", {});
@@ -355,6 +359,10 @@ describe("handleCommands reset hooks", () => {
     expect(pendingOrder).toEqual(["hook started"]);
     expect(order).toEqual(["hook started", "hook recorded reset", "command completed"]);
     expect(result?.reply?.text).toBe("✅ New session started.");
+    const invocation = pluginHooks.runBeforeReset.mock.calls[0]?.[1].hookInvocation;
+    expect(invocation?.signal?.aborted).toBe(true);
+    expect(() => invocation?.assertActive()).toThrow("no longer active");
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it.each(["throw", "timeout"])(
@@ -364,21 +372,44 @@ describe("handleCommands reset hooks", () => {
       pluginHooks.enabled = true;
       const started = createDeferred();
       const hanging = createDeferred();
-      pluginHooks.runBeforeReset.mockImplementationOnce(() => {
+      let lateSignalAborted: boolean | undefined;
+      let lateAuthorityError: unknown;
+      pluginHooks.runBeforeReset.mockImplementationOnce((_event, ctx) => {
         started.resolve();
         if (failure === "throw") {
           throw new Error("plugin failure");
         }
-        return hanging.promise;
+        return hanging.promise.then(() => {
+          lateSignalAborted = ctx.hookInvocation?.signal?.aborted;
+          try {
+            ctx.hookInvocation?.assertActive();
+          } catch (err) {
+            lateAuthorityError = err;
+          }
+        });
       });
       const params = buildResetParams("/reset", {});
       const scope = new AsyncWorkScope();
       const completion = scope.run(() => maybeHandleResetCommand(params));
       await started.promise;
-      await vi.advanceTimersByTimeAsync(5_001);
+      const invocation = pluginHooks.runBeforeReset.mock.calls[0]?.[1].hookInvocation;
+      if (failure === "timeout") {
+        await vi.advanceTimersByTimeAsync(4_999);
+        expect(invocation?.signal?.aborted).toBe(false);
+        expect(() => invocation?.assertActive()).not.toThrow();
+        await vi.advanceTimersByTimeAsync(1);
+      }
       const result = await completion;
       const pendingWork = scope.hasPendingWork;
+      expect(invocation?.signal?.aborted).toBe(true);
+      expect(() => invocation?.assertActive()).toThrow("no longer active");
       hanging.resolve();
+      await pluginHooks.runBeforeReset.mock.results[0]?.value;
+      if (failure === "timeout") {
+        expect(lateSignalAborted).toBe(true);
+        expect(lateAuthorityError).toBeInstanceOf(Error);
+        expect(String(lateAuthorityError)).toContain("no longer active");
+      }
 
       expect(result).toEqual({
         shouldContinue: false,

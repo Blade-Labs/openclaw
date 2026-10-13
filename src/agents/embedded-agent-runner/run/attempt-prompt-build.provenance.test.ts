@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import type { PluginHookBeforePromptBuildResult } from "../../../plugins/hook-before-agent-start.types.js";
 import type { PluginHookAgentContext } from "../../../plugins/hook-types.js";
 import { createHookRunner } from "../../../plugins/hooks.js";
-import { prepareSystemAgentRunAdmission } from "../../admitted-run-context.js";
+import { admissionLifetimeOf, prepareSystemAgentRunAdmission } from "../../admitted-run-context.js";
 import { buildAgentRunTerminalReplySnapshot } from "../../agent-run-terminal-reply.js";
 import {
   createTestSession,
@@ -209,6 +209,31 @@ describe("prompt-build hook context input provenance", () => {
     expect(captured).toHaveLength(1);
     expect(captured[0]).toMatchObject({ trigger: "user" });
     expect(captured[0]?.inputProvenance).toBeUndefined();
+  });
+
+  it("gives every embedded prompt build of one run the run's admission lifetime token", async () => {
+    // A retry or a later embedded/CLI fallback of the same operational run must
+    // present the token its first prompt build presented, so a plugin's
+    // first-attempt decision is never re-made by another runtime.
+    const admission = prepareSystemAgentRunAdmission(
+      {},
+      "lifetime-run",
+      "main",
+      "provenance-hook-test",
+    );
+    onTestFinished(() => admission.close());
+    const admittedRunContext = await admission.admit("embedded");
+    const first = await assembleWithCapturedHookCtx("lifetime-run-first", { admittedRunContext });
+    const retry = await assembleWithCapturedHookCtx("lifetime-run-retry", { admittedRunContext });
+    const other = await assembleWithCapturedHookCtx("lifetime-run-other");
+    const lifetime = admissionLifetimeOf(admittedRunContext.operationalRunInstance);
+    // CLI preparation emits admissionLifetimeOf on the same instance.
+    expect(first.captured[0]?.admissionLifetime).toBe(lifetime);
+    expect(retry.captured[0]?.admissionLifetime).toBe(lifetime);
+    expect(other.captured[0]?.admissionLifetime).toBeDefined();
+    expect(other.captured[0]?.admissionLifetime).not.toBe(lifetime);
+    expect(Object.isFrozen(lifetime)).toBe(true);
+    expect(Object.keys(lifetime)).toEqual([]);
   });
 });
 

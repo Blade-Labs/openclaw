@@ -38,6 +38,7 @@ export function buildAgentHookContext(params: AgentHarnessHookContext): PluginHo
     ...(params.trigger ? { trigger: params.trigger } : {}),
     ...(params.inputProvenance ? { inputProvenance: params.inputProvenance } : {}),
     ...(params.source ? { source: params.source } : {}),
+    ...(params.admissionLifetime ? { admissionLifetime: params.admissionLifetime } : {}),
     ...(params.channelId ? { channelId: params.channelId } : {}),
     ...(params.contextTokenBudget ? { contextTokenBudget: params.contextTokenBudget } : {}),
     ...(params.contextWindowSource ? { contextWindowSource: params.contextWindowSource } : {}),

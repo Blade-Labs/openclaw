@@ -306,6 +306,13 @@ export type PluginHookToolAuthority = {
 
 export type PluginHookAgentContext = {
   readonly source?: TurnSourceProvenance;
+  /**
+   * Opaque host token for the operational run: identical for every prompt
+   * build of one run (retries, overflow and embedded/CLI/harness fallback),
+   * distinct between runs. Carries no authority; plugins may key per-run state
+   * on its identity.
+   */
+  readonly admissionLifetime?: Readonly<Record<string, never>>;
   runId?: string;
   jobId?: string;
   trace?: DiagnosticTraceContext;

@@ -8,6 +8,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import * as mcpFixture from "../../agents/agent-bundle-mcp-manager.test-support.js";
 import { testing as sessionMcpTesting } from "../../agents/agent-bundle-mcp-runtime.js";
 import * as bootstrapCache from "../../agents/bootstrap-cache.js";
+import { loadCliSessionHistoryMessages } from "../../agents/cli-runner/session-history.js";
 import {
   clearEmbeddedSessionPromptStates,
   getEmbeddedSessionPromptState,
@@ -1786,6 +1787,44 @@ describe("initSessionState RawBody", () => {
     expect(store[sessionKey]?.memoryFlush).toBeUndefined();
   });
 
+  it("keeps the host session id across /new but clears the prompt-build history window", async () => {
+    // /new retains entry.sessionId (durable resets keep transcript identity),
+    // rotates the lifecycle revision and closes the history window: the next
+    // prompt build carries none of the earlier turns. Atlas starts a fresh
+    // history generation over a public classification only on this signal.
+    const storePath = await createStorePath("openclaw-session-new-history-window-");
+    const sessionKey = "agent:main:msteams:direct:owner";
+    const sessionId = "owner-dm-session";
+    await writeSessionStoreFast(storePath, {
+      [sessionKey]: {
+        sessionId,
+        lifecycleRevision: "public-generation",
+        updatedAt: Date.now(),
+        systemSent: true,
+      },
+    });
+    const target = { agentId: "main", sessionId, sessionKey, storePath };
+    await appendTranscriptMessage(target, {
+      message: { role: "user", content: "gateway public ask" },
+    });
+    await appendTranscriptMessage(target, {
+      message: { role: "assistant", content: [{ type: "text", text: "public answer" }] },
+    });
+    expect(await loadCliSessionHistoryMessages({ sessionTarget: target })).toMatchObject([
+      { role: "user", content: "gateway public ask" },
+      { role: "assistant" },
+    ]);
+    const reset = await initSessionState({
+      ctx: { RawBody: "/new", ChatType: "direct", SessionKey: sessionKey },
+      cfg: { session: { store: storePath, resetTriggers: ["/new"] } } as OpenClawConfig,
+    });
+    expect(reset.resetTriggered).toBe(true);
+    expect(reset.isNewSession).toBe(true);
+    expect(reset.sessionId).toBe(sessionId);
+    expect(reset.sessionEntry.lifecycleRevision).not.toBe("public-generation");
+    expect(await loadCliSessionHistoryMessages({ sessionTarget: target })).toEqual([]);
+  });
+
   it("drains stale system events when /new rotates an existing session", async () => {
     const root = await makeCaseDir("openclaw-rawbody-reset-system-events-");
     const storePath = path.join(root, "sessions.json");
@@ -2871,6 +2910,45 @@ describe("initSessionState reset policy", () => {
       });
     }
   });
+  it("keeps the host session id and a preserved conversation tail across an idle rollover", async () => {
+    // Plugins classifying per-session history (Atlas) see the tail the host
+    // carries into the next prompt build: a rollover is not a cleared history.
+    // The earlier turns are written at 04:45; the next inbound arrives idle.
+    vi.setSystemTime(new Date(2026, 0, 18, 4, 45, 0));
+    const storePath = await createStorePath("openclaw-session-idle-history-window-");
+    const sessionKey = "agent:main:msteams:direct:idle-owner";
+    const sessionId = "idle-owner-session";
+    await writeSessionStoreFast(storePath, {
+      [sessionKey]: {
+        sessionId,
+        lifecycleRevision: "idle-public-generation",
+        updatedAt: new Date(2026, 0, 18, 4, 45, 0).getTime(),
+      },
+    });
+    const target = { agentId: "main", sessionId, sessionKey, storePath };
+    await appendTranscriptMessage(target, {
+      message: { role: "user", content: "earlier public ask" },
+    });
+    await appendTranscriptMessage(target, {
+      message: { role: "assistant", content: [{ type: "text", text: "earlier public answer" }] },
+    });
+    vi.setSystemTime(new Date(2026, 0, 18, 5, 30, 0));
+    const result = await initSessionState({
+      ctx: { Body: "hello", SessionKey: sessionKey },
+      cfg: {
+        session: { store: storePath, reset: { mode: "idle", idleMinutes: 30 } },
+      } as OpenClawConfig,
+    });
+    expect(result.isNewSession).toBe(true);
+    expect(result.resetTriggered).toBe(false);
+    expect(result.sessionId).toBe(sessionId);
+    expect(result.sessionEntry.lifecycleRevision).not.toBe("idle-public-generation");
+    const history = (await loadCliSessionHistoryMessages({ sessionTarget: target })) as Array<{
+      role?: string;
+    }>;
+    expect(history.some((message) => message.role === "user")).toBe(true);
+  });
+
   it("drains stale system events when idle rollover creates a new session", async () => {
     vi.setSystemTime(new Date(2026, 0, 18, 5, 30, 0));
     const root = await makeCaseDir("openclaw-reset-idle-system-events-");

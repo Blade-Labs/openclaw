@@ -6,6 +6,7 @@
  */
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
+import { getPluginRuntimeGatewayRequestScope } from "../../plugins/runtime/gateway-request-scope.js";
 import type { PluginHookBeforePromptBuildResult } from "../../plugins/types.js";
 import { joinPresentTextSegments } from "../../shared/text/join-segments.js";
 import type { BootstrapContextRunKind } from "../bootstrap-mode.js";
@@ -68,7 +69,17 @@ export async function resolveAgentHarnessBeforePromptBuildResult(params: {
       promptInputRange: { start: 0, end: inputPrompt.length },
     };
   }
-  const hookCtx = buildAgentHookContext(params.ctx);
+  // A plugin harness runs inside the host scope of the run it executes; the
+  // run's lifetime token is attached only to that exact run's prompt build.
+  const harnessAdmission = getPluginRuntimeGatewayRequestScope()?.harnessAdmission;
+  const hookCtx = buildAgentHookContext({
+    ...params.ctx,
+    ...(!params.ctx.admissionLifetime &&
+    harnessAdmission &&
+    params.ctx.runId === harnessAdmission.runId
+      ? { admissionLifetime: harnessAdmission.lifetime }
+      : {}),
+  });
   const promptEvent = {
     prompt: inputPrompt,
     ...(typeof params.currentUserMessage === "string"

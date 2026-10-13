@@ -1,4 +1,5 @@
 import {
+  createDefaultAdmissionTurnSource,
   createOperationalRunInstanceRef,
   prepareAgentRunAdmission,
   type AdmittedRunContext,
@@ -12,7 +13,7 @@ import {
   type ChannelAdmissionEvidence,
 } from "../../channels/message-access/admission-evidence.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import type { HostTurnSource } from "../../infra/host-turn-source.js";
+import { projectHostTurnSource, type HostTurnSource } from "../../infra/host-turn-source.js";
 
 /** Adapt one opaque channel carrier to the canonical admitted-run facts and decision FIFO. */
 export function consumeChannelRunAdmission(evidence: ChannelAdmissionEvidence | undefined): {
@@ -70,6 +71,9 @@ export function prepareChannelRunAdmission(params: {
   onAdmitted?: (context: AdmittedRunContext) => void;
 }): PreparedAgentRunAdmission {
   const operationalRunInstance = createOperationalRunInstanceRef(params.runId);
+  // Normalized once: readSource() before admission and the admitted context
+  // project the same source, including the non-user fallback.
+  const turnSource = params.turnSource ?? createDefaultAdmissionTurnSource(params.ingressKind);
   let prepared: PreparedAgentRunAdmission | undefined;
   let closed = false;
   const assertSourceCurrent = () => {
@@ -83,6 +87,14 @@ export function prepareChannelRunAdmission(params: {
   return Object.freeze({
     operationalRunInstance,
     assertSourceCurrent,
+    readSource: () =>
+      prepared?.readSource?.() ??
+      projectHostTurnSource(
+        closed ? undefined : turnSource,
+        operationalRunInstance.runId,
+        params.sessionKey ?? null,
+        0,
+      ),
     readOperatorAuthority: () => {
       if (closed && params.operatorAuthority) {
         throw new Error("prepared operator authority is no longer active");
@@ -101,7 +113,7 @@ export function prepareChannelRunAdmission(params: {
           assertSourceCurrent: params.assertSourceCurrent,
           operationalRunInstance,
           operatorAuthority: params.operatorAuthority,
-          turnSource: params.turnSource,
+          turnSource,
           sessionKey: params.sessionKey,
           facts: {
             runId: params.runId,

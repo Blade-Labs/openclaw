@@ -21,6 +21,7 @@ import { resolveSkillResourceCandidates } from "../../skills/runtime/resource-ca
 import {
   captureAdmittedRunSource,
   getAdmittedRunDelegatedAuthority,
+  harnessAdmissionScope,
   retainAdmittedRunBeforeToolCallRecovery,
 } from "../admitted-run-context.js";
 import { copyAgentToolMetadata } from "../agent-tool-metadata.js";
@@ -708,6 +709,7 @@ export function createAgentHarnessHostCapabilities(params: {
           isWebchatConnect: () => false,
           ...getPluginRuntimeGatewayRequestScope(),
           ...nodeAuthorities,
+          ...harnessAdmissionScope(attempt.runId, attempt.admittedRunContext),
         },
         run,
       );

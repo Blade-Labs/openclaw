@@ -22,6 +22,7 @@ import {
 import type { getGlobalHookRunner } from "../../../plugins/hook-runner-global.js";
 import { buildInterSessionPromptContext } from "../../../sessions/input-provenance.js";
 import {
+  admissionLifetimeOf,
   captureAdmittedRunSource,
   resolveAdmittedRunActiveAssertion,
 } from "../../admitted-run-context.js";
@@ -160,6 +161,14 @@ export async function prepareEmbeddedAttemptPromptAssembly(input: {
     trigger: attempt.trigger,
     inputProvenance: attempt.inputProvenance,
     source: captureAdmittedRunSource(attempt.admittedRunContext).source,
+    // The run's lifetime token, shared with every other prompt producer of the
+    // same operational run (CLI preparation, plugin harnesses), so a fallback
+    // between runtimes is a retry of the same run, not a new first attempt.
+    ...(attempt.admittedRunContext
+      ? {
+          admissionLifetime: admissionLifetimeOf(attempt.admittedRunContext.operationalRunInstance),
+        }
+      : {}),
     ...buildAgentHookContextChannelFields(attempt),
     ...buildAgentHookContextIdentityFields({
       trigger: attempt.trigger,

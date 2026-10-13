@@ -115,6 +115,11 @@ export type PreparedAgentRunAdmission = Readonly<{
   assertSourceCurrent: () => void;
   /** Host-only source restriction available before the runtime prepares its tools. */
   readOperatorAuthority?: () => AdmittedRunOperatorAuthority | undefined;
+  /**
+   * The run's turn-source projection before admission, so prompt-build hooks see
+   * the same facts the admitted context will project at revision 0.
+   */
+  readSource?: () => TurnSourceProvenance;
   /** Idempotently closes the exact delegated approval lease, if admission occurred. */
   close: () => void;
 }>;
@@ -422,6 +427,43 @@ export function createOperationalRunInstanceRef(runId: string): OperationalRunIn
   return Object.freeze({ instanceId: randomUUID(), runId });
 }
 
+/** Opaque, inert per-run token; it carries no authority and reveals no host state. */
+export type AdmissionLifetime = Readonly<Record<string, never>>;
+const admissionLifetimes = new WeakMap<OperationalRunInstanceRef, AdmissionLifetime>();
+
+/**
+ * One stable opaque token per operational run instance, shared by every prompt
+ * retry and fallback of that run and released with it. Plugins may key their
+ * own per-run decisions on it without being handed the instance itself.
+ */
+export function admissionLifetimeOf(instance: OperationalRunInstanceRef): AdmissionLifetime {
+  let lifetime = admissionLifetimes.get(instance);
+  if (!lifetime) {
+    lifetime = Object.freeze(Object.create(null) as Record<string, never>);
+    admissionLifetimes.set(instance, lifetime);
+  }
+  return lifetime;
+}
+
+/**
+ * Host request-scope fields for a plugin harness attempt: plugin harnesses
+ * build their own hook context, so the generic prompt-build helper attaches
+ * the run's lifetime token from this scope, for that exact run only.
+ */
+export function harnessAdmissionScope(
+  runId: string,
+  context: AdmittedRunContext | undefined,
+): { harnessAdmission?: Readonly<{ runId: string; lifetime: AdmissionLifetime }> } {
+  return context
+    ? {
+        harnessAdmission: Object.freeze({
+          runId,
+          lifetime: admissionLifetimeOf(context.operationalRunInstance),
+        }),
+      }
+    : {};
+}
+
 /** Prepares a system-owned run without selecting its eventual execution runtime early. */
 export function prepareSystemAgentRunAdmission(
   cfg: OpenClawConfig,
@@ -464,14 +506,7 @@ export function prepareAgentRunAdmission(params: {
 }): PreparedAgentRunAdmission {
   const operationalRunInstance = params.operationalRunInstance;
   const turnSource =
-    params.turnSource ??
-    createHostNonUserTurnSource(
-      params.facts.ingress.kind === "schedule"
-        ? "cron"
-        : params.facts.ingress.kind === "system"
-          ? "system"
-          : "unknown",
-    );
+    params.turnSource ?? createDefaultAdmissionTurnSource(params.facts.ingress.kind);
   if (operationalRunInstance.runId !== params.facts.runId) {
     throw new Error("operational run instance disagrees with prepared admission");
   }
@@ -505,6 +540,13 @@ export function prepareAgentRunAdmission(params: {
   return Object.freeze({
     operationalRunInstance,
     assertSourceCurrent: () => assertSourceCurrent?.(),
+    readSource: () =>
+      projectHostTurnSource(
+        closed ? undefined : turnSource,
+        operationalRunInstance.runId,
+        params.sessionKey ?? null,
+        0,
+      ),
     readOperatorAuthority: () => {
       if (operatorAuthority) {
         if (closed) {
@@ -568,6 +610,19 @@ export function prepareAgentRunAdmission(params: {
       return admitted;
     },
   });
+}
+
+/**
+ * The non-user source an admission uses when its caller supplies none. Callers
+ * that project a source before admission must create it once and pass it on,
+ * so the projection and the admitted context share the same facts.
+ */
+export function createDefaultAdmissionTurnSource(
+  ingressKind: ExecutionIdentityAdmissionFacts["ingress"]["kind"],
+): HostTurnSource {
+  return createHostNonUserTurnSource(
+    ingressKind === "schedule" ? "cron" : ingressKind === "system" ? "system" : "unknown",
+  );
 }
 
 /** Resolves a host-only continuation or validates an already-admitted internal caller. */

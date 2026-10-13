@@ -6,6 +6,12 @@ import {
 } from "../../plugins/hook-runner-global.js";
 import type { PluginHookAgentContext } from "../../plugins/hook-types.js";
 import { createMockPluginRegistry } from "../../plugins/hooks.test-fixtures.js";
+import {
+  admissionLifetimeOf,
+  createOperationalRunInstanceRef,
+  prepareAgentRunAdmission,
+} from "../admitted-run-context.js";
+import { createAgentHarnessHostCapabilities } from "./host-capability.js";
 import { resolveAgentHarnessBeforePromptBuildResult } from "./prompt-compaction-hook-helpers.js";
 
 afterEach(() => {
@@ -284,6 +290,66 @@ describe("resolveAgentHarnessBeforePromptBuildResult", () => {
 
     expect(calls).toEqual(["heartbeat", "before_prompt_build"]);
     expect(result.prompt).toBe("heartbeat context\n\nprompt context\n\nhello");
+  });
+
+  it("gives a plugin harness prompt build its own run's admission lifetime token only", async () => {
+    const runId = "harness-lifetime-run";
+    const admission = prepareAgentRunAdmission({
+      cfg: {},
+      facts: {
+        runId,
+        agentId: "main",
+        ingress: { kind: "system", boundary: "host-capability-test", state: "present" },
+      },
+      operationalRunInstance: createOperationalRunInstanceRef(runId),
+    });
+    const admittedRunContext = await admission.admit("plugin-harness", `harness-${runId}`);
+    const host = createAgentHarnessHostCapabilities({
+      attempt: {
+        agentId: "main",
+        sessionId: "harness-lifetime-session",
+        sessionKey: "agent:main:harness-lifetime",
+        runId,
+        admittedRunContext,
+      } as Parameters<typeof createAgentHarnessHostCapabilities>[0]["attempt"],
+      pluginId: "codex",
+    });
+    const captured: PluginHookAgentContext[] = [];
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        {
+          hookName: "before_prompt_build",
+          handler: async (_event: unknown, ctx: PluginHookAgentContext) => {
+            captured.push(ctx);
+            return undefined;
+          },
+        },
+      ]),
+    );
+    const build = (ctxRunId: string) =>
+      resolveAgentHarnessBeforePromptBuildResult({
+        prompt: "hello",
+        developerInstructions: "base",
+        messages: [],
+        ctx: { runId: ctxRunId },
+      });
+    try {
+      // Plugin harnesses build their own hook context without the token; the
+      // host scope of the attempt supplies the run's token to that run only.
+      await host.runWithScope(async () => {
+        await build(runId);
+        await build("another-run");
+      });
+      await build(runId);
+      const lifetime = admissionLifetimeOf(admittedRunContext.operationalRunInstance);
+      expect(captured).toHaveLength(3);
+      expect(captured[0]?.admissionLifetime).toBe(lifetime);
+      expect(captured[1]).not.toHaveProperty("admissionLifetime");
+      expect(captured[2]).not.toHaveProperty("admissionLifetime");
+    } finally {
+      host.close();
+      admission.close();
+    }
   });
 
   it("preserves authenticated channel identity in prompt-build hook context", async () => {

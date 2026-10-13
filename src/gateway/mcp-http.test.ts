@@ -10,6 +10,8 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import {
+  appendAdmittedRunSource,
+  captureAdmittedRunSource,
   createOperationalRunInstanceRef,
   prepareAgentRunAdmission,
   type AdmittedRunContext,
@@ -33,6 +35,7 @@ import type { AnyAgentTool } from "../agents/tools/common.js";
 import { getGatewayToolCallerIdentity } from "../agents/tools/gateway-caller-context.js";
 import { createLibrarySkillWorkshopTool } from "../agents/tools/skill-workshop-tool-library.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { createHostChannelTurnSource } from "../infra/host-turn-source.js";
 import {
   drainSystemEventEntries,
   enqueueSystemEventWithReceipt,
@@ -1533,6 +1536,94 @@ describe("mcp loopback server", () => {
       turnSourceTo: boundContext.currentChannelId,
       turnSourceAccountId: boundContext.accountId,
       turnSourceThreadId: boundContext.currentThreadTs,
+    });
+  });
+
+  it("gives before_tool_call the bound run's current admitted source on every loopback call", async () => {
+    const { port, runtime } = await startLoopbackServerForTest();
+    const runId = "run-source";
+    const channelSource = (messageId: string) =>
+      createHostChannelTurnSource({
+        actor: {
+          channel: "msteams",
+          accountId: "default",
+          senderId: "aad-owner",
+          actorKind: "human",
+        },
+        message: {
+          messageId,
+          conversationId: "teams-dm",
+          conversationKind: "direct",
+          eventKind: "message",
+        },
+      });
+    const admission = prepareAgentRunAdmission({
+      cfg: {},
+      facts: {
+        runId,
+        agentId: "main",
+        ingress: { kind: "channel", boundary: "mcp-http-test", state: "present" },
+      },
+      operationalRunInstance: createOperationalRunInstanceRef(runId),
+      turnSource: channelSource("activity-1"),
+      sessionKey: "agent:main:msteams:direct:aad-owner",
+    });
+    activeAdmissions.push(admission);
+    const admittedRunContext = await admission.admit("gateway", `gateway-${runId}`);
+    resolveGatewayScopedToolsMock.mockReturnValue({
+      agentId: "main",
+      tools: [makeMessageTool()],
+    });
+    const boundContext = {
+      sessionKey: "agent:main:msteams:direct:aad-owner",
+      agentId: "main",
+      sessionId: "session-source",
+      runId,
+      messageProvider: "msteams",
+      senderIsOwner: true,
+      nativeCronCreatorToolAllowlist: ["read"],
+    } satisfies McpLoopbackRequestContext;
+    const grant = mintMcpLoopbackClientGrant({
+      context: boundContext,
+      runtimeOwnerToken: runtime.ownerToken,
+      admittedRunContext,
+    });
+    const capture = activateMcpLoopbackClientGrantCapture({
+      token: grant.token,
+      runtimeOwnerToken: runtime.ownerToken,
+      captureKey: "capture-source",
+    });
+    if (!capture) {
+      throw new Error("expected an active native capture");
+    }
+    expect(capture.captureNativeToolAuthority(boundContext.nativeCronCreatorToolAllowlist)).toBe(
+      true,
+    );
+    const call = async () =>
+      await sendRaw({
+        port,
+        token: grant.token,
+        headers: jsonHeaders({ "x-openclaw-cli-capture-key": "capture-source" }),
+        body: mcpToolCallBody("message"),
+      });
+
+    expect((await call()).status).toBe(200);
+    const first = getBeforeToolCallHookInput(0).ctx;
+    expect(first?.readSource?.()).toEqual(captureAdmittedRunSource(admittedRunContext).source);
+    expect(first?.readSource?.()).toMatchObject({
+      runId,
+      revision: 0,
+      completeness: "complete",
+      inputs: [{ origin: "user", message: { messageId: "activity-1" } }],
+    });
+
+    // An accepted steer appends to the admitted source; the next loopback call
+    // reads the new revision, not a value captured at grant time.
+    appendAdmittedRunSource(admittedRunContext, channelSource("activity-2"));
+    expect((await call()).status).toBe(200);
+    expect(getBeforeToolCallHookInput(1).ctx?.readSource?.()).toMatchObject({
+      revision: 1,
+      inputs: [{ message: { messageId: "activity-1" } }, { message: { messageId: "activity-2" } }],
     });
   });
 

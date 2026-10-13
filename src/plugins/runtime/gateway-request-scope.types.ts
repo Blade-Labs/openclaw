@@ -9,6 +9,15 @@ import type { PluginRegistry } from "../registry-types.js";
 import type { OpenClawPluginNodeWorkspace } from "../types.node-host.js";
 
 export type PluginRuntimeGatewayRequestScope = {
+  /**
+   * The operational run a plugin harness attempt executes for, with its opaque
+   * admission lifetime token. Host-owned; the generic harness prompt-build
+   * helper attaches the token only to that exact run's hook context.
+   */
+  harnessAdmission?: Readonly<{
+    runId: string;
+    lifetime: Readonly<Record<string, never>>;
+  }>;
   /** Recheck the admitted HTTP device or cookie grant before effects/disclosure; rejection sends HTTP 401 and throws. */
   revalidate?: () => Promise<void>;
   /** Exact placement owner captured before the local harness begins. */

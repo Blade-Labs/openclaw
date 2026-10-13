@@ -1,5 +1,7 @@
 // Emits reset hooks and cleanup work around session reset commands.
 import { resolveDefaultAgentId } from "../../agents/agent-scope.js";
+import { readChannelContextApprovalActor } from "../../channels/message-access/admission-evidence.js";
+import { readAdmittedChannelApprovalActor } from "../../channels/message-access/approval-actor.js";
 import { formatSqliteSessionFileMarker } from "../../config/sessions/legacy-sqlite-marker.js";
 import { loadTranscriptEvents } from "../../config/sessions/session-accessor.js";
 import { resolveSessionStorePathForScope } from "../../config/sessions/session-store-path.js";
@@ -7,11 +9,15 @@ import { selectSessionTranscriptLeafControlledPath } from "../../config/sessions
 import { logVerbose } from "../../globals.js";
 import { createInternalHookEvent, triggerInternalHook } from "../../hooks/internal-hooks.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
+import { withHookTimeout } from "../../plugins/hook-timeout.js";
 import { parseAgentSessionKey } from "../../routing/session-key.js";
+import { runOutsideAsyncWorkScope } from "../../shared/async-work-scope.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
+import { parseSoftResetCommand } from "./commands-reset-mode.js";
 import type { HandleCommandsParams } from "./commands-types.js";
 
 const routeReplyRuntimeLoader = createLazyImportLoader(() => import("./route-reply.runtime.js"));
+const BEFORE_RESET_TIMEOUT_MS = 5_000;
 
 function loadRouteReplyRuntime() {
   return routeReplyRuntimeLoader.load();
@@ -71,7 +77,14 @@ export async function emitResetCommandHooks(params: {
   cfg: HandleCommandsParams["cfg"];
   command: Pick<
     HandleCommandsParams["command"],
-    "surface" | "senderId" | "channel" | "from" | "to" | "resetHookTriggered"
+    | "surface"
+    | "senderId"
+    | "channel"
+    | "from"
+    | "to"
+    | "resetHookTriggered"
+    | "isAuthorizedSender"
+    | "commandBodyNormalized"
   >;
   sessionKey?: string;
   storePath?: string;
@@ -153,21 +166,66 @@ export async function emitResetCommandHooks(params: {
         sessionKey: params.sessionKey,
         storePath,
       }));
-    void (async () => {
-      try {
-        await hookRunner.runBeforeReset(
-          { sessionFile, messages, reason: params.action },
-          {
-            agentId,
-            sessionKey: params.sessionKey,
-            sessionId: prevEntry?.sessionId,
-            workspaceDir: params.workspaceDir,
-          },
-        );
-      } catch (err: unknown) {
-        logVerbose(`before_reset hook failed: ${String(err)}`);
+    let senderId: string | undefined;
+    let actorKind: "human" | undefined;
+    try {
+      // Read after transcript/reply awaits so a closed transport owner cannot label this reset.
+      const admitted = readChannelContextApprovalActor(params.ctx);
+      const actor = admitted ? readAdmittedChannelApprovalActor(admitted)?.actor : undefined;
+      senderId = actor?.senderId;
+      if (
+        actor?.actorKind === "human" &&
+        params.ctx.SenderIsBot !== true &&
+        params.ctx.InboundEventKind !== "room_event" &&
+        !params.ctx.InternalTurnSource &&
+        (!params.ctx.InputProvenance || params.ctx.InputProvenance.kind === "external_user")
+      ) {
+        actorKind = "human";
       }
-    })();
+    } catch (err: unknown) {
+      logVerbose(`before_reset: admitted actor unavailable (${String(err)})`);
+    }
+    const invocation = new AbortController();
+    const hookInvocation = Object.freeze({
+      signal: invocation.signal,
+      assertActive() {
+        invocation.signal.throwIfAborted();
+      },
+    });
+    try {
+      // Await the bounded result without making scope cleanup join timed-out plugin work.
+      await runOutsideAsyncWorkScope(() =>
+        withHookTimeout(
+          hookRunner.runBeforeReset(
+            { sessionFile, messages, reason: params.action },
+            {
+              hookInvocation,
+              agentId,
+              sessionKey: params.sessionKey,
+              sessionId: prevEntry?.sessionId,
+              workspaceDir: params.workspaceDir,
+              ...(senderId ? { senderId } : {}),
+              isAuthorizedSender: params.command.isAuthorizedSender,
+              ...(params.ctx.InputProvenance?.kind === "external_user"
+                ? { trigger: "user" }
+                : params.ctx.InternalTurnSource
+                  ? { trigger: params.ctx.InternalTurnSource }
+                  : {}),
+              ...(actorKind ? { actorKind } : {}),
+              resetMode: parseSoftResetCommand(params.command.commandBodyNormalized).matched
+                ? "soft"
+                : "hard",
+            },
+          ),
+          BEFORE_RESET_TIMEOUT_MS,
+        ),
+      );
+    } catch (err: unknown) {
+      logVerbose(`before_reset hook failed: ${String(err)}`);
+    } finally {
+      // Close the host wait even when the plugin's underlying work has not settled.
+      invocation.abort(new Error("reset hook invocation is no longer active"));
+    }
   }
   return { routedReply };
 }

@@ -6,8 +6,15 @@ import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import * as bootstrapCache from "../../agents/bootstrap-cache.js";
+import { buildChannelInboundEventContext } from "../../channels/inbound-event/context.js";
+import { createHostChannelInboundEventContextBuilder } from "../../channels/inbound-event/host-context-builder.js";
+import { readChannelContextTurnSource } from "../../channels/message-access/admission-evidence.js";
+import { createHostChannelIngressRuntime } from "../../channels/message-access/runtime.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import { loadSessionEntry, replaceSessionEntry } from "../../config/sessions/session-accessor.js";
+import { projectHostTurnSource } from "../../infra/host-turn-source.js";
+import type { PluginHookHandlerMap } from "../../plugins/hook-types.js";
+import { AsyncWorkScope } from "../../shared/async-work-scope.js";
 import type { MsgContext } from "../templating.js";
 import { buildCommandContext } from "./commands-context.js";
 import { maybeHandleResetCommand } from "./commands-reset.js";
@@ -15,6 +22,10 @@ import type { HandleCommandsParams } from "./commands-types.js";
 import { parseInlineSessionDirectives } from "./directive-handling.parse.js";
 
 const triggerInternalHookMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const pluginHooks = vi.hoisted(() => ({
+  enabled: false,
+  runBeforeReset: vi.fn<PluginHookHandlerMap["before_reset"]>(),
+}));
 const routeReplyMock = vi.hoisted(() =>
   vi.fn<
     (params: unknown) => Promise<{
@@ -48,7 +59,13 @@ vi.mock("../../hooks/internal-hooks.js", () => ({
 }));
 
 vi.mock("../../plugins/hook-runner-global.js", () => ({
-  getGlobalHookRunner: vi.fn(() => null),
+  getGlobalHookRunner: () =>
+    pluginHooks.enabled
+      ? {
+          hasHooks: (name: string) => name === "before_reset",
+          runBeforeReset: pluginHooks.runBeforeReset,
+        }
+      : null,
 }));
 
 vi.mock("../commands-registry.js", () => ({
@@ -147,11 +164,63 @@ function firstHookEvent(): Record<string, unknown> {
   return requireRecord(mockCall(triggerInternalHookMock)[0], "hook event");
 }
 
+async function buildAdmittedResetParams(
+  body = "/new",
+  actorKind: "human" | "bot" | "unknown" = "human",
+) {
+  let live = true;
+  const owner = { channelId: "test", isLive: () => live };
+  const sessionKey = "agent:main:test:direct:conversation";
+  const senderId = "opaque:sender";
+  const channelIngress = await createHostChannelIngressRuntime(owner).resolveStable({
+    channelId: "test",
+    accountId: "default",
+    source: { actorKind, eventKind: "message" },
+    subject: { stableId: senderId },
+    conversation: { kind: "direct", id: "conversation" },
+    contextBinding: {
+      agentId: "main",
+      sessionKey,
+      messageId: "reset-message",
+      inboundEventKind: "user_request",
+    },
+    dmPolicy: "open",
+    groupPolicy: "open",
+    allowFrom: ["*"],
+  });
+  const buildContext = createHostChannelInboundEventContextBuilder(
+    buildChannelInboundEventContext,
+    owner,
+  );
+  const ctx = await buildContext({
+    channel: "test",
+    accountId: "default",
+    messageId: "reset-message",
+    from: "test:sender",
+    sender: { id: senderId, isBot: actorKind === "bot" },
+    conversation: { kind: "direct", id: "conversation" },
+    route: { agentId: "main", routeSessionKey: sessionKey },
+    reply: { to: "test:sender" },
+    message: { rawBody: body, commandBody: body },
+    access: { commands: { authorized: true } },
+    extra: { InputProvenance: { kind: "external_user" } },
+    channelIngress,
+  });
+  const params = buildResetParams(body, {});
+  params.ctx = ctx;
+  params.sessionKey = sessionKey;
+  params.command.senderId = "command-normalized-sender";
+  params.previousSessionResetMessages = [{ role: "user", content: "before reset" }];
+  return { params, close: () => (live = false) };
+}
+
 describe("handleCommands reset hooks", () => {
   let clearBootstrapSnapshotSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     vi.clearAllMocks();
+    pluginHooks.enabled = false;
+    pluginHooks.runBeforeReset.mockReset().mockResolvedValue(undefined);
     clearBootstrapSnapshotSpy = vi.spyOn(bootstrapCache, "clearBootstrapSnapshot");
     resetMocks.resetConfiguredBindingTargetInPlace.mockResolvedValue({ ok: true });
     resetMocks.resolveBoundAcpThreadSessionKey.mockResolvedValue(undefined);
@@ -165,7 +234,192 @@ describe("handleCommands reset hooks", () => {
 
   afterEach(() => {
     clearBootstrapSnapshotSpy.mockRestore();
+    vi.useRealTimers();
   });
+
+  it.each([
+    ["/new", "new", "hard"],
+    ["/new soft", "new", "hard"],
+    ["/reset", "reset", "hard"],
+    ["/reset soft", "reset", "soft"],
+    ["/ReSeT SoFt keep going", "reset", "soft"],
+  ] as const)("describes the admitted human and mode for %s", async (body, reason, resetMode) => {
+    pluginHooks.enabled = true;
+    const { params } = await buildAdmittedResetParams(body);
+    const source = projectHostTurnSource(
+      readChannelContextTurnSource(params.ctx),
+      "test-run",
+      "test-session",
+    );
+
+    await maybeHandleResetCommand(params);
+
+    expect(pluginHooks.runBeforeReset).toHaveBeenCalledExactlyOnceWith(
+      { sessionFile: params.sessionKey, messages: params.previousSessionResetMessages, reason },
+      expect.objectContaining({
+        senderId: source.inputs[0]?.origin === "user" ? source.inputs[0].actor.senderId : undefined,
+        isAuthorizedSender: true,
+        trigger: "user",
+        actorKind: "human",
+        resetMode,
+      }),
+    );
+    expect(params.command.resetHookTriggered).toBe(true);
+    if (resetMode === "soft") {
+      expect(params.command.softResetTriggered).toBe(true);
+      expect(params.command.softResetTail).toBe(body === "/reset soft" ? "" : "keep going");
+    }
+  });
+
+  it.each([
+    "bot",
+    "journal replay",
+    "replayed command",
+    "recovered command",
+    "system event",
+    "gateway chat.send",
+    "closed owner",
+    "missing provenance",
+  ])("describes actor provenance for %s", async (kind) => {
+    pluginHooks.enabled = true;
+    const { params, close } = await buildAdmittedResetParams(
+      "/new",
+      kind === "bot" ? "bot" : kind === "journal replay" ? "unknown" : "human",
+    );
+    if (kind === "replayed command" || kind === "recovered command") {
+      // Serialized/reconstructed contexts cannot retain the private admission carrier.
+      params.ctx = { ...params.ctx };
+    } else if (kind === "system event") {
+      params.ctx.InputProvenance = { kind: "internal_system" };
+      params.ctx.InternalTurnSource = "cron";
+    } else if (kind === "gateway chat.send") {
+      params.ctx = {
+        Body: "/new",
+        Provider: "webchat",
+        Surface: "webchat",
+        SenderId: "gateway-operator",
+        CommandAuthorized: true,
+        GatewayClientScopes: ["operator.admin"],
+        InputProvenance: { kind: "external_user" },
+      };
+    } else if (kind === "closed owner") {
+      triggerInternalHookMock.mockImplementationOnce(async () => close());
+    } else if (kind === "missing provenance") {
+      delete params.ctx.InputProvenance;
+      params.command.isAuthorizedSender = false;
+    }
+
+    await maybeHandleResetCommand(params);
+
+    expect(pluginHooks.runBeforeReset).toHaveBeenCalledOnce();
+    const ctx = pluginHooks.runBeforeReset.mock.calls[0]?.[1];
+    if (kind === "missing provenance") {
+      expect(ctx).toMatchObject({ actorKind: "human", isAuthorizedSender: false });
+      expect(ctx).not.toHaveProperty("trigger");
+    } else {
+      expect(ctx).not.toHaveProperty("actorKind");
+    }
+    if (kind === "system event") {
+      expect(ctx).toHaveProperty("trigger", "cron");
+    }
+    if (
+      ["replayed command", "recovered command", "gateway chat.send", "closed owner"].includes(kind)
+    ) {
+      expect(ctx).not.toHaveProperty("senderId");
+    }
+  });
+
+  it("settles before_reset before completing the reset command", async () => {
+    vi.useFakeTimers();
+    pluginHooks.enabled = true;
+    const started = createDeferred();
+    const settle = createDeferred();
+    const order: string[] = [];
+    pluginHooks.runBeforeReset.mockImplementationOnce(async (_event, ctx) => {
+      started.resolve();
+      expect(ctx.hookInvocation?.signal?.aborted).toBe(false);
+      expect(() => ctx.hookInvocation?.assertActive()).not.toThrow();
+      order.push("hook started");
+      await settle.promise;
+      expect(ctx.hookInvocation?.signal?.aborted).toBe(false);
+      expect(() => ctx.hookInvocation?.assertActive()).not.toThrow();
+      order.push("hook recorded reset");
+    });
+    const params = buildResetParams("/new", {});
+    const completion = maybeHandleResetCommand(params).then((result) => {
+      order.push("command completed");
+      return result;
+    });
+    await started.promise;
+    await vi.advanceTimersByTimeAsync(0);
+    const pendingOrder = [...order];
+    settle.resolve();
+    const result = await completion;
+
+    expect(pendingOrder).toEqual(["hook started"]);
+    expect(order).toEqual(["hook started", "hook recorded reset", "command completed"]);
+    expect(result?.reply?.text).toBe("✅ New session started.");
+    const invocation = pluginHooks.runBeforeReset.mock.calls[0]?.[1].hookInvocation;
+    expect(invocation?.signal?.aborted).toBe(true);
+    expect(() => invocation?.assertActive()).toThrow("no longer active");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["throw", "timeout"])(
+    "preserves reset completion and reply after a hook %s",
+    async (failure) => {
+      vi.useFakeTimers();
+      pluginHooks.enabled = true;
+      const started = createDeferred();
+      const hanging = createDeferred();
+      let lateSignalAborted: boolean | undefined;
+      let lateAuthorityError: unknown;
+      pluginHooks.runBeforeReset.mockImplementationOnce((_event, ctx) => {
+        started.resolve();
+        if (failure === "throw") {
+          throw new Error("plugin failure");
+        }
+        return hanging.promise.then(() => {
+          lateSignalAborted = ctx.hookInvocation?.signal?.aborted;
+          try {
+            ctx.hookInvocation?.assertActive();
+          } catch (err) {
+            lateAuthorityError = err;
+          }
+        });
+      });
+      const params = buildResetParams("/reset", {});
+      const scope = new AsyncWorkScope();
+      const completion = scope.run(() => maybeHandleResetCommand(params));
+      await started.promise;
+      const invocation = pluginHooks.runBeforeReset.mock.calls[0]?.[1].hookInvocation;
+      if (failure === "timeout") {
+        await vi.advanceTimersByTimeAsync(4_999);
+        expect(invocation?.signal?.aborted).toBe(false);
+        expect(() => invocation?.assertActive()).not.toThrow();
+        await vi.advanceTimersByTimeAsync(1);
+      }
+      const result = await completion;
+      const pendingWork = scope.hasPendingWork;
+      expect(invocation?.signal?.aborted).toBe(true);
+      expect(() => invocation?.assertActive()).toThrow("no longer active");
+      hanging.resolve();
+      await pluginHooks.runBeforeReset.mock.results[0]?.value;
+      if (failure === "timeout") {
+        expect(lateSignalAborted).toBe(true);
+        expect(lateAuthorityError).toBeInstanceOf(Error);
+        expect(String(lateAuthorityError)).toContain("no longer active");
+      }
+
+      expect(result).toEqual({
+        shouldContinue: false,
+        reply: { text: "✅ Session reset.", isStatusNotice: true },
+      });
+      expect(params.command.resetHookTriggered).toBe(true);
+      expect(pendingWork).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
 
   it("triggers hooks for /new commands", async () => {
     const cases = [

@@ -3,6 +3,7 @@ import type {
   GatewayRequestContext,
   GatewayRequestOptions,
 } from "../../gateway/server-methods/types.js";
+import type { PluginHookAgentContext } from "../hook-types.js";
 import type { PluginOrigin } from "../plugin-origin.types.js";
 import type { DeclaredProviderOwnerIndex } from "../provider-owner-index.js";
 import type { PluginRegistry } from "../registry-types.js";
@@ -17,6 +18,8 @@ export type PluginRuntimeGatewayRequestScope = {
   harnessAdmission?: Readonly<{
     runId: string;
     lifetime: Readonly<Record<string, never>>;
+    /** The run's current admitted turn source, as embedded/CLI prompt builds carry it. */
+    readSource: () => PluginHookAgentContext["source"];
   }>;
   /** Recheck the admitted HTTP device or cookie grant before effects/disclosure; rejection sends HTTP 401 and throws. */
   revalidate?: () => Promise<void>;

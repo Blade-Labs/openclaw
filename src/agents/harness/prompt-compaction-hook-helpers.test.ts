@@ -8,6 +8,7 @@ import type { PluginHookAgentContext } from "../../plugins/hook-types.js";
 import { createMockPluginRegistry } from "../../plugins/hooks.test-fixtures.js";
 import {
   admissionLifetimeOf,
+  captureAdmittedRunSource,
   createOperationalRunInstanceRef,
   prepareAgentRunAdmission,
 } from "../admitted-run-context.js";
@@ -346,6 +347,14 @@ describe("resolveAgentHarnessBeforePromptBuildResult", () => {
       expect(captured[0]?.admissionLifetime).toBe(lifetime);
       expect(captured[1]).not.toHaveProperty("admissionLifetime");
       expect(captured[2]).not.toHaveProperty("admissionLifetime");
+      // The same run-matched scope supplies the run's admitted turn source,
+      // as embedded and CLI prompt builds carry it.
+      const source = captureAdmittedRunSource(admittedRunContext).source;
+      expect(source).toBeDefined();
+      expect(captured[0]?.source).toEqual(source);
+      expect(captured[0]?.source).toMatchObject({ version: 1, runId });
+      expect(captured[1]).not.toHaveProperty("source");
+      expect(captured[2]).not.toHaveProperty("source");
     } finally {
       host.close();
       admission.close();

@@ -70,15 +70,17 @@ export async function resolveAgentHarnessBeforePromptBuildResult(params: {
     };
   }
   // A plugin harness runs inside the host scope of the run it executes; the
-  // run's lifetime token is attached only to that exact run's prompt build.
+  // run's lifetime token and admitted turn source are attached only to that
+  // exact run's prompt build.
   const harnessAdmission = getPluginRuntimeGatewayRequestScope()?.harnessAdmission;
+  const sameRun = Boolean(harnessAdmission && params.ctx.runId === harnessAdmission.runId);
+  const scopeSource = sameRun && !params.ctx.source ? harnessAdmission?.readSource() : undefined;
   const hookCtx = buildAgentHookContext({
     ...params.ctx,
-    ...(!params.ctx.admissionLifetime &&
-    harnessAdmission &&
-    params.ctx.runId === harnessAdmission.runId
+    ...(!params.ctx.admissionLifetime && sameRun && harnessAdmission
       ? { admissionLifetime: harnessAdmission.lifetime }
       : {}),
+    ...(scopeSource ? { source: scopeSource } : {}),
   });
   const promptEvent = {
     prompt: inputPrompt,

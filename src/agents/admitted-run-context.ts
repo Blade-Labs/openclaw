@@ -448,17 +448,27 @@ export function admissionLifetimeOf(instance: OperationalRunInstanceRef): Admiss
 /**
  * Host request-scope fields for a plugin harness attempt: plugin harnesses
  * build their own hook context, so the generic prompt-build helper attaches
- * the run's lifetime token from this scope, for that exact run only.
+ * the run's lifetime token and its current admitted turn source from this
+ * scope, for that exact run only.
  */
 export function harnessAdmissionScope(
   runId: string,
   context: AdmittedRunContext | undefined,
-): { harnessAdmission?: Readonly<{ runId: string; lifetime: AdmissionLifetime }> } {
+): {
+  harnessAdmission?: Readonly<{
+    runId: string;
+    lifetime: AdmissionLifetime;
+    readSource: () => AdmittedSourceSnapshot["source"];
+  }>;
+} {
   return context
     ? {
         harnessAdmission: Object.freeze({
           runId,
           lifetime: admissionLifetimeOf(context.operationalRunInstance),
+          // Read at prompt-build time: the source revision can grow while
+          // the run executes.
+          readSource: () => captureAdmittedRunSource(context).source,
         }),
       }
     : {};

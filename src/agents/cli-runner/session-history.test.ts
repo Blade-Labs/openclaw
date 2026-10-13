@@ -9,6 +9,8 @@ import {
   resolveSessionTranscriptDatabasePath,
   upsertSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
+import { buildSessionResetBoundaryEvent } from "../../config/sessions/session-reset-boundary-event.js";
+import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import type { PersistedUserTurnMessage } from "../../sessions/user-turn-transcript.types.js";
 import { withEnvAsync } from "../../test-utils/env.js";
 import { cleanupSessionStateForTest } from "../../test-utils/session-state-cleanup.js";
@@ -21,6 +23,7 @@ import {
   hasCliSessionTranscript,
   loadCliSessionContextEngineMessages,
   loadCliSessionHistoryMessages,
+  loadCliSessionHookHistory,
   loadCliSessionPromptContext,
   resolveAutoCliSessionReseedHistoryChars,
 } from "./session-history.js";
@@ -76,6 +79,237 @@ async function createSession(messages: string[] = [], agentId = "main") {
   }
   return { target, manager: SessionManager.open(target, dir), params: { sessionTarget: target } };
 }
+
+describe("CLI prompt hook history evidence", () => {
+  it.each([
+    {
+      scenario: "human /new",
+      reason: "new",
+      context: "clear",
+      source: "human-command",
+      boundary: true,
+      complete: true,
+      turns: 1,
+    },
+    {
+      scenario: "human hard /reset",
+      reason: "reset",
+      context: "clear",
+      source: "human-command",
+      boundary: true,
+      complete: true,
+      turns: 1,
+    },
+    {
+      scenario: "/reset soft (no transcript boundary)",
+      boundary: false,
+      complete: false,
+      turns: 2,
+    },
+    {
+      scenario: "idle retained tail",
+      reason: "idle",
+      context: "preserve-tail",
+      boundary: false,
+      complete: false,
+      turns: 1,
+    },
+    {
+      scenario: "daily retained tail",
+      reason: "daily",
+      context: "preserve-tail",
+      boundary: false,
+      complete: false,
+      turns: 1,
+    },
+    {
+      scenario: "automatic clear reset",
+      reason: "reset",
+      context: "clear",
+      boundary: false,
+      complete: false,
+      turns: 1,
+    },
+    { scenario: "legacy reset", legacy: true, boundary: false, complete: false, turns: 1 },
+    {
+      scenario: "oversized public turn",
+      reason: "new",
+      context: "clear",
+      source: "human-command",
+      extra: "oversized",
+      boundary: true,
+      complete: false,
+      turns: 2,
+    },
+    {
+      scenario: "two user turns",
+      reason: "new",
+      context: "clear",
+      source: "human-command",
+      extra: "user",
+      boundary: true,
+      complete: true,
+      turns: 2,
+    },
+    {
+      scenario: "count-limited public turns",
+      reason: "new",
+      context: "clear",
+      source: "human-command",
+      extra: "count",
+      boundary: true,
+      complete: false,
+      turns: MAX_CLI_SESSION_HISTORY_MESSAGES + 2,
+    },
+    {
+      scenario: "compaction",
+      reason: "new",
+      context: "clear",
+      source: "human-command",
+      extra: "compaction",
+      boundary: true,
+      complete: false,
+      turns: 1,
+    },
+    {
+      scenario: "saved notes",
+      reason: "new",
+      context: "clear",
+      source: "human-command",
+      extra: "notes",
+      boundary: true,
+      complete: false,
+      turns: 1,
+    },
+  ] as const)("accounts for $scenario before projecting hook messages", async (testCase) => {
+    const { target, params } = await createSession(["public history"]);
+    let resetId: string | undefined;
+    if ("context" in testCase) {
+      const request =
+        testCase.context === "clear"
+          ? {
+              context: "clear" as const,
+              reason: testCase.reason as "new" | "reset",
+              ...("source" in testCase ? { source: testCase.source } : {}),
+            }
+          : { context: "preserve-tail" as const, reason: testCase.reason as "idle" | "daily" };
+      const reset = buildSessionResetBoundaryEvent({
+        events: loadTranscriptEventsSync(target),
+        ...request,
+      });
+      resetId = reset.id;
+      await appendTranscriptEvent(target, reset);
+    } else if ("legacy" in testCase) {
+      await appendTranscriptEvent(target, {
+        type: "reset",
+        id: "legacy-reset",
+        reason: "new",
+        timestamp: new Date(0).toISOString(),
+      });
+    }
+    if ("extra" in testCase) {
+      if (
+        testCase.extra === "oversized" ||
+        testCase.extra === "user" ||
+        testCase.extra === "count"
+      ) {
+        const count = testCase.extra === "count" ? MAX_CLI_SESSION_HISTORY_MESSAGES + 1 : 1;
+        for (let index = 0; index < count; index++) {
+          await appendTranscriptMessage(target, {
+            eventId: `extra-${index}`,
+            message: {
+              role: "user",
+              content:
+                testCase.extra === "oversized"
+                  ? "P".repeat(5 * 1024 * 1024)
+                  : "public intervening turn",
+              timestamp: 0,
+            },
+          });
+        }
+      } else {
+        await appendTranscriptEvent(
+          target,
+          testCase.extra === "compaction"
+            ? {
+                type: "compaction",
+                id: "summary",
+                summary: "public instructions retained",
+                firstKeptEntryId: resetId,
+                tokensBefore: 100,
+                timestamp: new Date(0).toISOString(),
+              }
+            : {
+                type: "custom_message",
+                id: "notes",
+                customType: "notes",
+                content: "retained private context",
+                timestamp: new Date(0).toISOString(),
+              },
+        );
+      }
+    }
+    const recorder = createUserTurnTranscriptRecorder({
+      target: { ...target, sessionEntry: undefined },
+      input: { text: "Hello", timestamp: 1 },
+      updateMode: "none",
+    });
+    await recorder.persistApproved();
+    const admission = recorder.getAdmissionReceipt();
+    expect(admission).toBeDefined();
+    const history = await loadCliSessionHookHistory({ ...params, currentAdmission: admission });
+    expect(history.historyEvidence).toEqual({
+      ...(testCase.boundary ? { boundary: { id: resetId, reason: testCase.reason } } : {}),
+      complete: testCase.complete,
+      turnsSinceBoundary: testCase.turns,
+      currentEntry: { id: admission!.entryId, isLastEntry: true },
+    });
+    expect(history.messages.at(-1)).toMatchObject({ role: "user", content: "Hello" });
+    if ("extra" in testCase && testCase.extra === "oversized") {
+      expect(history.messages).toHaveLength(1);
+    }
+    if ("extra" in testCase && testCase.extra === "compaction") {
+      expect(history.messages).toHaveLength(1);
+    }
+  });
+
+  it("correlates admission rather than identical text, including later entries", async () => {
+    const { target, params } = await createSession();
+    await appendTranscriptEvent(
+      target,
+      buildSessionResetBoundaryEvent({
+        events: loadTranscriptEventsSync(target),
+        context: "clear",
+        reason: "new",
+        source: "human-command",
+      }),
+    );
+    const recorder = createUserTurnTranscriptRecorder({
+      target: { ...target, sessionEntry: undefined },
+      input: { text: "same", timestamp: 1 },
+      updateMode: "none",
+    });
+    await recorder.persistApproved();
+    const admission = recorder.getAdmissionReceipt()!;
+    await appendTranscriptMessage(target, {
+      message: { role: "user", content: "same", timestamp: 1 },
+    });
+    const history = await loadCliSessionHookHistory({ ...params, currentAdmission: admission });
+    expect(history.historyEvidence).toMatchObject({
+      turnsSinceBoundary: 2,
+      currentEntry: { id: admission.entryId, isLastEntry: false },
+    });
+    expect((await loadCliSessionHookHistory(params)).historyEvidence).not.toHaveProperty(
+      "currentEntry",
+    );
+    await expect(
+      loadCliSessionHookHistory({
+        ...params,
+        currentAdmission: { ...admission, sessionKey: "other-session" },
+      }),
+    ).rejects.toThrow("different session key");
+  });
+});
 
 it("recovers SQLite-only compacted history across every CLI reader", async () => {
   const stateDir = tempDirs.make("openclaw-cli-sqlite-");

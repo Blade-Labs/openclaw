@@ -9,13 +9,18 @@ import {
 } from "../../../packages/agent-core/src/harness/session/session.js";
 import { selectResetKeptEntries } from "../../../packages/agent-core/src/harness/session/tool-result-pairing.js";
 import {
-  readSessionTranscriptBoundedMessageTailPage,
   readSessionTranscriptWatermark,
   waitForSessionTranscriptProjection,
   type SessionTranscriptRuntimeTarget,
 } from "../../config/sessions/session-accessor.js";
+import { prepareSessionTranscriptHydration } from "../../config/sessions/session-transcript-hydration.js";
 import { SessionTranscriptStorageUnavailableError } from "../../config/sessions/session-transcript-projection-error.js";
-import { resolveSessionTranscriptReadFence } from "../../config/sessions/session-transcript-read-fence.js";
+import {
+  resolveSessionTranscriptReadFence,
+  runWithSessionTranscriptReadFence,
+} from "../../config/sessions/session-transcript-read-fence.js";
+import type { PluginHookHistoryEvidence } from "../../plugins/hook-types.js";
+import type { UserTurnTranscriptAdmissionReceipt } from "../../sessions/user-turn-transcript.types.js";
 import { estimateToolResultTextChars } from "../embedded-agent-runner/tool-result-text-budget.js";
 import { MAX_AGENT_HOOK_HISTORY_MESSAGES } from "../harness/hook-history.js";
 import { isOpenClawRuntimeContextCustomMessage } from "../internal-runtime-context.js";
@@ -381,37 +386,60 @@ export async function hasCliSessionTranscript({
 }
 
 /** Loads reset-aware active transcript messages for CLI lifecycle hook context. */
-export async function loadCliSessionHistoryMessages({
+export async function loadCliSessionHistoryMessages(
+  params: CliSessionHistoryParams,
+): Promise<unknown[]> {
+  return (await loadCliSessionHookHistory(params)).messages;
+}
+
+/** Loads hook messages and read-only completeness facts without changing message selection. */
+export async function loadCliSessionHookHistory({
   sessionManager,
   sessionTarget,
   abortSignal,
-}: CliSessionHistoryParams): Promise<unknown[]> {
+  currentAdmission,
+}: CliSessionHistoryParams & { currentAdmission?: UserTurnTranscriptAdmissionReceipt }): Promise<{
+  messages: unknown[];
+  historyEvidence: PluginHookHistoryEvidence;
+}> {
   abortSignal?.throwIfAborted();
+  const unknownEvidence = { complete: false, turnsSinceBoundary: null } as const;
   if (sessionManager) {
-    return loadCliMemoryEntries(sessionManager, true).flatMap((entry) =>
-      entry.type === "message" ? [entry.message] : [],
-    );
+    // Caller-owned views can be bounded or uncommitted; they cannot certify a durable boundary.
+    return {
+      messages: loadCliMemoryEntries(sessionManager, true).flatMap((entry) =>
+        entry.type === "message" ? [entry.message] : [],
+      ),
+      historyEvidence: unknownEvidence,
+    };
   }
   if (!sessionTarget) {
-    return [];
+    return { messages: [], historyEvidence: unknownEvidence };
   }
   const { restoreSessionColdTranscript } =
     await import("../../config/sessions/session-cold-storage.js");
   await restoreSessionColdTranscript(sessionTarget, () => abortSignal?.throwIfAborted());
   await waitForSessionTranscriptProjection(sessionTarget, abortSignal);
   // Hooks retain history across compactions; only reset closes their history window.
-  const page = readSessionTranscriptBoundedMessageTailPage(sessionTarget, {
+  const hydration = runWithSessionTranscriptReadFence(
+    currentAdmission ?? resolveSessionTranscriptReadFence(sessionTarget),
+    () => prepareSessionTranscriptHydration(sessionTarget, undefined, abortSignal),
+  );
+  const page = await hydration.readHookHistory({
     maxBytes: MAX_CLI_SESSION_HISTORY_BYTES,
     maxMessages: MAX_CLI_SESSION_HISTORY_MESSAGES,
-    offset: 0,
   });
+  hydration.assertCurrent();
   if (page.events.length < page.scannedMessages) {
     cliBackendLog.warn(
       `cli session history truncated to bounded message tail: ${sessionTarget.sessionId}`,
     );
   }
   // SAFETY: The message-position projection only selects canonical message events.
-  return page.events.map(({ event }) => (event as SessionMessageEntry).message);
+  return {
+    messages: page.events.map(({ event }) => (event as SessionMessageEntry).message),
+    historyEvidence: page.historyEvidence ?? unknownEvidence,
+  };
 }
 
 /** Loads canonical replay messages for context-engine updates. */

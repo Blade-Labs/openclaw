@@ -178,7 +178,7 @@ import {
 import {
   buildCliSessionHistoryPrompt,
   hasCliSessionTranscript,
-  loadCliSessionHistoryMessages,
+  loadCliSessionHookHistory,
   loadCliSessionPromptContext,
   resolveAutoCliSessionReseedHistoryChars,
 } from "./session-history.js";
@@ -1008,10 +1008,22 @@ async function prepareCliRunContextWithinReadFence(
     PreparedCliRunContext["bindQuestionAnswerAuthority"]
   > = (assertActive) => bindQuestionAnswerAuthorityForSession(questionSessionKey, assertActive);
   const modelDisplay = `${params.provider}/${modelId}`;
-  let openClawHistoryMessages: unknown[] | undefined;
-  const loadOpenClawHistoryMessages = async () => {
-    openClawHistoryMessages ??= await loadCliSessionHistoryMessages(params);
-    return openClawHistoryMessages;
+  let openClawHookHistory: Awaited<ReturnType<typeof loadCliSessionHookHistory>> | undefined;
+  const loadOpenClawHookHistory = async () => {
+    openClawHookHistory ??= await loadCliSessionHookHistory({
+      ...params,
+      currentAdmission: params.userTurnTranscriptRecorder?.getAdmissionReceipt(),
+    });
+    const target = params.sessionTarget;
+    return target &&
+      target.agentId === sessionAgentId &&
+      target.sessionId === params.sessionId &&
+      target.sessionKey === params.sessionKey
+      ? openClawHookHistory
+      : {
+          messages: openClawHookHistory.messages,
+          historyEvidence: { complete: false, turnsSinceBoundary: null },
+        };
   };
   // The same host turn source the agent-run hook projects, so prompt-build
   // plugins can qualify the turn before preparing a memory-bearing prompt.
@@ -1047,7 +1059,7 @@ async function prepareCliRunContextWithinReadFence(
       return await resolvePromptBuildHookResult({
         config: runConfig,
         prompt: params.prompt,
-        messages: await loadOpenClawHistoryMessages(),
+        ...(await loadOpenClawHookHistory()),
         hookCtx: promptBuildHookContext,
         hookRunner: promptBuildHookRunner,
         bootstrapContextRunKind: params.bootstrapContextRunKind,
@@ -1386,7 +1398,7 @@ async function prepareCliRunContextWithinReadFence(
       return await promptBuildHookRunner.runAuthorizedPromptBuild(
         {
           prompt: params.prompt,
-          messages: await loadOpenClawHistoryMessages(),
+          ...(await loadOpenClawHookHistory()),
         },
         promptBuildHookContext,
         {

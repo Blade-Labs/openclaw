@@ -1,3 +1,5 @@
+import type { PluginHookHistoryEvidence } from "./hook-types.js";
+
 // before_model_resolve hook
 export type PluginHookBeforeModelResolveAttachment = {
   kind: "image" | "video" | "audio" | "document" | "other";
@@ -27,6 +29,8 @@ export type PluginHookBeforePromptBuildEvent = {
   currentUserMessageId?: string;
   /** Session messages prepared for this run. */
   messages: unknown[];
+  /** CLI canonical snapshot evidence. Other runners omit it; absence means no evidence. */
+  readonly historyEvidence?: PluginHookHistoryEvidence;
 };
 
 export type PluginHookBeforePromptBuildResult = {

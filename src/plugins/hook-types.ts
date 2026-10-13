@@ -50,6 +50,18 @@ import type {
   PluginHookSkillProposalEvaluateResult,
 } from "./hook-skill.types.js";
 import type { PluginJsonValue } from "./host-hook-json.js";
+
+/** Read-only CLI transcript facts for this hook's session and run; never admission authority. */
+export type PluginHookHistoryEvidence = Readonly<{
+  /** Only a committed explicit human command that cleared context; legacy events do not qualify. */
+  boundary?: Readonly<{ id: string; reason: "new" | "reset" }>;
+  /** Every post-reset entry is represented in messages, with no retained prefix or omissions. */
+  complete: boolean;
+  /** Canonical post-reset user count, including omitted entries; null when unprovable. */
+  turnsSinceBoundary: number | null;
+  /** Admission-receipt identity, present only if it is a user entry on this snapshot's window. */
+  currentEntry?: Readonly<{ id: string; isLastEntry: boolean }>;
+}>;
 import type {
   PluginAgentTurnPrepareEvent,
   PluginAgentTurnPrepareResult,

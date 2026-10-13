@@ -143,6 +143,20 @@ export function createSessionHistoryWorkerReaders(
         input.limits ? undefined : receiveChunk,
       );
     },
+    readHookHistory: async (input, signal) =>
+      await runRequest(
+        () => ({ kind: "hook-history", ...input }),
+        JSON.stringify(input).length * 2,
+        (value) => {
+          if (typeof value === "boolean" || Array.isArray(value) || value.kind !== "hook-history") {
+            throw new Error(
+              "Session history worker returned another result instead of hook history",
+            );
+          }
+          return value.page;
+        },
+        signal,
+      ),
     readCurrentTurnEntry: async (input, signal) =>
       await runRequest(
         () => ({ kind: "current-turn-entry", ...input }),

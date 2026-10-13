@@ -5,6 +5,7 @@ import {
   executeSqliteQueryTakeFirstSync,
   iterateSqliteQuerySync,
 } from "../../infra/kysely-sync.js";
+import type { PluginHookHistoryEvidence } from "../../plugins/hook-types.js";
 import type { TranscriptReadWindow } from "../../sessions/transcript-read-window.js";
 import { withCurrentProjectionSnapshot } from "./session-accessor.sqlite-active-projection.js";
 import type {
@@ -21,6 +22,7 @@ import {
   selectMessagePayload,
   selectMessageRows,
   type SessionTranscriptMessageEvent,
+  type CurrentTranscriptProjection,
 } from "./session-accessor.sqlite-projection-read.js";
 import {
   iterateVisibleMessageRange,
@@ -30,6 +32,7 @@ import {
   resolveVisibleMessagePositions,
   resolveTranscriptBoundaryWindow,
 } from "./session-accessor.sqlite-reset-window.js";
+import type { ResolvedTranscriptReadScope } from "./session-accessor.sqlite-scope.js";
 import {
   DEFAULT_VISIBLE_MESSAGE_MAX_BYTES,
   DEFAULT_VISIBLE_MESSAGE_MAX_MESSAGES,
@@ -72,6 +75,7 @@ export type SessionTranscriptMessageAnchorPage = SessionTranscriptMessageEventPa
 };
 
 export type SessionTranscriptBoundedMessageTailPage = SessionTranscriptMessageEventPage & {
+  historyEvidence?: PluginHookHistoryEvidence;
   // `events` may remain sparse for salvage callers; this count marks the
   // authoritative newest suffix before the first byte-budget omission.
   newestContiguousEventCount: number;
@@ -83,6 +87,102 @@ export type SessionTranscriptBoundedMessageTailPage = SessionTranscriptMessageEv
     indexedSeq: number;
   };
 };
+
+function readHookHistoryEvidence(
+  projection: CurrentTranscriptProjection,
+  visibleMessages: number,
+): PluginHookHistoryEvidence {
+  const window = resolveTranscriptBoundaryWindow(projection);
+  const db = getActiveTranscriptKysely(projection.database);
+  const active = db
+    .selectFrom("session_transcript_active_events as active")
+    .innerJoin("transcript_events as event", (join) =>
+      join
+        .onRef("event.session_id", "=", "active.session_id")
+        .onRef("event.seq", "=", "active.event_seq"),
+    )
+    .where("active.session_id", "=", projection.resolved.sessionId);
+  const canonicalEvent = transcriptEventJsonSql(projection.database.db, "event");
+  const boundary = window
+    ? executeSqliteQueryTakeFirstSync(
+        projection.database.db,
+        active
+          // Read only committed control fields; cached projections may predate this contract.
+          .select((eb) => [
+            eb.fn<unknown>("json_extract", [canonicalEvent, eb.val("$.type")]).as("type"),
+            eb.fn<unknown>("json_extract", [canonicalEvent, eb.val("$.id")]).as("id"),
+            eb.fn<unknown>("json_extract", [canonicalEvent, eb.val("$.context")]).as("context"),
+            eb.fn<unknown>("json_extract", [canonicalEvent, eb.val("$.source")]).as("source"),
+            eb.fn<unknown>("json_extract", [canonicalEvent, eb.val("$.reason")]).as("reason"),
+            eb
+              .fn<unknown>("json_extract", [canonicalEvent, eb.val("$.firstKeptEntryId")])
+              .as("firstKeptEntryId"),
+          ])
+          .where("active.event_seq", "=", window.boundarySeq),
+      )
+    : undefined;
+  const trustedBoundary =
+    boundary?.type === "reset" &&
+    typeof boundary.id === "string" &&
+    boundary.context === "clear" &&
+    boundary.source === "human-command" &&
+    boundary.firstKeptEntryId === null &&
+    (boundary.reason === "new" || boundary.reason === "reset")
+      ? { id: boundary.id, reason: boundary.reason }
+      : undefined;
+  const admission = resolveSqliteSessionTranscriptReadFence({
+    database: projection.database,
+    ...projection.resolved,
+  })?.admission;
+  let turnsSinceBoundary = 0;
+  let entries = 0;
+  let messagesOnly = true;
+  let currentEntry: PluginHookHistoryEvidence["currentEntry"];
+  // Navigation facts cover the entire post-reset path, including oversized messages,
+  // compactions and notes. Body/count budgets apply only to the returned messages.
+  for (const row of iterateSqliteQuerySync(
+    projection.database.db,
+    active
+      .select((eb) => [
+        eb
+          .fn<unknown>("json_extract", [transcriptEventNavigationSql("event"), eb.val("$.type")])
+          .as("type"),
+        eb
+          .fn<unknown>("json_extract", [transcriptEventNavigationSql("event"), eb.val("$.id")])
+          .as("id"),
+        eb
+          .fn<unknown>("json_extract", [
+            transcriptEventNavigationSql("event"),
+            eb.val("$.message.role"),
+          ])
+          .as("role"),
+      ])
+      .where("active.active_position", ">", window?.boundaryActivePosition ?? -1)
+      .orderBy("active.active_position", "asc"),
+  )) {
+    entries++;
+    messagesOnly &&= row.type === "message";
+    if (row.type === "message" && row.role === "user") {
+      turnsSinceBoundary++;
+      if (admission?.entryId === row.id) {
+        currentEntry = {
+          id: admission.entryId,
+          isLastEntry: projection.state.leafEventId === row.id,
+        };
+      }
+    }
+  }
+  return {
+    ...(trustedBoundary ? { boundary: trustedBoundary } : {}),
+    complete:
+      Boolean(trustedBoundary) &&
+      messagesOnly &&
+      entries === visibleMessages &&
+      window?.keptMessagePositions.length === 0,
+    turnsSinceBoundary,
+    ...(currentEntry ? { currentEntry } : {}),
+  };
+}
 
 /** Reads every message event on the active path. Full callers remain intentionally O(output). */
 export function readSessionTranscriptMessageEvents(
@@ -544,7 +644,14 @@ export function readSessionTranscriptMessageEventPage(
 /** Reads a tail page whose materialized event payloads fit a hard byte budget. */
 export function readSessionTranscriptBoundedMessageTailPage(
   scope: SessionTranscriptReadScope,
-  options: { maxBytes: number; maxMessages: number; offset: number; readOnly?: boolean },
+  options: {
+    maxBytes: number;
+    maxMessages: number;
+    offset: number;
+    readOnly?: boolean;
+    includeHistoryEvidence?: boolean;
+    resolvedScope?: ResolvedTranscriptReadScope;
+  },
 ): SessionTranscriptBoundedMessageTailPage {
   return withCurrentProjectionSnapshot(
     scope,
@@ -555,6 +662,9 @@ export function readSessionTranscriptBoundedMessageTailPage(
         generation: projection.generation,
         indexedSeq: projection.state.indexedSeq,
       };
+      const evidence = options.includeHistoryEvidence
+        ? readHookHistoryEvidence(projection, visible.total)
+        : undefined;
       const totalMessages = visible.total;
       const offset = Math.min(
         Math.max(0, Math.floor(Number.isFinite(options.offset) ? options.offset : 0)),
@@ -580,6 +690,14 @@ export function readSessionTranscriptBoundedMessageTailPage(
           serializedBytes: 0,
           snapshot,
           totalMessages,
+          ...(evidence
+            ? {
+                historyEvidence: {
+                  ...evidence,
+                  complete: evidence.complete && totalMessages === 0,
+                },
+              }
+            : {}),
         };
       }
       const metadata = Array.from(iterateVisibleMessageMetadata(projection, start, endExclusive));
@@ -618,6 +736,14 @@ export function readSessionTranscriptBoundedMessageTailPage(
         serializedBytes,
         snapshot,
         totalMessages,
+        ...(evidence
+          ? {
+              historyEvidence: {
+                ...evidence,
+                complete: evidence.complete && events.length === totalMessages,
+              },
+            }
+          : {}),
       };
     },
     options,

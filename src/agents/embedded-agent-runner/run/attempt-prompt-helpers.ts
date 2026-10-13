@@ -9,6 +9,7 @@ import type {
   ContextEngineSessionTarget,
 } from "../../../context-engine/types.js";
 import { pruneMapToMaxSize } from "../../../infra/map-size.js";
+import type { PluginHookBeforePromptBuildEvent } from "../../../plugins/hook-types.js";
 import { drainPluginNextTurnInjectionContext } from "../../../plugins/host-hook-state.js";
 import { buildPluginAgentTurnPrepareContext } from "../../../plugins/host-hooks.js";
 import type {
@@ -48,7 +49,7 @@ type PromptBuildHookRunner = {
     ctx: PluginHookAgentContext,
   ) => Promise<PluginAgentTurnPrepareResult | undefined>;
   runBeforePromptBuild: (
-    event: { prompt: string; messages: unknown[] },
+    event: PluginHookBeforePromptBuildEvent,
     ctx: PluginHookAgentContext,
   ) => Promise<PluginHookBeforePromptBuildResult | undefined>;
 };
@@ -92,6 +93,7 @@ export async function resolvePromptBuildHookResult(params: {
   config: OpenClawConfig;
   prompt: string;
   messages: unknown[];
+  historyEvidence?: PluginHookBeforePromptBuildEvent["historyEvidence"];
   hookCtx: PluginHookAgentContext;
   hookRunner?: PromptBuildHookRunner | null;
   bootstrapContextRunKind?: EmbeddedRunAttemptParams["bootstrapContextRunKind"];
@@ -153,6 +155,7 @@ export async function resolvePromptBuildHookResult(params: {
           {
             prompt: params.prompt,
             messages: params.messages,
+            ...(params.historyEvidence ? { historyEvidence: params.historyEvidence } : {}),
           },
           params.hookCtx,
         )

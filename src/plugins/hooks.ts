@@ -794,6 +794,10 @@ export function createHookRunner(
             messages: projectModelContextMessages(event.messages),
           })
         : event;
+    const historyEvidence =
+      hookName === "before_prompt_build" && "historyEvidence" in dispatchEvent
+        ? deepFreezeHookValue(dispatchEvent.historyEvidence)
+        : undefined;
 
     logger?.debug?.(`[hooks] running ${hookName} (${selectedHooks.length} handlers, sequential)`);
 
@@ -804,11 +808,29 @@ export function createHookRunner(
       let shouldStop = false;
       try {
         const handler = hook.handler as (event: unknown, ctx: unknown) => Promise<TResult>;
-        const handlerEvent = policy.eventForHandler
+        const selectedEvent = policy.eventForHandler
           ? policy.eventForHandler(dispatchEvent, result)
           : policy.isolateEventPerHandler
             ? cloneHookIsolationValue(hookName, dispatchEvent)
             : dispatchEvent;
+        // Isolation clones thaw descriptors. Preserve host evidence across handlers,
+        // including original absence, while messages keep their shared mutable array.
+        const handlerEvent =
+          hookName === "before_prompt_build" && historyEvidence === undefined
+            ? { ...selectedEvent }
+            : selectedEvent;
+        if (hookName === "before_prompt_build") {
+          if (historyEvidence === undefined) {
+            Reflect.deleteProperty(handlerEvent, "historyEvidence");
+          } else {
+            Object.defineProperty(handlerEvent, "historyEvidence", {
+              value: historyEvidence,
+              enumerable: true,
+              configurable: false,
+              writable: false,
+            });
+          }
+        }
         const invocation = hookName === "before_prompt_build" ? { active: true } : undefined;
         const handlerContext = invocation
           ? {

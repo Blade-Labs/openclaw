@@ -73,6 +73,8 @@ type ResetReason = "new" | "reset" | "idle" | "daily" | "cron-stale";
 interface ResetEntry extends SessionTreeEntryBase {
   type: "reset";
   reason: ResetReason;
+  context?: "clear" | "preserve-tail";
+  source?: "human-command";
   firstKeptEntryId?: string;
 }
 

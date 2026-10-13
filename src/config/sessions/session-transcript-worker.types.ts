@@ -15,6 +15,7 @@ import type { UserTurnTranscriptAdmissionReceipt } from "../../sessions/user-tur
 import type { OpenClawRegisteredAgentDatabase } from "../../state/openclaw-agent-db-contract.js";
 import type { SessionLifecycleTimestamps } from "./lifecycle.types.js";
 import type { SessionTranscriptBoundedActiveContext } from "./session-accessor.sqlite-active-context.js";
+import type { SessionTranscriptBoundedMessageTailPage } from "./session-accessor.sqlite-active-events.js";
 import type {
   SessionBranchSummaryReadRequest,
   SessionBranchSummaryReadResult,
@@ -111,6 +112,15 @@ export type SessionModelContextWorkerInput = {
   admission?: UserTurnTranscriptAdmissionReceipt;
   through?: TranscriptEntryAnchor;
   limits?: SessionModelContextLimits;
+};
+
+export type SessionHookHistoryWorkerInput = {
+  kind: "hook-history";
+  database: { agentId: string; path: string };
+  target: SessionTranscriptRuntimeTarget;
+  resolvedScope: ResolvedTranscriptReadScope;
+  admission?: UserTurnTranscriptAdmissionReceipt;
+  limits: { maxBytes: number; maxMessages: number };
 };
 
 export type SessionSqliteTargetWorkerInput = {
@@ -315,6 +325,7 @@ export type SessionBranchSummaryWorkerInput = {
 };
 
 export type SessionHistoryWorkerInput =
+  | SessionHookHistoryWorkerInput
   | SessionTranscriptHydrationWorkerInput
   | SessionTranscriptCurrentTurnEntryWorkerInput
   | SessionTranscriptHistoryWorkerInput
@@ -347,6 +358,7 @@ export type SessionHistoryWorkerPreparedInput = {
 }[SessionHistoryDatabaseWorkerInput["kind"]];
 
 export type SessionTranscriptWorkerValues = {
+  "hook-history": { kind: "hook-history"; page: SessionTranscriptBoundedMessageTailPage };
   "transcript-search": SessionTranscriptSearchWorkerResult;
   "transcript-hydration": SessionTranscriptHydrationWorkerResult;
   "current-turn-entry": SessionTranscriptCurrentTurnEntryRead;
@@ -412,6 +424,10 @@ export type SessionHistoryWorkerDatabase = {
     input: Omit<SessionTranscriptHydrationWorkerInput, "kind" | "database">,
     signal?: AbortSignal,
   ) => Promise<PreparedSessionTranscriptHydration>;
+  readHookHistory: (
+    input: Omit<SessionHookHistoryWorkerInput, "kind" | "database">,
+    signal?: AbortSignal,
+  ) => Promise<SessionTranscriptBoundedMessageTailPage>;
   readCurrentTurnEntry: (
     input: Omit<SessionTranscriptCurrentTurnEntryWorkerInput, "kind" | "database">,
     signal?: AbortSignal,

@@ -22,11 +22,13 @@ import type { ChannelPlugin } from "../../channels/plugins/types.plugin.js";
 import { getRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import { runWithCliHistoryWriter } from "../../config/sessions/cli-history-boundary.js";
 import {
+  appendTranscriptEvent,
   loadSessionEntryReadOnly,
   loadTranscriptEventsSync,
   replaceSessionEntrySync,
   patchSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
+import { buildSessionResetBoundaryEvent } from "../../config/sessions/session-reset-boundary-event.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { LegacyContextEngine } from "../../context-engine/legacy.js";
 import {
@@ -2318,6 +2320,7 @@ describe("prepareCliRunContext", () => {
     >;
     expect(beforePromptBuildCalls[0]?.[0]).toEqual({
       prompt: "latest ask",
+      historyEvidence: { complete: false, turnsSinceBoundary: null },
       messages: [
         { role: "user", content: "earlier context", timestamp: 1 },
         {
@@ -2515,12 +2518,62 @@ describe("prepareCliRunContext", () => {
       `${wrappedPluginSystemContext("prompt prepend system")}\n\nprompt system\n\n${wrappedPluginSystemContext("prompt append system")}${SYSTEM_PROMPT_CACHE_BOUNDARY}\nCurrent model identity: test-cli/test-model. If asked what model you are, answer with this value for the current run.`,
     );
     expect(hookRunner.runBeforePromptBuild).toHaveBeenCalledOnce();
+    expect(hookRunner.runBeforePromptBuild.mock.calls[0]?.[0]).toHaveProperty("historyEvidence");
     const promptContext = hookRunner.runBeforePromptBuild.mock.calls[0]?.[1];
     expect(promptContext?.channel).toBe("discord");
     expect(promptContext?.chatId).toBe("room-1");
     expect(promptContext?.senderId).toBe("user-789");
     expect(promptContext?.inputProvenance).toBeUndefined();
   });
+
+  it.each([true, false])(
+    "binds CLI history evidence to the prompt hook session (matches=%s)",
+    async (matches) => {
+      const { sessionTarget } = fixture.session;
+      const reset = buildSessionResetBoundaryEvent({
+        events: loadTranscriptEventsSync(sessionTarget),
+        context: "clear",
+        reason: "new",
+        source: "human-command",
+      });
+      await appendTranscriptEvent(sessionTarget, reset);
+      const recorder = createUserTurnTranscriptRecorder({
+        target: { ...sessionTarget, sessionEntry: undefined },
+        input: { text: "latest ask", timestamp: 1 },
+        updateMode: "none",
+      });
+      await recorder.persistApproved();
+      const hookRunner = {
+        hasHooks: vi.fn((hookName: string) => hookName === "before_prompt_build"),
+        runBeforePromptBuild: vi.fn<HookRunner["runBeforePromptBuild"]>(async () => undefined),
+        runAuthorizedPromptBuild: vi.fn<HookRunner["runAuthorizedPromptBuild"]>(
+          async () => undefined,
+        ),
+      };
+      mockGetGlobalHookRunner.mockReturnValue(hookRunner as never);
+      await fixture.prepare({
+        sessionKey: matches ? sessionTarget.sessionKey : "agent:main:other",
+        userTurnTranscriptRecorder: recorder,
+        toolAuthorityFingerprint: "turn-authority",
+      });
+      const expected = matches
+        ? {
+            boundary: { id: reset.id, reason: "new" },
+            complete: true,
+            turnsSinceBoundary: 1,
+            currentEntry: { id: recorder.getAdmissionReceipt()!.entryId, isLastEntry: true },
+          }
+        : { complete: false, turnsSinceBoundary: null };
+      const [event, ctx] = hookRunner.runBeforePromptBuild.mock.calls[0]!;
+      expect(ctx.sessionKey).toBe(matches ? sessionTarget.sessionKey : "agent:main:other");
+      expect(ctx.sessionId).toBe(sessionTarget.sessionId);
+      expect(event.historyEvidence).toEqual(expected);
+      expect(event.messages).toMatchObject([{ role: "user", content: "latest ask" }]);
+      expect(hookRunner.runAuthorizedPromptBuild.mock.calls[0]?.[0].historyEvidence).toEqual(
+        expected,
+      );
+    },
+  );
 
   it("applies turn-authorized prompt enrichment after CLI tool preparation", async () => {
     const hookRunner = {

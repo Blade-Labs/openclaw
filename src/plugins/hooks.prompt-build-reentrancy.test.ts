@@ -1,10 +1,67 @@
 import { describe, expect, it, vi } from "vitest";
+import type { PluginHookBeforePromptBuildEvent } from "./hook-types.js";
 import { createHookRunner } from "./hooks.js";
 import { createMockPluginRegistry, TEST_PLUGIN_AGENT_CTX } from "./hooks.test-fixtures.js";
 
 const promptEvent = (prompt: string) => ({ prompt, messages: [] });
 
 describe("before_prompt_build reentrancy", () => {
+  it.each([false, true])(
+    "preserves trusted evidence presence=%s across modifying plugins",
+    async (present) => {
+      const historyEvidence = {
+        boundary: { id: "committed-reset", reason: "new" as const },
+        complete: false,
+        turnsSinceBoundary: 2,
+        currentEntry: { id: "current", isLastEntry: true },
+      };
+      const observer = vi.fn((_event: PluginHookBeforePromptBuildEvent) => ({}));
+      const mutations: boolean[] = [];
+      const runner = createHookRunner(
+        createMockPluginRegistry([
+          {
+            hookName: "before_prompt_build",
+            pluginId: "mutator",
+            priority: 10,
+            handler: (...args: unknown[]) => {
+              const event = args[0] as PluginHookBeforePromptBuildEvent;
+              if (present) {
+                mutations.push(
+                  Reflect.set(event.historyEvidence!, "complete", true),
+                  Reflect.set(event.historyEvidence!.boundary!, "id", "forged"),
+                  Reflect.set(event.historyEvidence!.currentEntry!, "id", "forged"),
+                  Reflect.set(event, "historyEvidence", { complete: true }),
+                  Reflect.deleteProperty(event, "historyEvidence"),
+                );
+              } else {
+                Reflect.set(event, "historyEvidence", historyEvidence);
+              }
+              event.messages.push("shared message mutation");
+              return {};
+            },
+          },
+          {
+            hookName: "before_prompt_build",
+            pluginId: "observer",
+            handler: (...args: unknown[]) => observer(args[0] as PluginHookBeforePromptBuildEvent),
+          },
+        ]),
+      );
+      await runner.runBeforePromptBuild(
+        { ...promptEvent("hello"), ...(present ? { historyEvidence } : {}) },
+        TEST_PLUGIN_AGENT_CTX,
+      );
+      expect(observer).toHaveBeenCalledOnce();
+      const event = observer.mock.calls[0]![0];
+      if (present) {
+        expect(mutations).toEqual([false, false, false, false, false]);
+        expect(event.historyEvidence).toEqual(historyEvidence);
+      } else {
+        expect(event).not.toHaveProperty("historyEvidence");
+      }
+      expect(event.messages).toEqual(["shared message mutation"]);
+    },
+  );
   it("runs each handler once when a handler starts a nested prompt build", async () => {
     const firstHandler = vi.fn(async () => {
       await runner.runBeforePromptBuild(promptEvent("nested"), TEST_PLUGIN_AGENT_CTX);

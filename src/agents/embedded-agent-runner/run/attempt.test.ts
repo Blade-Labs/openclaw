@@ -12,6 +12,7 @@ vi.mock("../context-engine-capabilities.js", () => ({
 import type { LlmRuntime } from "@openclaw/ai";
 import { defaultLlmRuntime } from "@openclaw/ai/internal/runtime";
 import type { OpenClawConfig } from "../../../config/config.js";
+import type { PluginHookBeforePromptBuildEvent } from "../../../plugins/hook-types.js";
 import { addSession } from "../../bash-process-registry.js";
 import { createProcessSessionFixture } from "../../bash-process-registry.test-helpers.js";
 import { resetProcessRegistryForTests } from "../../bash-process-registry.test-support.js";
@@ -127,7 +128,7 @@ describe("resolvePromptBuildHookResult", () => {
   it("preserves prompt-build context fields", async () => {
     const hookRunner = {
       hasHooks: vi.fn(() => true),
-      runBeforePromptBuild: vi.fn(async () => ({
+      runBeforePromptBuild: vi.fn(async (_event: PluginHookBeforePromptBuildEvent) => ({
         prependContext: "prompt context",
         appendContext: "prompt append context",
         prependSystemContext: "prompt prepend",
@@ -147,6 +148,9 @@ describe("resolvePromptBuildHookResult", () => {
     expect(result.appendContext).toBe("prompt append context");
     expect(result.prependSystemContext).toBe(wrappedPluginSystemContext("prompt prepend"));
     expect(result.appendSystemContext).toBe(wrappedPluginSystemContext("prompt append"));
+    expect(hookRunner.runBeforePromptBuild.mock.calls[0]?.[0]).not.toHaveProperty(
+      "historyEvidence",
+    );
   });
 
   it("applies heartbeat prompt contributions only during heartbeat turns", async () => {

@@ -3,6 +3,7 @@ import { assertAgentDatabaseTerminalOpenAllowed } from "../../state/openclaw-age
 import { getOpenClawAgentDatabaseIfOpen } from "../../state/openclaw-agent-db.js";
 import { resolveOpenClawAgentSqlitePath } from "../../state/openclaw-agent-db.paths.js";
 import { readSessionTranscriptBoundedActiveContextCore } from "./session-accessor.sqlite-active-context.js";
+import { readSessionTranscriptBoundedMessageTailPage } from "./session-accessor.sqlite-active-events.js";
 import { readSessionTranscriptCurrentTurnEntry } from "./session-accessor.sqlite-current-turn.js";
 import { loadTranscriptReadSnapshotSync } from "./session-accessor.sqlite-read.js";
 import {
@@ -110,5 +111,17 @@ export function prepareSessionTranscriptHydration(
         owner.readCurrentTurnEntry({ ...request, target, resolvedScope, admission }, signal),
     );
   };
-  return { target, read, readCurrentTurnEntry, assertCurrent };
+  const readHookHistory = (limits: { maxBytes: number; maxMessages: number }) =>
+    readInOwner(
+      () =>
+        readSessionTranscriptBoundedMessageTailPage(target, {
+          ...limits,
+          offset: 0,
+          readOnly: true,
+          includeHistoryEvidence: true,
+        }),
+      (owner, resolvedScope) =>
+        owner.readHookHistory({ target, resolvedScope, limits, admission }, signal),
+    );
+  return { target, read, readCurrentTurnEntry, readHookHistory, assertCurrent };
 }

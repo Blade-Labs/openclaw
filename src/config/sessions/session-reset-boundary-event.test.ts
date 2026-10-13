@@ -38,11 +38,17 @@ describe("reset boundary planning", () => {
 
       const event = buildSessionResetBoundaryEvent({
         context: "clear",
+        source: "human-command",
         events: [user, assistant],
         reason,
       });
 
-      expect(event).toMatchObject({ parentId: assistant.id, reason });
+      expect(event).toMatchObject({
+        parentId: assistant.id,
+        reason,
+        context: "clear",
+        source: "human-command",
+      });
       expect(event).not.toHaveProperty("firstKeptEntryId");
     },
   );
@@ -95,6 +101,7 @@ describe("reset boundary planning", () => {
       parentId: firstReset.id,
       firstKeptEntryId: keptUser.id,
       reason: "reset",
+      context: "preserve-tail",
     });
   });
 
@@ -140,6 +147,7 @@ describe("reset boundary planning", () => {
       parentId: compaction.id,
       firstKeptEntryId: keptUser.id,
       reason: "daily",
+      context: "preserve-tail",
     });
   });
 });

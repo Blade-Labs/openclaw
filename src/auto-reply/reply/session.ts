@@ -1037,7 +1037,17 @@ async function initSessionStateAttemptLocked(
       : "reset";
   const resetBoundary: SessionResetBoundaryRequest | undefined = previousSessionEntry
     ? resetTriggered
-      ? { context: "clear", reason: resolveExplicitSessionEndReason(matchedResetTriggerLower) }
+      ? {
+          context: "clear",
+          reason: resolveExplicitSessionEndReason(matchedResetTriggerLower),
+          ...(!isSystemEvent &&
+          ctx.SenderIsBot !== true &&
+          classifySessionStateActor({ inputProvenance: ctx.InputProvenance }).actorType ===
+            "human" &&
+          (matchedResetTriggerLower === "/new" || matchedResetTriggerLower === "/reset")
+            ? { source: "human-command" as const }
+            : {}),
+        }
       : { context: "preserve-tail", reason: continuityReason }
     : undefined;
   const resetBoundaryAppended = resetBoundary !== undefined;

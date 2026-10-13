@@ -71,6 +71,50 @@ ordinary `before_prompt_build` → finalized tool policy → authorized prompt
 enrichment. `agent_turn_prepare` and queued-injection draining are not wired
 into the Codex or Copilot prompt paths.
 
+### CLI history evidence
+
+CLI `before_prompt_build` events include optional read-only `historyEvidence`,
+bound to the hook context's `agentId`, `sessionKey`, `sessionId`, and `runId`.
+It describes the same committed canonical transcript snapshot as `messages`,
+before message projection and the 100-message / 5 MiB limits:
+
+- `boundary?: { id, reason }` identifies the latest persisted reset only when
+  it records `context: "clear"`, `source: "human-command"`, and reason `new`
+  or `reset`, with no retained anchor. The reset lifecycle writer records the
+  command source for authorized human `/new` and hard `/reset` commands.
+  Soft reset does not append a transcript boundary. Automatic resets,
+  idle/daily rollovers, restarts, compaction, and legacy events lacking these
+  explicit facts cannot supply a boundary.
+- `complete` is true only with that boundary and when every canonical
+  post-reset entry is represented in `messages`, with no budget omissions or
+  retained prefix. Compaction, saved notes, and any other non-message records
+  make it false, even if all projected messages fit the limits.
+- `turnsSinceBoundary` counts all canonical post-reset user entries in host
+  order, including oversized or count-limited entries. Without a reset, it
+  counts from the beginning of the active path. `null` means the canonical
+  count could not be established.
+- `currentEntry?: { id, isLastEntry }` correlates the persisted admission
+  receipt to a post-reset user entry on that snapshot. `isLastEntry` compares
+  it to the canonical leaf, including non-message entries. Equal text or
+  timestamps do not establish this correlation. Without a valid persisted
+  admission, the field is absent.
+
+Caller-owned CLI session-manager views and missing transcript targets cannot
+certify committed history; they receive `complete: false`, no boundary or
+current-entry correlation, and a `null` count. The same refusal applies when
+the transcript target does not match the hook context's agent and session.
+The embedded runner and other harnesses omit `historyEvidence`. Absence is
+no evidence, never an empty or complete transcript. Evidence and its nested
+fields remain read-only through ordinary and authorized prompt-hook dispatch;
+message projection and budgets keep their existing behavior.
+
+This envelope grants no authority. Plugins must still verify the current
+human, conversation, and run through existing admission contracts. A fresh
+generation rule must require complete history, the expected turn count and
+current-entry correlation, and consume the boundary ID atomically with its
+generation record. Persist consumption so replay or restart cannot reuse an
+old reset. Do not qualify a singleton message from text equality alone.
+
 For multiple registrations, the first defined provider/model override and
 `systemPrompt` win. Context additions concatenate in priority order, and tool
 restrictions intersect. A nested ordinary `before_prompt_build` dispatch on

@@ -3768,7 +3768,12 @@ describe("initSessionState reset authorization", () => {
           .toEqual(allowed ? undefined : { "claude-cli": "existing-cli-binding" });
         expect.soft(resets).toHaveLength(allowed ? 1 : 0);
         if (allowed) {
-          expect.soft(resets[0]).toMatchObject({ type: "reset", reason: body.slice(1) });
+          expect.soft(resets[0]).toMatchObject({
+            type: "reset",
+            reason: body.slice(1),
+            context: "clear",
+            source: "human-command",
+          });
         }
         expect.soft(acknowledgement?.shouldContinue).toBe(false);
         if (allowed) {
@@ -4510,7 +4515,7 @@ describe("initSessionState preserves behavior overrides across /new and /reset",
       });
       expect(events.map((event) => (event as { type?: unknown }).type)).toContain("reset");
       const resetEvent = events.findLast((event) => (event as { type?: unknown }).type === "reset");
-      expect(resetEvent).toMatchObject({ reason: slug });
+      expect(resetEvent).toMatchObject({ reason: slug, context: "clear", source: "human-command" });
       expect(resetEvent).not.toHaveProperty("firstKeptEntryId");
       const archived = (await fs.readdir(path.dirname(storePath))).filter((entry) =>
         entry.startsWith(`${existingSessionId}.jsonl.reset.`),

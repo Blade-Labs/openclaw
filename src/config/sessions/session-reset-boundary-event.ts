@@ -5,7 +5,11 @@ import { selectSessionTranscriptLeafControlledPath } from "./transcript-tree.js"
 type SessionResetBoundaryReason = "new" | "reset" | "idle" | "daily" | "cron-stale";
 
 export type SessionResetBoundaryRequest =
-  | { context: "clear"; reason: Extract<SessionResetBoundaryReason, "new" | "reset"> }
+  | {
+      context: "clear";
+      reason: Extract<SessionResetBoundaryReason, "new" | "reset">;
+      source?: "human-command";
+    }
   | {
       context: "preserve-tail";
       reason: Extract<SessionResetBoundaryReason, "reset" | "idle" | "daily" | "cron-stale">;
@@ -17,6 +21,8 @@ type SessionResetBoundaryEvent = {
   parentId: string | null;
   timestamp: string;
   reason: SessionResetBoundaryReason;
+  context: "clear" | "preserve-tail";
+  source?: "human-command";
   firstKeptEntryId?: string;
 };
 
@@ -93,6 +99,8 @@ export function buildSessionResetBoundaryEvent(
     parentId: recordId(activeEntries.at(-1)) ?? null,
     timestamp: new Date().toISOString(),
     reason: params.reason,
+    context: params.context,
+    ...(params.context === "clear" && params.source ? { source: params.source } : {}),
     ...(firstKeptEntryId ? { firstKeptEntryId } : {}),
   };
 }

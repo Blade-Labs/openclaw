@@ -60,6 +60,8 @@ export type ResetReason = "new" | "reset" | "idle" | "daily" | "cron-stale";
 export interface ResetEntry extends SessionEntryBase {
   type: "reset";
   reason: ResetReason;
+  context?: "clear" | "preserve-tail";
+  source?: "human-command";
   firstKeptEntryId?: string;
 }
 

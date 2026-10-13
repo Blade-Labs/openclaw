@@ -105,6 +105,32 @@ async function commitReset(
   ) as ReturnType<typeof buildSessionResetBoundaryEvent> & { historySeq: number };
 }
 
+async function withHistoryClock(run: () => Promise<void>) {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+  try {
+    await run();
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
+async function advanceParentHistory(
+  target: Awaited<ReturnType<typeof createSession>>["target"],
+  clock: "frozen" | "backward",
+) {
+  for (let index = 0; index < 6; index++) {
+    if (clock === "backward") {
+      vi.setSystemTime(Date.now() - 1_000);
+    }
+    await appendTranscriptMessage(target, {
+      eventId: `later-turn-${index}`,
+      message: makeUserMessage(`later ${index}`, index + 2),
+    });
+  }
+  return loadTranscriptReadSnapshotSync(target);
+}
+
 describe("CLI prompt hook history evidence", () => {
   it.each([
     {
@@ -303,54 +329,158 @@ describe("CLI prompt hook history evidence", () => {
     }
   });
 
-  it("keeps an earlier branch boundary below the later public turn's durable order", async () => {
-    const { target, params } = await createSession(["root"]);
-    const reset = async () => {
-      const event = await commitReset(target, {
-        context: "clear",
-        reason: "new",
-        source: "human-command",
-        actorId: "owner",
+  it.each(["frozen", "backward"] as const)(
+    "inherits the parent high-water mark when branching from earlier history with a %s clock",
+    async (clock) => {
+      await withHistoryClock(async () => {
+        const { target, params } = await createSession(["root"]);
+        const reset = async () => {
+          const event = await commitReset(target, {
+            context: "clear",
+            reason: "new",
+            source: "human-command",
+            actorId: "owner",
+          });
+          return event.id;
+        };
+        const earlyReset = await reset();
+        await appendTranscriptMessage(target, {
+          eventId: "early-turn",
+          message: makeUserMessage("early", 1),
+        });
+        const early = await loadCliSessionHookHistory(params);
+        await advanceParentHistory(target, clock);
+        await reset();
+        const recorder = createUserTurnTranscriptRecorder({
+          target: { ...target, sessionEntry: undefined },
+          input: { text: "later public classification", timestamp: 2 },
+          updateMode: "none",
+        });
+        await recorder.persistApproved();
+        const later = await loadCliSessionHookHistory({
+          ...params,
+          currentAdmission: recorder.getAdmissionReceipt(),
+        });
+        const parent = loadTranscriptReadSnapshotSync(target);
+        const highWater = parent.version.updatedAt!;
+        expect(highWater).toEqual(expect.any(Number));
+        expect(highWater).toBeGreaterThan(early.historyEvidence.boundary!.seq);
+        expect(highWater).toBeGreaterThanOrEqual(later.historyEvidence.currentEntry!.seq);
+        expect(highWater).toBeGreaterThanOrEqual(
+          Math.max(
+            ...parent.events.map((event) => (event as { historySeq?: number }).historySeq ?? 0),
+          ),
+        );
+        if (clock === "backward") {
+          vi.setSystemTime(Date.now() - 1_000);
+        }
+        const manager = SessionManager.open(target);
+        await manager.createBranchedSession("early-turn");
+        const branchTarget = { ...target, sessionId: manager.getSessionId() };
+        const selected = await loadCliSessionHookHistory({ sessionTarget: branchTarget });
+        expect(selected.historyEvidence).toMatchObject({
+          complete: true,
+          turnsSinceBoundary: 1,
+          boundary: { id: earlyReset, seq: early.historyEvidence.boundary!.seq },
+        });
+        expect(selected.historyEvidence.boundary!.seq).toBeLessThan(
+          later.historyEvidence.currentEntry!.seq,
+        );
+        if (clock === "backward") {
+          vi.setSystemTime(Date.now() - 1_000);
+        }
+        const fresh = await commitReset(branchTarget, {
+          context: "clear",
+          reason: "new",
+          source: "human-command",
+          actorId: "owner",
+        });
+        expect(fresh.historySeq).toBeGreaterThan(highWater);
       });
-      return event.id;
-    };
-    const earlyReset = await reset();
-    await appendTranscriptMessage(target, {
-      eventId: "early-turn",
-      message: makeUserMessage("early", 1),
-    });
-    const early = await loadCliSessionHookHistory(params);
-    await reset();
-    const recorder = createUserTurnTranscriptRecorder({
-      target: { ...target, sessionEntry: undefined },
-      input: { text: "later public classification", timestamp: 2 },
-      updateMode: "none",
-    });
-    await recorder.persistApproved();
-    const later = await loadCliSessionHookHistory({
-      ...params,
-      currentAdmission: recorder.getAdmissionReceipt(),
-    });
-    const manager = SessionManager.open(target);
-    await manager.createBranchedSession("early-turn");
-    const branchTarget = { ...target, sessionId: manager.getSessionId() };
-    const selected = await loadCliSessionHookHistory({ sessionTarget: branchTarget });
-    expect(selected.historyEvidence).toMatchObject({
-      complete: true,
-      turnsSinceBoundary: 1,
-      boundary: { id: earlyReset, seq: early.historyEvidence.boundary!.seq },
-    });
-    expect(selected.historyEvidence.boundary!.seq).toBeLessThan(
-      later.historyEvidence.currentEntry!.seq,
-    );
-    const fresh = await commitReset(branchTarget, {
-      context: "clear",
-      reason: "new",
-      source: "human-command",
-      actorId: "owner",
-    });
-    expect(fresh.historySeq).toBeGreaterThan(later.historyEvidence.currentEntry!.seq);
-  });
+    },
+  );
+
+  it.each([
+    ["full", "frozen"],
+    ["full", "backward"],
+    ["suffix", "frozen"],
+    ["suffix", "backward"],
+    ["exact", "frozen"],
+    ["exact", "backward"],
+  ] as const)(
+    "preserves the high-water mark through %s rewrites of earlier history with a %s clock",
+    async (rewrite, clock) => {
+      await withHistoryClock(async () => {
+        const { target, params } = await createSession(["root"]);
+        const reset = await commitReset(target, {
+          context: "clear",
+          reason: "new",
+          source: "human-command",
+          actorId: "owner",
+        });
+        await appendTranscriptMessage(target, {
+          eventId: "early-turn",
+          message: makeUserMessage("early", 1),
+        });
+        const earlier = loadTranscriptReadSnapshotSync(target);
+        const before = (await loadCliSessionHookHistory(params)).historyEvidence.boundary!;
+        const parent = await advanceParentHistory(target, clock);
+        const highWater = parent.version.updatedAt!;
+        expect(highWater).toEqual(expect.any(Number));
+        expect(highWater).toBeGreaterThanOrEqual(
+          Math.max(
+            ...parent.events.map((event) => (event as { historySeq?: number }).historySeq ?? 0),
+          ),
+        );
+        expect(highWater).toBeGreaterThan(
+          (earlier.events.at(-1) as { historySeq: number }).historySeq,
+        );
+        if (clock === "backward") {
+          vi.setSystemTime(Date.now() - 1_000);
+        }
+        const forged = earlier.events.map((event, index) =>
+          index === 0 ? event : { ...(event as object), historySeq: 1 },
+        );
+        if (rewrite === "full") {
+          await replaceTranscriptEvents(target, forged);
+        } else if (rewrite === "suffix") {
+          expect(
+            replaceTranscriptSuffixEventsSync(target, loadTranscriptEventsSync(target), forged),
+          ).toBe(true);
+        } else {
+          const current = loadTranscriptReadSnapshotSync(target);
+          const event = current.events.find((entry) => (entry as { id?: string }).id === reset.id)!;
+          expect(
+            await rewriteTranscriptEventRowsExact(target, {
+              expectedGeneration: current.version.generation,
+              rows: [
+                {
+                  event: { ...(event as object), historySeq: 1 },
+                  expectedEventJson: JSON.stringify(event),
+                  seq: current.events.indexOf(event),
+                },
+              ],
+            }),
+          ).not.toBeNull();
+        }
+        expect((await loadCliSessionHookHistory(params)).historyEvidence.boundary).toEqual(before);
+        if (clock === "backward") {
+          vi.setSystemTime(Date.now() - 1_000);
+        }
+        const fresh = await commitReset(target, {
+          context: "clear",
+          reason: "new",
+          source: "human-command",
+          actorId: "owner",
+        });
+        expect(fresh.historySeq).toBeGreaterThan(highWater);
+        expect((await loadCliSessionHookHistory(params)).historyEvidence.boundary).toMatchObject({
+          id: fresh.id,
+          seq: fresh.historySeq,
+        });
+      });
+    },
+  );
 
   it("preserves committed order through full, suffix and exact rewrites and rejects copied reset authority", async () => {
     const { target, params } = await createSession(["root"]);

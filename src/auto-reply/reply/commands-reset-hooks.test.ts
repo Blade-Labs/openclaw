@@ -17,6 +17,7 @@ import type { PluginHookHandlerMap } from "../../plugins/hook-types.js";
 import { AsyncWorkScope } from "../../shared/async-work-scope.js";
 import type { MsgContext } from "../templating.js";
 import { buildCommandContext } from "./commands-context.js";
+import { handleCommands } from "./commands-core.js";
 import { maybeHandleResetCommand } from "./commands-reset.js";
 import type { HandleCommandsParams } from "./commands-types.js";
 import { parseInlineSessionDirectives } from "./directive-handling.parse.js";
@@ -235,6 +236,40 @@ describe("handleCommands reset hooks", () => {
   afterEach(() => {
     clearBootstrapSnapshotSpy.mockRestore();
     vi.useRealTimers();
+  });
+
+  it("reads the admitted reset actor from rootCtx when the session context is copied", async () => {
+    pluginHooks.enabled = true;
+    const { params } = await buildAdmittedResetParams();
+    const admittedCtx = params.ctx;
+    const sessionCtx = { ...admittedCtx };
+    const dispatchParams = {
+      ...params,
+      ctx: sessionCtx,
+      resolveModelLevels: async () => ({
+        resolvedThinkLevel: params.resolvedThinkLevel,
+        resolvedReasoningLevel: params.resolvedReasoningLevel,
+      }),
+    };
+
+    await handleCommands({ ...dispatchParams, command: { ...params.command } });
+
+    expect(pluginHooks.runBeforeReset).toHaveBeenCalledOnce();
+    const copiedCtx = pluginHooks.runBeforeReset.mock.calls[0]?.[1];
+    expect(copiedCtx).not.toHaveProperty("senderId");
+    expect(copiedCtx).not.toHaveProperty("actorKind");
+
+    await handleCommands({
+      ...dispatchParams,
+      command: { ...params.command },
+      rootCtx: admittedCtx,
+    });
+
+    expect(pluginHooks.runBeforeReset).toHaveBeenCalledTimes(2);
+    expect(pluginHooks.runBeforeReset.mock.calls[1]?.[1]).toMatchObject({
+      senderId: "opaque:sender",
+      actorKind: "human",
+    });
   });
 
   it.each([

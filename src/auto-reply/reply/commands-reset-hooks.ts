@@ -13,6 +13,7 @@ import { withHookTimeout } from "../../plugins/hook-timeout.js";
 import { parseAgentSessionKey } from "../../routing/session-key.js";
 import { runOutsideAsyncWorkScope } from "../../shared/async-work-scope.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
+import type { MsgContext } from "../templating.js";
 import { parseSoftResetCommand } from "./commands-reset-mode.js";
 import type { HandleCommandsParams } from "./commands-types.js";
 
@@ -74,6 +75,7 @@ export async function emitResetCommandHooks(params: {
   action: ResetCommandAction;
   agentId?: string;
   ctx: HandleCommandsParams["ctx"];
+  rootCtx?: MsgContext;
   cfg: HandleCommandsParams["cfg"];
   command: Pick<
     HandleCommandsParams["command"],
@@ -170,7 +172,7 @@ export async function emitResetCommandHooks(params: {
     let actorKind: "human" | undefined;
     try {
       // Read after transcript/reply awaits so a closed transport owner cannot label this reset.
-      const admitted = readChannelContextApprovalActor(params.ctx);
+      const admitted = readChannelContextApprovalActor(params.rootCtx ?? params.ctx);
       const actor = admitted ? readAdmittedChannelApprovalActor(admitted)?.actor : undefined;
       senderId = actor?.senderId;
       if (

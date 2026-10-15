@@ -21,7 +21,6 @@ import {
   buildAgentHookContextChannelFields,
   buildAgentHookContextIdentityFields,
 } from "../plugins/hook-agent-context.js";
-import { resolveBlockMessage } from "../plugins/hook-decision-types.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import { admissionLifetimeOf, captureAdmittedRunSource } from "./admitted-run-context.js";
 import {
@@ -30,6 +29,7 @@ import {
   markAuthProfileSuccess,
 } from "./auth-profiles.js";
 import { resolveCliBackendConfig } from "./cli-backends.js";
+import { createCliAttemptQualifier } from "./cli-runner/attempt-qualification.js";
 import { runCliCleanup } from "./cli-runner/cleanup.js";
 import { acceptsCliLiveSession } from "./cli-runner/cli-live-session-registry.js";
 import {
@@ -54,7 +54,6 @@ import {
   buildCliHookAssistantMessage,
   buildCliHookUserMessage,
   finalizeCliContextEngineTurn,
-  persistApprovedCliUserTurnTranscript,
   persistCliAssistantTranscript,
   persistCliRunBlock,
   resolveCliAssistantStopReason,
@@ -64,11 +63,8 @@ import {
   attachCliMessagingDeliveryEvidence,
   getCliMessagingDeliveryEvidence,
 } from "./cli-runner/delivery-evidence.js";
-import { createCliRunCurrentAssertion } from "./cli-runner/execution-target.js";
 import { createCliFailoverError } from "./cli-runner/exit-error.js";
-import { isClaudeCliBackendId } from "./cli-runner/helpers.js";
 import { cliBackendLog, formatCliBackendOutputDigest } from "./cli-runner/log.js";
-import { prepareCliAttemptPrompt } from "./cli-runner/prompt-context.js";
 import {
   runClaudeCliAgentTurnWithDiagnostics,
   type ClaudeCliRunDiagnosticLifecycle,
@@ -81,12 +77,8 @@ import type { PreparedCliRunContext, RunCliAgentParams } from "./cli-runner/type
 import { claudeCliSessionTranscriptHasContent as claudeCliSessionTranscriptHasContentImpl } from "./command/attempt-execution.helpers.js";
 import type { EmbeddedAgentRunResult } from "./embedded-agent-runner.js";
 import { bootstrapHarnessContextEngine } from "./harness/context-engine-lifecycle.js";
-import { buildAgentHookContext } from "./harness/hook-context.js";
 import { buildAgentHookConversationMessages } from "./harness/hook-history.js";
-import {
-  runAgentHarnessLlmInputHook,
-  runAgentHarnessLlmOutputHook,
-} from "./harness/lifecycle-hook-helpers.js";
+import { runAgentHarnessLlmOutputHook } from "./harness/lifecycle-hook-helpers.js";
 import { resolveReplyExpectation } from "./reply-completion.js";
 
 const log = createSubsystemLogger("agents/cli-runner");
@@ -290,13 +282,8 @@ async function runPreparedCliAgentOwned(
   const needsHookHistory = hasLlmInputHooks || hasAgentEndHooks || hasBeforeAgentRunHooks;
   let historyMessages: unknown[] = [];
   let promptForHooks = context.promptForHooks ?? params.prompt;
-  let qualifiedPrompt: PreparedCliRunContext["preparedPrompt"];
-  let qualifiedEnvelope: string | undefined;
-  let userPersistenceAttempted = false;
   const imageCleanups = new Set<() => Promise<void>>();
-  let qualifyAttempt:
-    | ((attempt: PreparedCliRunContext, nativeId?: string) => Promise<void>)
-    | undefined;
+  let qualifyAttempt: ReturnType<typeof createCliAttemptQualifier> | undefined;
   const contextWindowFields = () => ({
     ...(context.contextWindowInfo?.tokens
       ? { contextTokenBudget: context.contextWindowInfo.tokens }
@@ -631,110 +618,20 @@ async function runPreparedCliAgentOwned(
       });
     };
 
-    qualifyAttempt = async (attempt, nativeId) => {
-      const assertCurrent = createCliRunCurrentAssertion(
-        attempt.params,
-        attempt.params.abortSignal,
-        attempt.runIdentity,
-      );
-      assertCurrent();
-      const transport = await prepareCliAttemptPrompt(attempt, nativeId);
-      if (transport.imagePayload.cleanupImages) {
-        imageCleanups.add(transport.imagePayload.cleanupImages);
-      }
-      attempt.preparedImagePayload = transport.imagePayload;
-      assertCurrent();
-      const projection = transport.preparedPrompt;
-      const envelope = JSON.stringify([
-        attempt.params.provider,
-        attempt.modelId,
-        attempt.normalizedModel,
-        attempt.systemPrompt,
-      ]);
-      if (
-        qualifiedPrompt &&
-        envelope === qualifiedEnvelope &&
-        JSON.stringify(projection) === JSON.stringify(qualifiedPrompt)
-      ) {
-        attempt.preparedPrompt = qualifiedPrompt;
-        return;
-      }
-      promptForHooks = projection.logicalPrompt;
-      if (hasBeforeAgentRunHooks && hookRunner) {
-        let beforeRunResult:
-          | Awaited<ReturnType<NonNullable<typeof hookRunner>["runBeforeAgentRun"]>>
-          | undefined;
-        try {
-          beforeRunResult = await hookRunner.runBeforeAgentRun(
-            {
-              prompt: promptForHooks,
-              systemPrompt: context.systemPrompt,
-              messages: buildAgentHookConversationMessages({
-                historyMessages,
-                currentTurnMessages: [],
-              }),
-              channelId: hookContext.channelId,
-              accountId: params.agentAccountId,
-              senderId: params.senderId ?? undefined,
-              senderIsOwner: params.senderIsOwner ?? undefined,
-            },
-            buildAgentHookContext(hookContext),
-          );
-        } catch {
-          const blockMessage = resolveBlockMessage(
-            { outcome: "block", reason: "before_agent_run hook failed" },
-            { blockedBy: "before_agent_run" },
-          );
-          throw Object.assign(new Error(blockMessage), { cliBlockedBy: "before_agent_run" });
-        }
-
-        const beforeRunDecision = beforeRunResult?.decision;
-        if (beforeRunDecision?.outcome === "block") {
-          const blockMessage = resolveBlockMessage(beforeRunDecision, {
-            blockedBy: beforeRunResult?.pluginId ?? "unknown",
-          });
-          throw Object.assign(new Error(blockMessage), {
-            cliBlockedBy: beforeRunResult?.pluginId ?? "unknown",
-          });
-        }
-      }
-
-      assertCurrent();
-      if (!userPersistenceAttempted) {
-        userPersistenceAttempted = true;
-        userTurnHandled = await persistApprovedCliUserTurnTranscript(params);
-        // Persistence can establish the transcript image correlation key. Keep
-        // the approved row, then qualify those final transport bytes before input.
-        if (
-          isClaudeCliBackendId(attempt.backendResolved.id) &&
-          transport.imagePayload.imagePaths?.length &&
-          transport.imageTurnEntryId !==
-            params.userTurnTranscriptRecorder?.getAdmissionReceipt()?.entryId
-        ) {
-          assertCurrent();
-          return qualifyAttempt!(attempt, nativeId);
-        }
-      }
-      assertCurrent();
-      runAgentHarnessLlmInputHook({
-        event: {
-          runId: hookContext.runId,
-          sessionId: hookContext.sessionId,
-          provider: params.provider,
-          model: context.modelId,
-          systemPrompt: context.systemPrompt,
-          prompt: promptForHooks,
-          historyMessages,
-          imagesCount: params.images?.length ?? 0,
-        },
-        ctx: hookContext,
-        hookRunner,
-      });
-      assertCurrent();
-      attempt.preparedPrompt = projection;
-      qualifiedPrompt = projection;
-      qualifiedEnvelope = envelope;
-    };
+    qualifyAttempt = createCliAttemptQualifier({
+      context,
+      hookContext,
+      hookRunner,
+      hasBeforeAgentRunHooks,
+      historyMessages,
+      imageCleanups,
+      onPromptForHooks: (prompt) => {
+        promptForHooks = prompt;
+      },
+      onUserTurnHandled: (handled) => {
+        userTurnHandled = handled;
+      },
+    });
     try {
       await qualifyAttempt(context, resolveCliSessionId(context.reusableCliSession));
     } catch (error) {

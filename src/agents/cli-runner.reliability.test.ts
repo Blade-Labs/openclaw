@@ -249,6 +249,19 @@ function makeClaudePreparedContext(
   return buildPreparedContext({ provider: "claude-cli", model: "opus", ...overrides });
 }
 
+function setHostRunContract(context: PreparedCliRunContext): void {
+  const { params } = context;
+  Object.assign(context, {
+    hostRunContractVersion: 1,
+    runIdentity: Object.freeze({
+      agentId: "main",
+      runId: params.runId,
+      sessionKey: params.sessionKey,
+      sessionId: params.sessionId,
+    }),
+  });
+}
+
 async function admitPreparedContext(
   context: PreparedCliRunContext,
   runtime: "embedded" | "plugin-harness" = "embedded",
@@ -4298,15 +4311,7 @@ describe("runCliAgent reliability", () => {
       userTurnTranscriptRecorder: recorder,
       onBeforeFreshCliSessionRetry: clearBeforeRetry,
     };
-    Object.assign(context, {
-      hostRunContractVersion: 1,
-      runIdentity: Object.freeze({
-        agentId: "main",
-        runId: context.params.runId,
-        sessionKey: sessionTarget.sessionKey,
-        sessionId: context.params.sessionId,
-      }),
-    });
+    setHostRunContract(context);
     const admission = await admitPreparedContext(context, "plugin-harness");
     context.params.assertCurrent = createCliRunCurrentAssertion(
       context.params,
@@ -4404,15 +4409,7 @@ describe("runCliAgent reliability", () => {
       sessionTarget,
       workspaceDir: dir,
     };
-    Object.assign(context, {
-      hostRunContractVersion: 1,
-      runIdentity: Object.freeze({
-        agentId: "main",
-        runId: context.params.runId,
-        sessionKey: sessionTarget.sessionKey,
-        sessionId: context.params.sessionId,
-      }),
-    });
+    setHostRunContract(context);
     const admission = await admitPreparedContext(context, "plugin-harness");
     let nativeCalls = 0;
     const f = await disclosureRecoveryFixture(
@@ -4475,15 +4472,7 @@ describe("runCliAgent reliability", () => {
       ],
     };
     context.promptContext = { prependContext: "private core", appendContext: "heartbeat" };
-    Object.assign(context, {
-      hostRunContractVersion: 1,
-      runIdentity: Object.freeze({
-        agentId: "main",
-        runId: context.params.runId,
-        sessionKey: sessionTarget.sessionKey,
-        sessionId: context.params.sessionId,
-      }),
-    });
+    setHostRunContract(context);
     const admission = await admitPreparedContext(context, "plugin-harness");
     const observed: import("../plugins/cli-backend.types.js").CliBackendExecuteContext[] = [];
     vi.doMock(path.resolve("extensions/anthropic/cli.runtime.ts"), () => ({

@@ -39,6 +39,7 @@ import type {
   CliBackendAuthEpochMode,
   CliBackendPreparedExecution,
   CliBackendPromptContext,
+  CliBackendRunIdentity,
 } from "../../plugins/cli-backend.types.js";
 import { buildAgentHookContextChannelFields } from "../../plugins/hook-agent-context.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
@@ -556,6 +557,17 @@ async function prepareCliRunContextWithinReadFence(
   // Control bytes must reach the resumed backend without turn hooks, prompts,
   // tools, MCP, skills, or context-engine setup changing their execution.
   const skipsTurnPreparation = isSideQuestion || isControlOperation;
+  let runIdentity: CliBackendRunIdentity | undefined;
+  const assertRunIdentity = (candidate: RunCliAgentParams) => {
+    if (
+      runIdentity &&
+      Object.entries(runIdentity).some(
+        ([field, value]) => candidate[field as keyof CliBackendRunIdentity] !== value,
+      )
+    ) {
+      throw new Error("CLI host run identity changed during preparation");
+    }
+  };
   const admitPreparedParams = async (
     candidate: RunCliAgentParams,
   ): Promise<
@@ -569,7 +581,9 @@ async function prepareCliRunContextWithinReadFence(
     });
     candidate.assertCurrent?.();
     const { preparedRunAdmission: _preparedRunAdmission, ...rest } = candidate;
-    return { ...rest, agentId: workspaceResolution.agentId, admittedRunContext };
+    const prepared = { ...rest, agentId: workspaceResolution.agentId, admittedRunContext };
+    assertRunIdentity(prepared);
+    return prepared;
   };
   const runtimeChatType = params.chatType ?? params.sessionEntry?.chatType;
   const workspaceResolution = resolveRunWorkspaceDir({
@@ -1022,6 +1036,19 @@ async function prepareCliRunContextWithinReadFence(
   // run, so a plugin's first-attempt decision cannot be re-made by a retry.
   const promptBuildRunInstance = (params.admittedRunContext ?? params.preparedRunAdmission)
     ?.operationalRunInstance;
+  const provisionalIdentity = {
+    agentId: sessionAgentId,
+    runId: params.runId,
+    sessionKey: params.sessionKey,
+    sessionId: params.sessionId,
+  };
+  if (
+    Object.values(provisionalIdentity).every(
+      (value) => typeof value === "string" && value.length > 0,
+    )
+  ) {
+    runIdentity = Object.freeze(provisionalIdentity as CliBackendRunIdentity);
+  }
   const promptBuildHookContext = {
     runId: params.runId,
     agentId: sessionAgentId,
@@ -1673,6 +1700,8 @@ async function prepareCliRunContextWithinReadFence(
         : undefined;
     cleanupPreparedResources = cleanupPreparedBackend;
     const prepareExecutionContext = {
+      hostRunContractVersion: 1 as const,
+      runIdentity,
       config: params.config,
       workspaceDir,
       agentDir,
@@ -2066,7 +2095,6 @@ async function prepareCliRunContextWithinReadFence(
         ? params.prompt
         : params.transcriptPrompt;
     let promptContext: CliBackendPromptContext | undefined;
-    let promptForHooks: string | undefined;
     let preparedPrompt = isControlOperation
       ? params.prompt
       : (params.finalizePromptForResolvedTools?.({
@@ -2075,6 +2103,26 @@ async function prepareCliRunContextWithinReadFence(
         }) ?? params.prompt);
     if (!isControlOperation && params.skillsSnapshot?.librarySelections?.length) {
       preparedPrompt = remapSkillReferencePaths(preparedPrompt, preparedSkills.usagePaths);
+    }
+    let historyPromptCurrentTurn = preparedPrompt;
+    if (!skipsTurnPreparation) {
+      const currentInboundContext = prependCliSessionDriftUserContext(
+        params.currentInboundContext,
+        reusableCliSession,
+      );
+      const renderCurrentPrompt = (prompt: string, preferResumableText = false) =>
+        annotateInterSessionPromptText(
+          buildCurrentInboundPrompt({
+            context: currentInboundContext,
+            prompt,
+            preferResumableText,
+          }),
+          params.inputProvenance,
+        );
+      const preferResumableText =
+        params.currentInboundEventKind === "room_event" && Boolean(reusableCliSessionId);
+      historyPromptCurrentTurn = renderCurrentPrompt(preparedPrompt);
+      preparedPrompt = renderCurrentPrompt(preparedPrompt, preferResumableText);
     }
     if (!skipsTurnPreparation) {
       try {
@@ -2106,9 +2154,12 @@ async function prepareCliRunContextWithinReadFence(
             ...(prependContext ? { prependContext } : {}),
             ...(appendContext ? { appendContext } : {}),
           };
-          promptForHooks = logicalPrompt;
         } else {
           preparedPrompt = logicalPrompt;
+          historyPromptCurrentTurn = composeCliPromptContext(historyPromptCurrentTurn, {
+            prependContext,
+            appendContext,
+          });
         }
         const hookSystemPrompt = hookResult?.systemPrompt?.trim();
         if (hookSystemPrompt) {
@@ -2125,29 +2176,6 @@ async function prepareCliRunContextWithinReadFence(
       }
       params.assertCurrent?.();
       params.abortSignal?.throwIfAborted();
-    }
-    let historyPromptCurrentTurn = preparedPrompt;
-    if (!skipsTurnPreparation) {
-      const currentInboundContext = prependCliSessionDriftUserContext(
-        params.currentInboundContext,
-        reusableCliSession,
-      );
-      const renderCurrentPrompt = (prompt: string, preferResumableText = false) =>
-        annotateInterSessionPromptText(
-          buildCurrentInboundPrompt({
-            context: currentInboundContext,
-            prompt,
-            preferResumableText,
-          }),
-          params.inputProvenance,
-        );
-      const preferResumableText =
-        params.currentInboundEventKind === "room_event" && Boolean(reusableCliSessionId);
-      historyPromptCurrentTurn = renderCurrentPrompt(preparedPrompt);
-      preparedPrompt = renderCurrentPrompt(preparedPrompt, preferResumableText);
-      if (promptForHooks !== undefined) {
-        promptForHooks = renderCurrentPrompt(promptForHooks, preferResumableText);
-      }
     }
     // Node placement keeps this: the history prompt is built from the
     // gateway-side OpenClaw transcript, so a fresh remote CLI session still
@@ -2210,6 +2238,8 @@ async function prepareCliRunContextWithinReadFence(
     });
     const buildPreparedContext = (preparedParams: PreparedCliRunContext["params"]) => ({
       params: preparedParams,
+      hostRunContractVersion: 1 as const,
+      runIdentity,
       bindQuestionAnswerAuthority,
       effectiveAuthProfileId,
       ...(authStore ? { authProfileStore: authStore } : {}),
@@ -2256,6 +2286,7 @@ async function prepareCliRunContextWithinReadFence(
         ...(requireExplicitMessageTarget ? { requireExplicitMessageTarget: true } : {}),
       });
     const bindPreparedParams = (preparedParams: PreparedCliRunContext["params"]) => {
+      assertRunIdentity(preparedParams);
       bindMcpClientGrantAdmission(preparedParams.admittedRunContext);
       if (!isControlOperation) {
         recordAdmittedModelRoutingDecision({
@@ -2373,7 +2404,6 @@ async function prepareCliRunContextWithinReadFence(
           ...promptContext,
           appendContext: append(promptContext?.appendContext ?? ""),
         };
-        promptForHooks = append(promptForHooks ?? preparedParams.prompt);
       } else {
         preparedParams.prompt = append(preparedParams.prompt);
         if (openClawHistoryPrompt) {
@@ -2390,7 +2420,7 @@ async function prepareCliRunContextWithinReadFence(
       contextEngine,
       deferContextEngineDisposalUntil,
       contextEngineTurnPrompt,
-      ...(promptContext ? { promptContext, promptForHooks } : {}),
+      ...(promptContext ? { promptContext } : {}),
       ...(nodeSkillWorkshop ? { nodeSkillWorkshop } : {}),
       ...(openClawHistoryPrompt ? { openClawHistoryPrompt } : {}),
     };

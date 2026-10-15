@@ -112,7 +112,24 @@ export type CliBundleMcpMode =
   | "codex-config-overrides"
   | "gemini-system-settings";
 
+export type CliBackendRunIdentity = Readonly<{
+  agentId: string;
+  runId: string;
+  sessionKey: string;
+  /** OpenClaw host session, never the native CLI session. */
+  sessionId: string;
+}>;
+
+export type CliBackendPreparedPrompt = Readonly<{
+  version: 1;
+  prompt: string;
+  promptContext?: Readonly<CliBackendPromptContext>;
+  logicalPrompt: string;
+}>;
+
 export type CliBackendPrepareExecutionContext = {
+  readonly hostRunContractVersion?: 1;
+  readonly runIdentity?: CliBackendRunIdentity;
   config?: OpenClawConfig;
   workspaceDir: string;
   agentDir?: string;
@@ -244,6 +261,10 @@ export type CliBackendPromptContext = {
 
 /** Exact prepared local process facts consumed by a plugin-owned execution transport. */
 export type CliBackendExecuteContext = {
+  readonly hostRunContractVersion?: 1;
+  readonly runIdentity?: CliBackendRunIdentity;
+  readonly preparedPrompt?: CliBackendPreparedPrompt;
+  readonly workspaceDir: string;
   command: string;
   /** Preserve a verified invocation name when command resolves through a PATH shim. */
   argv0?: string;

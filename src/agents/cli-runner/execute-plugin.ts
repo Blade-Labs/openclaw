@@ -48,7 +48,7 @@ function createPluginUserInputHandler(params: {
     const signal = request.abortSignal
       ? AbortSignal.any([params.abortSignal, request.abortSignal])
       : params.abortSignal;
-    const assertActive = createCliRunCurrentAssertion(run, signal);
+    const assertActive = createCliRunCurrentAssertion(run, signal, params.context.runIdentity);
     try {
       assertActive();
     } catch {
@@ -239,8 +239,12 @@ export async function executePluginOwnedProcess(params: {
   const signal = run.abortSignal
     ? AbortSignal.any([controller.signal, run.abortSignal])
     : controller.signal;
-  const assertCurrent = createCliRunCurrentAssertion(run, signal);
-  const assertRunCurrent = createCliRunCurrentAssertion(run);
+  const assertCurrent = createCliRunCurrentAssertion(run, signal, params.context.runIdentity);
+  const assertRunCurrent = createCliRunCurrentAssertion(
+    run,
+    run.abortSignal,
+    params.context.runIdentity,
+  );
   const termination: { reason: TerminationReason } = { reason: "exit" };
   // Normal cleanup closes native callbacks; MCP results retain their admitted
   // caller through the capture drain. Cancellation and timeouts still close both.
@@ -349,6 +353,10 @@ export async function executePluginOwnedProcess(params: {
       argv0: params.executionArgv0,
       args: executionArgs,
       cwd,
+      workspaceDir: params.context.workspaceDir,
+      hostRunContractVersion: params.context.hostRunContractVersion,
+      runIdentity: params.context.runIdentity,
+      preparedPrompt: params.context.preparedPrompt,
       env: params.env,
       prompt: params.prompt,
       ...(params.promptContext ? { promptContext: params.promptContext } : {}),

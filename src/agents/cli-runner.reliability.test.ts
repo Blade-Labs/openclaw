@@ -2736,6 +2736,7 @@ describe("runCliAgent reliability", () => {
     try {
       await runPreparedCliAgent({
         ...buildPreparedContext(),
+        workspaceDir: dir,
         params: {
           ...buildPreparedContext().params,
           sessionFile,
@@ -4269,7 +4270,7 @@ describe("runCliAgent reliability", () => {
     expect(callArg(hookRunner.runAgentEnd, 0, 1, "agent_end context")).toBeTypeOf("object");
   });
 
-  it("does not emit duplicate llm_input when session-expired recovery succeeds", async () => {
+  it("requalifies changed reseed bytes on session-expired recovery without repeating user persistence", async () => {
     const hookRunner = {
       hasHooks: vi.fn((hookName: string) =>
         ["llm_input", "llm_output", "agent_end"].includes(hookName),
@@ -4326,7 +4327,7 @@ describe("runCliAgent reliability", () => {
       });
 
       await vi.waitFor(() => {
-        expect(hookRunner.runLlmInput).toHaveBeenCalledTimes(1);
+        expect(hookRunner.runLlmInput).toHaveBeenCalledTimes(2);
         expect(hookRunner.runLlmOutput).toHaveBeenCalledTimes(1);
         expect(hookRunner.runAgentEnd).toHaveBeenCalledTimes(1);
       });
@@ -4334,6 +4335,10 @@ describe("runCliAgent reliability", () => {
         callArg(hookRunner.runLlmInput, 0, 0, "llm_input event"),
         "llm_input event",
       );
+      expect(hookRunner.runLlmInput.mock.calls.map((call) => call[0].prompt)).toEqual([
+        context.params.prompt,
+        context.openClawHistoryPrompt,
+      ]);
       const historyMessages = requireArray(llmInputEvent.historyMessages, "history messages");
       expect(historyMessages).toHaveLength(MAX_CLI_SESSION_HISTORY_MESSAGES);
       const firstHistoryMessage = requireRecord(historyMessages[0], "first history message");

@@ -1,5 +1,5 @@
 import { createAbortError } from "../../infra/abort-signal.js";
-import type { CliBackendExecute } from "../../plugins/cli-backend.types.js";
+import type { CliBackendExecute, CliBackendRunIdentity } from "../../plugins/cli-backend.types.js";
 import { getPluginValueInstance } from "../../plugins/plugin-instance-scope.js";
 import type { PluginInstanceConsumer } from "../../plugins/plugin-instance.types.js";
 import { resolveAdmittedRunActiveAssertion } from "../admitted-run-context.js";
@@ -14,10 +14,19 @@ import type { CliExecutionTarget, PreparedCliRunContext, RunCliAgentParams } fro
 export function createCliRunCurrentAssertion(
   params: PreparedCliRunContext["params"],
   signal = params.abortSignal,
+  runIdentity?: CliBackendRunIdentity,
 ): () => void {
   const assertCallerCurrent = params.assertCurrent;
   const assertAdmitted = resolveAdmittedRunActiveAssertion(params.admittedRunContext, signal);
   return () => {
+    if (
+      runIdentity &&
+      Object.entries(runIdentity).some(
+        ([field, value]) => params[field as keyof CliBackendRunIdentity] !== value,
+      )
+    ) {
+      throw new Error("CLI host run identity changed after preparation");
+    }
     assertCallerCurrent?.();
     if (signal?.aborted) {
       throw createAbortError("CLI run aborted");

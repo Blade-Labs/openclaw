@@ -27,7 +27,6 @@ import {
 } from "../embedded-agent-runner/run/images.js";
 import type { MediaImageLayout } from "../embedded-agent-runner/run/prompt-image-metadata.js";
 import { resolveFastModeForElapsed } from "../fast-mode.js";
-import { applyPluginTextReplacements } from "../plugin-text-transforms.js";
 import { prepareCliBundleMcpCaptureAttempt } from "./bundle-mcp.js";
 import { runCliCleanup } from "./cleanup.js";
 import {
@@ -64,7 +63,7 @@ import {
 } from "./helpers.js";
 import { cliBackendLog, CLI_BACKEND_LOG_OUTPUT_ENV } from "./log.js";
 import { createClaudeCliModelCallDiagnostics } from "./model-call-diagnostics.js";
-import { composeCliPromptContext } from "./prompt-context.js";
+import { composeCliPromptContext, finalizeCliPreparedPrompt } from "./prompt-context.js";
 import type { PreparedCliRunContext } from "./types.js";
 
 function normalizeCliBackendThinkingLevel(
@@ -144,7 +143,11 @@ export async function executePreparedCliRun(
         }
       : inputContext;
   const params = context.params as PreparedCliRunInternalParams;
-  const assertCurrent = createCliRunCurrentAssertion(params);
+  const assertCurrent = createCliRunCurrentAssertion(
+    params,
+    params.abortSignal,
+    context.runIdentity,
+  );
   assertCurrent();
   const backend = context.preparedBackend.backend;
   const executionTarget = context.executionTarget;
@@ -176,33 +179,10 @@ export async function executePreparedCliRun(
       : undefined;
   const nodeSystemPrompt = nodePlacement && shouldSendSystemPrompt ? systemPromptArg : undefined;
 
-  const basePrompt = cliSessionIdToUse
-    ? params.prompt
-    : (context.openClawHistoryPrompt ?? params.prompt);
-  let prompt =
-    params.controlOperation !== undefined
-      ? basePrompt
-      : applyPluginTextReplacements(basePrompt, context.backendResolved.textTransforms?.input);
-  const promptContext = context.promptContext
-    ? {
-        ...(context.promptContext.prependContext
-          ? {
-              prependContext: applyPluginTextReplacements(
-                context.promptContext.prependContext,
-                context.backendResolved.textTransforms?.input,
-              ),
-            }
-          : {}),
-        ...(context.promptContext.appendContext
-          ? {
-              appendContext: applyPluginTextReplacements(
-                context.promptContext.appendContext,
-                context.backendResolved.textTransforms?.input,
-              ),
-            }
-          : {}),
-      }
-    : undefined;
+  const preparedPrompt =
+    context.preparedPrompt ?? finalizeCliPreparedPrompt(context, cliSessionIdToUse);
+  let prompt = preparedPrompt.prompt;
+  const promptContext = preparedPrompt.promptContext;
   if (
     nodePlacement &&
     ((params.images?.length ?? 0) > 0 ||
@@ -230,6 +210,14 @@ export async function executePreparedCliRun(
         media: params.media,
         ...(imageTurnEntryId ? { imageTurnKey: hashCliImageTurnEntryId(imageTurnEntryId) } : {}),
       });
+  if (
+    usePluginOwnedExecution &&
+    context.preparedPrompt &&
+    imagePayload.prompt !== preparedPrompt.prompt
+  ) {
+    await imagePayload.cleanupImages?.();
+    throw new Error("CLI prompt changed after readiness");
+  }
   prompt = imagePayload.prompt;
   const promptInputBackend =
     params.controlOperation === "compact" && context.backendResolved.manualCompaction
@@ -358,7 +346,7 @@ export async function executePreparedCliRun(
         buildCliExecLogLine({
           provider: params.provider,
           model: context.normalizedModel,
-          promptChars: basePrompt.length,
+          promptChars: preparedPrompt.prompt.length,
           trigger: params.trigger,
           useResume,
           cliSessionId: cliSessionIdToUse,

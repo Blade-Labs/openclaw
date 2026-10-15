@@ -42,6 +42,7 @@ async function createContext(
     command: process.execPath,
     args: [fixture],
     cwd: root,
+    workspaceDir: root,
     env: {
       PATH: process.env.PATH ?? "",
       HOME: root,

@@ -71,6 +71,7 @@ async function contextForChild(source: string): Promise<CliBackendExecuteContext
     command: process.execPath,
     args: [command],
     cwd: root,
+    workspaceDir: root,
     env: { PATH: process.env.PATH ?? "", HOME: root, CLAUDE_CONFIG_DIR: root },
     prompt: "Synthetic subprocess diagnostic probe.",
     systemPrompt: "Synthetic subprocess diagnostic probe.",

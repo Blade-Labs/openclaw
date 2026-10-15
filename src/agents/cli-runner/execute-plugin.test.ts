@@ -21,6 +21,7 @@ import {
   SUCCESS_RESULT,
   waitUntilAborted,
 } from "./execute-plugin.test-support.js";
+import { finalizeCliPreparedPrompt } from "./prompt-context.js";
 import type { PreparedCliRunContext } from "./types.js";
 
 vi.mock("../tools/gateway.js", () => ({
@@ -64,16 +65,31 @@ afterEach(() => {
 
 describe("plugin-owned CLI execution host boundary", () => {
   it("streams plugin events through the canonical host output boundary", async () => {
-    const { context } = await createExecution();
+    const { context, admission } = await createExecution();
+    Object.assign(context, {
+      hostRunContractVersion: 1,
+      runIdentity: Object.freeze({
+        agentId: context.params.agentId!,
+        runId: context.params.runId,
+        sessionKey: context.params.sessionKey!,
+        sessionId: "host-session",
+      }),
+    });
+    context.params.sessionId = "host-session";
     context.systemPrompt = `  Follow host policy.${SYSTEM_PROMPT_CACHE_BOUNDARY}Keep credentials private.  `;
     context.promptContext = {
       prependContext: "private red prefix",
       appendContext: "private red suffix",
     };
+    context.preparedPrompt = finalizeCliPreparedPrompt(context);
     const output: string[] = [];
     let observedExecution: CliBackendExecuteContext | undefined;
     const execute: CliBackendExecute = async function* (execution) {
       observedExecution = execution;
+      const originalRunId = context.params.runId;
+      context.params.runId = "changed-host-run";
+      expect(() => execution.assertCurrent?.()).toThrow("CLI host run identity changed");
+      context.params.runId = originalRunId;
       yield { type: "system", subtype: "init", session_id: "sdk-session" };
       yield SUCCESS_RESULT;
     };
@@ -86,6 +102,16 @@ describe("plugin-owned CLI execution host boundary", () => {
       { type: "system", subtype: "init", session_id: "sdk-session" },
       SUCCESS_RESULT,
     ]);
+    expect(observedExecution?.runIdentity).toBe(context.runIdentity);
+    expect(observedExecution?.runIdentity?.sessionId).toBe("host-session");
+    expect(observedExecution?.preparedPrompt).toBe(context.preparedPrompt);
+    expect(observedExecution?.workspaceDir).toBe(context.workspaceDir);
+    expect(Object.isFrozen(observedExecution?.preparedPrompt?.promptContext)).toBe(true);
+    expect(observedExecution?.hostRunContractVersion).toBe(1);
+    expect(() => observedExecution?.assertCurrent?.()).toThrow();
+    expect(observedExecution?.abortSignal?.aborted).toBe(true);
+    admission.close();
+    expect(() => observedExecution?.assertCurrent?.()).toThrow();
     expect(observedExecution).toEqual(
       expect.objectContaining({
         command: "/bin/sh",

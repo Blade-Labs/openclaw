@@ -2,9 +2,15 @@ import {
   buildActiveNodeContextText,
   prepareActiveNodeContext,
 } from "../../infra/active-node-context.js";
-import type { CliBackendConfig, CliBackendPromptContext } from "../../plugins/cli-backend.types.js";
+import type {
+  CliBackendConfig,
+  CliBackendPromptContext,
+  CliBackendPreparedPrompt,
+} from "../../plugins/cli-backend.types.js";
 import { buildRuntimeContextCustomMessage } from "../embedded-agent-runner/run/runtime-context-prompt.js";
 import { buildMediaTaskRuntimeContext } from "../media-generation-task-status.js";
+import { applyPluginTextReplacements } from "../plugin-text-transforms.js";
+import type { PreparedCliRunContext } from "./types.js";
 
 /** Current-turn facts stay outside native prompts that are retained across CLI turns. */
 export async function buildCliTurnAppendContext(
@@ -36,6 +42,41 @@ export async function buildCliTurnAppendContext(
 export function composeCliPromptContext(prompt: string, context?: CliBackendPromptContext): string {
   const prepended = context?.prependContext ? `${context.prependContext}\n\n${prompt}` : prompt;
   return context?.appendContext ? `${prepended}\n\n${context.appendContext}` : prepended;
+}
+
+/** Select and transform the actual attempt before readiness and input observation. */
+export function finalizeCliPreparedPrompt(
+  context: PreparedCliRunContext,
+  cliSessionIdToUse?: string,
+): CliBackendPreparedPrompt {
+  if (!cliSessionIdToUse && context.openClawHistoryPrompt) {
+    context.cliHistoryWriter?.assertReadable();
+  }
+  const replace = (text: string) =>
+    context.params.controlOperation !== undefined
+      ? text
+      : applyPluginTextReplacements(text, context.backendResolved.textTransforms?.input);
+  const prompt = replace(
+    cliSessionIdToUse
+      ? context.params.prompt
+      : (context.openClawHistoryPrompt ?? context.params.prompt),
+  );
+  const promptContext = context.promptContext
+    ? Object.freeze({
+        ...(context.promptContext.prependContext
+          ? { prependContext: replace(context.promptContext.prependContext) }
+          : {}),
+        ...(context.promptContext.appendContext
+          ? { appendContext: replace(context.promptContext.appendContext) }
+          : {}),
+      })
+    : undefined;
+  return Object.freeze({
+    version: 1,
+    prompt,
+    ...(promptContext ? { promptContext } : {}),
+    logicalPrompt: composeCliPromptContext(prompt, promptContext),
+  });
 }
 
 export async function prepareCliSystemPrompt(

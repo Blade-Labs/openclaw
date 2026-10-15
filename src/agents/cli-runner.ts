@@ -66,8 +66,9 @@ import {
 } from "./cli-runner/delivery-evidence.js";
 import { createCliRunCurrentAssertion } from "./cli-runner/execution-target.js";
 import { createCliFailoverError } from "./cli-runner/exit-error.js";
+import { isClaudeCliBackendId } from "./cli-runner/helpers.js";
 import { cliBackendLog, formatCliBackendOutputDigest } from "./cli-runner/log.js";
-import { finalizeCliPreparedPrompt } from "./cli-runner/prompt-context.js";
+import { prepareCliAttemptPrompt } from "./cli-runner/prompt-context.js";
 import {
   runClaudeCliAgentTurnWithDiagnostics,
   type ClaudeCliRunDiagnosticLifecycle,
@@ -291,6 +292,8 @@ async function runPreparedCliAgentOwned(
   let promptForHooks = context.promptForHooks ?? params.prompt;
   let qualifiedPrompt: PreparedCliRunContext["preparedPrompt"];
   let qualifiedEnvelope: string | undefined;
+  let userPersistenceAttempted = false;
+  const imageCleanups = new Set<() => Promise<void>>();
   let qualifyAttempt:
     | ((attempt: PreparedCliRunContext, nativeId?: string) => Promise<void>)
     | undefined;
@@ -635,7 +638,13 @@ async function runPreparedCliAgentOwned(
         attempt.runIdentity,
       );
       assertCurrent();
-      const projection = finalizeCliPreparedPrompt(attempt, nativeId);
+      const transport = await prepareCliAttemptPrompt(attempt, nativeId);
+      if (transport.imagePayload.cleanupImages) {
+        imageCleanups.add(transport.imagePayload.cleanupImages);
+      }
+      attempt.preparedImagePayload = transport.imagePayload;
+      assertCurrent();
+      const projection = transport.preparedPrompt;
       const envelope = JSON.stringify([
         attempt.params.provider,
         attempt.modelId,
@@ -691,8 +700,20 @@ async function runPreparedCliAgentOwned(
       }
 
       assertCurrent();
-      if (!qualifiedPrompt) {
+      if (!userPersistenceAttempted) {
+        userPersistenceAttempted = true;
         userTurnHandled = await persistApprovedCliUserTurnTranscript(params);
+        // Persistence can establish the transcript image correlation key. Keep
+        // the approved row, then qualify those final transport bytes before input.
+        if (
+          isClaudeCliBackendId(attempt.backendResolved.id) &&
+          transport.imagePayload.imagePaths?.length &&
+          transport.imageTurnEntryId !==
+            params.userTurnTranscriptRecorder?.getAdmissionReceipt()?.entryId
+        ) {
+          assertCurrent();
+          return qualifyAttempt!(attempt, nativeId);
+        }
       }
       assertCurrent();
       runAgentHarnessLlmInputHook({
@@ -747,7 +768,13 @@ async function runPreparedCliAgentOwned(
   let cleanupError: Error | undefined;
   try {
     await runCliCleanup(params, "cli-backend-release", async () => {
-      await context.preparedBackend.cleanup?.();
+      try {
+        for (const cleanup of imageCleanups) {
+          await cleanup();
+        }
+      } finally {
+        await context.preparedBackend.cleanup?.();
+      }
     });
   } catch (error) {
     cleanupError = error as Error;

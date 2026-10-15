@@ -238,6 +238,9 @@ export type PreparedCliRunContext = {
   readonly hostRunContractVersion?: 1;
   readonly runIdentity?: import("../../plugins/cli-backend.types.js").CliBackendRunIdentity;
   preparedPrompt?: import("../../plugins/cli-backend.types.js").CliBackendPreparedPrompt;
+  preparedImagePayload?: Awaited<
+    ReturnType<typeof import("./helpers.js").prepareCliPromptImagePayload>
+  >;
   params: RunCliAgentParams & { admittedRunContext: AdmittedRunContext };
   /** Core-only original caller policy, bound to each native request's exact lifetime. */
   bindQuestionAnswerAuthority?: (assertActive: () => void) => PreparedQuestionAnswerAuthority;

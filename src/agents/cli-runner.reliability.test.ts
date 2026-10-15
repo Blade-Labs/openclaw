@@ -54,6 +54,11 @@ import { captureEnv, setTestEnvValue } from "../test-utils/env.js";
 import { prepareSystemAgentRunAdmission } from "./admitted-run-context.js";
 import { createTestAdmittedRunContext } from "./admitted-run-context.test-support.js";
 import { testing as cliBackendsTesting } from "./cli-backends.test-support.js";
+import { readCliImageTurnContext, hashCliImageTurnEntryId } from "./cli-image-turn-correlation.js";
+import {
+  disclosurePluginRoot,
+  disclosureRecoveryFixture,
+} from "./cli-runner.disclosure.test-support.js";
 import {
   restoreCliRunnerTestDeps,
   runPreparedCliAgent as runPreparedCliAgentCore,
@@ -68,10 +73,12 @@ import {
 import { runCliRecovery } from "./cli-runner/cli-run-recovery.js";
 import { executePreparedCliRun as executePreparedCliRunCore } from "./cli-runner/execute.js";
 import { wrapPreparedCliRunWithTestAdmission } from "./cli-runner/execute.test-support.js";
+import { createCliRunCurrentAssertion } from "./cli-runner/execution-target.js";
 import {
   resolveCliNoOutputTimeoutMs,
   resolveCliRunTimeoutOverrideMs,
 } from "./cli-runner/helpers.js";
+import { prepareCliHistoryBoundary } from "./cli-runner/history-boundary.js";
 import { prepareCliRunContext } from "./cli-runner/prepare.js";
 import { hashCliReseedPrompt } from "./cli-runner/reseed-envelope.js";
 import * as sessionHistoryModule from "./cli-runner/session-history.js";
@@ -79,10 +86,8 @@ import { captureCliRunStartTime, type PreparedCliRunContext } from "./cli-runner
 import { isIntermediateAssistantTranscriptMessage } from "./embedded-agent-runner/message-visibility.js";
 import { FailoverError } from "./failover-error.js";
 import { runAgentHarnessBeforeMessageWriteHook } from "./harness/hook-helpers.js";
-import { MAX_AGENT_HOOK_HISTORY_MESSAGES } from "./harness/hook-history.js";
 import { SessionManager } from "./sessions/session-manager.js";
 
-const MAX_CLI_SESSION_HISTORY_MESSAGES = MAX_AGENT_HOOK_HISTORY_MESSAGES;
 const runPreparedCliAgent = wrapPreparedCliRunWithTestAdmission(runPreparedCliAgentCore);
 const executePreparedCliRun = wrapPreparedCliRunWithTestAdmission(executePreparedCliRunCore);
 
@@ -4270,82 +4275,279 @@ describe("runCliAgent reliability", () => {
     expect(callArg(hookRunner.runAgentEnd, 0, 1, "agent_end context")).toBeTypeOf("object");
   });
 
-  it("requalifies changed reseed bytes on session-expired recovery without repeating user persistence", async () => {
-    const hookRunner = {
-      hasHooks: vi.fn((hookName: string) =>
-        ["llm_input", "llm_output", "agent_end"].includes(hookName),
-      ),
-      runLlmInput: vi.fn(async () => undefined),
-      runLlmOutput: vi.fn(async () => undefined),
-      runAgentEnd: vi.fn(async () => undefined),
-    };
-    setHookRunnerForTest(hookRunner);
-    const { dir, sessionFile, sessionTarget } = createSessionFixture({
-      history: Array.from({ length: MAX_CLI_SESSION_HISTORY_MESSAGES + 5 }, (_, index) => ({
-        role: "user" as const,
-        content: `history-${index}`,
-      })),
-    });
-
-    supervisorSpawnMock.mockResolvedValueOnce(
-      makeManagedRun({
-        exitCode: 1,
-        stderr: "session expired",
-      }),
-    );
-    supervisorSpawnMock.mockResolvedValueOnce(makeManagedRun({ stdout: "recovered output" }));
-
-    const context = buildPreparedContext({
-      sessionKey: "agent:main:main",
-      runId: "run-retry-success",
-      cliSessionId: "thread-123",
-      openClawHistoryPrompt:
-        "Continue this conversation using the OpenClaw transcript below.\n\nUser: recovered history\n\n<next_user_message>\nhi\n</next_user_message>",
-    });
-    context.preparedBackend.backend.freshSessionRecovery = "invalidated-only";
-    const clearBeforeRetry = vi.fn(async () => true);
-
-    try {
-      const result = await runPreparedCliAgent({
-        ...context,
-        params: {
-          ...context.params,
+  it.skipIf(!disclosurePluginRoot)(
+    "requalifies changed authorized reseed through actual Disclosure without repeating user persistence",
+    async () => {
+      const { dir, sessionFile, sessionTarget } = createSessionFixture();
+      const context = buildPreparedContext({
+        provider: "zeroh-claude-cli",
+        model: "claude-sonnet-4-6",
+        sessionKey: sessionTarget.sessionKey,
+        runId: "run-retry-disclosure",
+        cliSessionId: "native-predecessor",
+      });
+      context.workspaceDir = dir;
+      const recorder = createCliUserTurnRecorder({ text: "hi", sessionTarget, workspaceDir: dir });
+      const persisted = vi.spyOn(recorder, "persistApproved");
+      const clearBeforeRetry = vi.fn(async () => true);
+      context.params = {
+        ...context.params,
+        agentId: "main",
+        sessionFile,
+        sessionTarget,
+        workspaceDir: dir,
+        userTurnTranscriptRecorder: recorder,
+        onBeforeFreshCliSessionRetry: clearBeforeRetry,
+      };
+      Object.assign(context, {
+        hostRunContractVersion: 1,
+        runIdentity: Object.freeze({
           agentId: "main",
-          onBeforeFreshCliSessionRetry: clearBeforeRetry,
-          sessionFile,
-          sessionTarget,
-          workspaceDir: dir,
+          runId: context.params.runId,
+          sessionKey: sessionTarget.sessionKey,
+          sessionId: context.params.sessionId,
+        }),
+      });
+      const admission = await admitPreparedContext(context, "plugin-harness");
+      context.params.assertCurrent = createCliRunCurrentAssertion(
+        context.params,
+        undefined,
+        context.runIdentity,
+      );
+      // Establish actual credential-scoped authority over an empty local transcript.
+      context.cliHistoryWriter = await prepareCliHistoryBoundary(context.params, {
+        credential: {
+          type: "token",
+          provider: "zeroh-claude-cli",
+          token: "synthetic-history-owner",
         },
       });
-
-      expect(result.payloads).toEqual([{ text: "recovered output" }]);
-      expect(result.meta.finalPromptText).toContain("User: recovered history");
-      expect(clearBeforeRetry).toHaveBeenCalledWith({
-        provider: "codex-cli",
-        reason: "session_expired",
-        sessionId: "thread-123",
+      expect(context.cliHistoryWriter).toBeDefined();
+      let nativeCalls = 0;
+      const f = await disclosureRecoveryFixture(context, async function* (execution) {
+        if (++nativeCalls === 1) {
+          // Read through the real writer after the approved user row was committed.
+          const history = await sessionHistoryModule.loadCliSessionPromptContext({
+            ...context.params,
+            allowRawTranscriptReseed: true,
+            rawTranscriptReseedReason: "session-expired",
+          });
+          context.openClawHistoryPrompt = sessionHistoryModule.buildCliSessionHistoryPrompt({
+            messages: history.reseedMessages,
+            prompt: "hi",
+          });
+          expect(context.openClawHistoryPrompt).toContain("hi");
+          throw new FailoverError("session expired", { reason: "session_expired" });
+        }
+        execution.assertCurrent!();
+        expect(() => expectDefined(f.observed[0], "predecessor").assertCurrent!()).toThrow();
+        yield {
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          result: "recovered output",
+          session_id: execution.sessionId,
+        };
       });
+      setHookRunnerForTest(f.hookRunner);
+      Object.assign(context, captureCliRunStartTime());
+      try {
+        const result = await runPreparedCliAgentCore(context);
+        expect(result.payloads).toEqual([{ text: "recovered output" }]);
+        expect(nativeCalls).toBe(2);
+        expect(f.late.map((x) => x.prompt)).toEqual(f.inputs.map((x) => x.prompt));
+        expect(f.inputs.map((x) => x.prompt)).toEqual(["hi", context.openClawHistoryPrompt]);
+        expect(f.late).toHaveLength(2);
+        expect(persisted).toHaveBeenCalledOnce();
+        const messages = await readTranscriptMessages(sessionTarget);
+        expect(messages.filter((m) => requireRecord(m, "message").role === "user")).toHaveLength(1);
+        expect(f.bindings).toHaveLength(2);
+        expect(clearBeforeRetry).toHaveBeenCalledWith({
+          provider: "zeroh-claude-cli",
+          reason: "session_expired",
+          sessionId: "native-predecessor",
+        });
+        expect(f.observed.map((e) => e.runIdentity)).toEqual([
+          context.runIdentity,
+          context.runIdentity,
+        ]);
+        expect(f.inputs.map((x) => x.lifetime)).toEqual([f.lifetime, f.lifetime]);
+        const firstInput = expectDefined(f.inputs[0], "initial input");
+        const retryInput = expectDefined(f.inputs[1], "retry input");
+        expect(retryInput.pending.startedAt).toBe(firstInput.pending.startedAt);
+        expect(retryInput.pending).not.toBe(firstInput.pending);
+        expect(retryInput.pending.conflicting).toBe(false);
+        expect(retryInput.pending.fenced).not.toBe(true);
+        expect(() => expectDefined(f.observed[0], "predecessor").assertCurrent!()).toThrow();
+        expect(expectDefined(f.observed[0], "predecessor").abortSignal?.aborted).toBe(true);
+        expect(f.observed.map((e) => e.preparedPrompt!.logicalPrompt)).toEqual(
+          f.inputs.map((x) => x.prompt),
+        );
+      } finally {
+        await f.cleanup();
+        admission.close();
+      }
+    },
+  );
 
-      await vi.waitFor(() => {
-        expect(hookRunner.runLlmInput).toHaveBeenCalledTimes(2);
-        expect(hookRunner.runLlmOutput).toHaveBeenCalledTimes(1);
-        expect(hookRunner.runAgentEnd).toHaveBeenCalledTimes(1);
+  it.skipIf(!disclosurePluginRoot)(
+    "actual Disclosure refuses an unqualified duplicate input before dispatch",
+    async () => {
+      const { dir, sessionFile, sessionTarget } = createSessionFixture();
+      const context = buildPreparedContext({
+        provider: "zeroh-claude-cli",
+        model: "claude-sonnet-4-6",
+        sessionKey: sessionTarget.sessionKey,
       });
-      const llmInputEvent = requireRecord(
-        callArg(hookRunner.runLlmInput, 0, 0, "llm_input event"),
-        "llm_input event",
+      context.workspaceDir = dir;
+      context.params = {
+        ...context.params,
+        agentId: "main",
+        sessionFile,
+        sessionTarget,
+        workspaceDir: dir,
+      };
+      Object.assign(context, {
+        hostRunContractVersion: 1,
+        runIdentity: Object.freeze({
+          agentId: "main",
+          runId: context.params.runId,
+          sessionKey: sessionTarget.sessionKey,
+          sessionId: context.params.sessionId,
+        }),
+      });
+      const admission = await admitPreparedContext(context, "plugin-harness");
+      let nativeCalls = 0;
+      const f = await disclosureRecoveryFixture(
+        context,
+        async function* () {
+          nativeCalls++;
+          yield {
+            type: "result",
+            subtype: "success",
+            is_error: false,
+            result: "unexpected dispatch",
+          };
+        },
+        true,
       );
-      expect(hookRunner.runLlmInput.mock.calls.map((call) => call[0].prompt)).toEqual([
-        context.params.prompt,
-        context.openClawHistoryPrompt,
-      ]);
-      const historyMessages = requireArray(llmInputEvent.historyMessages, "history messages");
-      expect(historyMessages).toHaveLength(MAX_CLI_SESSION_HISTORY_MESSAGES);
-      const firstHistoryMessage = requireRecord(historyMessages[0], "first history message");
-      expect(firstHistoryMessage.role).toBe("user");
-      expect(firstHistoryMessage.content).toBe(`history-5`);
+      setHookRunnerForTest(f.hookRunner);
+      Object.assign(context, captureCliRunStartTime());
+      try {
+        await expect(runPreparedCliAgentCore(context)).rejects.toThrow(
+          "memory-provider-admission-ambiguous",
+        );
+        expect(f.inputs).toHaveLength(1);
+        expect(f.late).toHaveLength(1);
+        expect(f.bindings).toHaveLength(0);
+        expect(nativeCalls).toBe(0);
+        expect(f.warnings.join("\n")).toContain("candidate-ambiguous");
+      } finally {
+        await f.cleanup();
+        admission.close();
+      }
+    },
+  );
+
+  it("real Claude plugin image transport equals late/input/execution and dispatches", async () => {
+    const { dir, sessionFile, sessionTarget } = createSessionFixture();
+    const context = makeClaudePreparedContext({
+      model: "claude-sonnet-4-6",
+      sessionKey: sessionTarget.sessionKey,
+    });
+    context.workspaceDir = dir;
+    const recorder = createCliUserTurnRecorder({
+      text: "describe image",
+      sessionTarget,
+      workspaceDir: dir,
+    });
+    await recorder.persistApproved({ cwd: dir });
+    context.params = {
+      ...context.params,
+      agentId: "main",
+      sessionFile,
+      sessionTarget,
+      workspaceDir: dir,
+      prompt: "describe image",
+      userTurnTranscriptRecorder: recorder,
+      images: [
+        {
+          type: "image",
+          data: createSolidPngBuffer(1, 1, { r: 255, g: 0, b: 0 }).toString("base64"),
+          mimeType: "image/png",
+        },
+      ],
+    };
+    context.promptContext = { prependContext: "private core", appendContext: "heartbeat" };
+    Object.assign(context, {
+      hostRunContractVersion: 1,
+      runIdentity: Object.freeze({
+        agentId: "main",
+        runId: context.params.runId,
+        sessionKey: sessionTarget.sessionKey,
+        sessionId: context.params.sessionId,
+      }),
+    });
+    const admission = await admitPreparedContext(context, "plugin-harness");
+    const observed: import("../plugins/cli-backend.types.js").CliBackendExecuteContext[] = [];
+    vi.doMock(path.resolve("extensions/anthropic/cli.runtime.ts"), () => ({
+      async *executeClaudeCli(execution: (typeof observed)[number]) {
+        observed.push(execution);
+        const imagePath = expectDefined(execution.prompt.match(/@([^\n]+)$/)?.[1], "image path");
+        expect(fs.existsSync(imagePath)).toBe(true);
+        yield {
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          result: "image described",
+          session_id: execution.sessionId,
+        };
+      },
+    }));
+    const { buildAnthropicCliBackend } = await import("../../extensions/anthropic/cli-backend.js");
+    const backend = buildAnthropicCliBackend();
+    const prepared = await backend.prepareExecution!({
+      workspaceDir: dir,
+      provider: "claude-cli",
+      modelId: context.modelId,
+      executionMode: "agent",
+    });
+    if (!prepared?.execute) {
+      throw new Error("Claude plugin execution unavailable");
+    }
+    const config = { ...backend.config, command: "/bin/sh", liveSession: undefined };
+    context.backendResolved = { ...backend, config, bundleMcp: false };
+    context.preparedBackend = { ...prepared, backend: config, env: prepared.env ?? {} };
+    context.executionTarget = { kind: "plugin", execute: prepared.execute! };
+    const hooks = {
+      hasHooks: (name: string) => ["before_agent_run", "llm_input"].includes(name),
+      runBeforeAgentRun: vi.fn(async () => undefined),
+      runLlmInput: vi.fn(async () => undefined),
+    };
+    setHookRunnerForTest(hooks);
+    try {
+      const result = await runPreparedCliAgentCore(context);
+      expect(result.payloads).toEqual([{ text: "image described" }]);
+      expect(observed).toHaveLength(1);
+      expect(hooks.runBeforeAgentRun).toHaveBeenCalledOnce();
+      expect(hooks.runLlmInput).toHaveBeenCalledOnce();
+      const execution = expectDefined(observed[0], "native image execution");
+      expect(execution.prompt).toContain("@");
+      expect(readCliImageTurnContext(execution.prompt)).toBe(
+        hashCliImageTurnEntryId(recorder.getAdmissionReceipt()!.entryId),
+      );
+      const late = callArg(hooks.runBeforeAgentRun, 0, 0, "late") as { prompt: string };
+      const input = callArg(hooks.runLlmInput, 0, 0, "input") as { prompt: string };
+      expect(late.prompt).toBe(input.prompt);
+      expect(input.prompt).toBe(execution.preparedPrompt!.logicalPrompt);
+      expect(execution.prompt).toBe(execution.preparedPrompt!.prompt);
+      expect(execution.promptContext).toEqual(execution.preparedPrompt!.promptContext);
+      const rows = JSON.stringify(await readTranscriptMessages(sessionTarget));
+      expect(rows).not.toContain("private core");
+      expect(rows).not.toContain("Image turn:");
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      await context.preparedBackend.cleanup?.();
+      admission.close();
     }
   });
 

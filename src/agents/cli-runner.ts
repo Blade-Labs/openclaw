@@ -45,19 +45,19 @@ import {
   cliRunSettlementDeps,
   formatCliTerminalInterruption,
   isClaudeCliBackend,
+  prepareCliRunForExecution,
   resolveCliSourceReplyMirror,
   settleCliBackendOutcome,
-  settleCliPreparationError,
   settlePreparedCliRun,
 } from "./cli-runner/cli-run-settlement.js";
 import {
   buildCliHookAssistantMessage,
   buildCliHookUserMessage,
+  createCliAgentEndHook,
   finalizeCliContextEngineTurn,
   persistCliAssistantTranscript,
   persistCliRunBlock,
   resolveCliAssistantStopReason,
-  runCliAgentEndHook,
 } from "./cli-runner/cli-run-transcript.js";
 import {
   attachCliMessagingDeliveryEvidence,
@@ -226,15 +226,7 @@ async function runCliAgentInternal(
       },
     };
   }
-  const { prepareCliRunContext } = await import("./cli-runner/prepare.runtime.js");
-  let context: PreparedCliRunContext;
-  try {
-    context = await prepareCliRunContext(params);
-  } catch (error) {
-    params.assertCurrent?.();
-    await settleCliPreparationError(error, params);
-    throw error;
-  }
+  const context = await prepareCliRunForExecution(params);
   return await settlePreparedCliRun({
     context,
     diagnosticLifecycle,
@@ -329,8 +321,9 @@ async function runPreparedCliAgentOwned(
     }),
   ];
 
+  const finishAgentEndHook = createCliAgentEndHook(params);
   const finishFailedAgentEndHook = (error: unknown) =>
-    runCliAgentEndHook(params, {
+    finishAgentEndHook({
       event: {
         messages: buildAgentEndMessages(),
         success: false,
@@ -343,7 +336,7 @@ async function runPreparedCliAgentOwned(
 
   const finishBlockedRun = async (message: string, pluginId: string) => {
     await persistCliRunBlock(params, { message, pluginId });
-    await runCliAgentEndHook(params, {
+    await finishAgentEndHook({
       event: {
         messages: buildAgentHookConversationMessages({
           historyMessages,
@@ -572,7 +565,7 @@ async function runPreparedCliAgentOwned(
         const interruptionError = terminalInterruption
           ? formatCliTerminalInterruption(terminalInterruption)
           : undefined;
-        await runCliAgentEndHook(params, {
+        await finishAgentEndHook({
           event: {
             messages: buildAgentEndMessages(lastAssistant),
             success: interruptionError === undefined,
@@ -661,6 +654,9 @@ async function runPreparedCliAgentOwned(
   } catch (error) {
     runFailed = true;
     runError = error;
+    if (!turnSideEffectsDisabled) {
+      await finishFailedAgentEndHook(error);
+    }
   }
   let cleanupError: Error | undefined;
   try {

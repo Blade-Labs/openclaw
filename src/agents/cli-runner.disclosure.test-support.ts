@@ -29,7 +29,7 @@ const nativeDispatch = vi.fn<CliBackendExecute>();
 export async function disclosureRecoveryFixture(
   context: PreparedCliRunContext,
   native: CliBackendExecute,
-  unqualifiedDuplicate = false,
+  unqualifiedChangedInput = false,
 ) {
   if (!disclosurePluginRoot) {
     throw new Error("LIBMEM_PLUGIN_ROOT is required");
@@ -127,8 +127,11 @@ export async function disclosureRecoveryFixture(
       // Actual handler records synchronously, before receipt I/O.
       const pending = shared().get(stateDir)!.activeMemoryRuns.get(key)!;
       inputs.push({ prompt: event.prompt, lifetime: ctx.admissionLifetime, pending });
-      if (unqualifiedDuplicate) {
-        await hooks.get("llm_input")!({ ...event }, ctx);
+      if (unqualifiedChangedInput) {
+        await hooks.get("llm_input")!(
+          { ...event, prompt: `${event.prompt}\nchanged without qualification` },
+          ctx,
+        );
       }
       await delivery;
     }),

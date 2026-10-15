@@ -6,6 +6,7 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSolidPngBuffer } from "../../test/helpers/image-fixtures.js";
+import { createDeferred } from "../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { getReplyPayloadMetadata } from "../auto-reply/reply-payload.js";
 import { createReplyOperation } from "../auto-reply/reply/reply-run-registry.js";
@@ -71,6 +72,7 @@ import {
   supervisorSpawnMock,
 } from "./cli-runner.test-support.js";
 import { runCliRecovery } from "./cli-runner/cli-run-recovery.js";
+import * as cliRunTranscript from "./cli-runner/cli-run-transcript.js";
 import { executePreparedCliRun as executePreparedCliRunCore } from "./cli-runner/execute.js";
 import { wrapPreparedCliRunWithTestAdmission } from "./cli-runner/execute.test-support.js";
 import { createCliRunCurrentAssertion } from "./cli-runner/execution-target.js";
@@ -3759,6 +3761,131 @@ describe("runCliAgent reliability", () => {
     }
   });
 
+  it.each([
+    "cancelled after qualification",
+    "revoked after qualification",
+    "approved persistence rejected",
+    "cancelled during approved persistence",
+  ] as const)("ends the exact run once when %s before input", async (failure) => {
+    const { dir, sessionFile, sessionTarget } = createSessionFixture();
+    const context = buildPreparedContext({
+      sessionKey: sessionTarget.sessionKey,
+      runId: `run-pre-input-${failure}`,
+    });
+    context.params = {
+      ...context.params,
+      agentId: "main",
+      sessionFile,
+      sessionTarget,
+      workspaceDir: dir,
+    };
+    context.workspaceDir = dir;
+    setHostRunContract(context);
+    const abort = new AbortController();
+    let current = true;
+    const failureError = new Error(failure);
+    context.params.abortSignal = abort.signal;
+    context.params.assertCurrent = () => {
+      if (!current) {
+        throw failureError;
+      }
+    };
+    const recorder = createCliUserTurnRecorder({
+      text: "owner turn",
+      sessionTarget,
+      workspaceDir: dir,
+    });
+    context.params.userTurnTranscriptRecorder = recorder;
+    const persistenceEntered = createDeferred();
+    const persistenceReleased = createDeferred();
+    const persistence = vi.spyOn(recorder, "persistApproved");
+    if (failure === "approved persistence rejected") {
+      persistence.mockRejectedValue(failureError);
+    } else if (failure === "cancelled during approved persistence") {
+      persistence.mockImplementation(async () => {
+        persistenceEntered.resolve();
+        await persistenceReleased.promise;
+        return undefined;
+      });
+    }
+    const hooks = {
+      hasHooks: (name: string) => ["before_agent_run", "llm_input", "agent_end"].includes(name),
+      runBeforeAgentRun: vi.fn(async () => {
+        if (failure === "cancelled after qualification") {
+          abort.abort(failureError);
+        } else if (failure === "revoked after qualification") {
+          current = false;
+        }
+      }),
+      runLlmInput: vi.fn(async () => undefined),
+      runAgentEnd: vi.fn(async () => undefined),
+    };
+    setHookRunnerForTest(hooks);
+    try {
+      const result = runPreparedCliAgent(context);
+      const rejected = failure.startsWith("cancelled")
+        ? expect(result).rejects.toMatchObject({ name: "AbortError", message: "CLI run aborted" })
+        : expect(result).rejects.toBe(failureError);
+      if (failure === "cancelled during approved persistence") {
+        await persistenceEntered.promise;
+        abort.abort(failureError);
+        persistenceReleased.resolve();
+      }
+      await rejected;
+      expect(hooks.runBeforeAgentRun).toHaveBeenCalledOnce();
+      expect(hooks.runLlmInput).not.toHaveBeenCalled();
+      expect(supervisorSpawnMock).not.toHaveBeenCalled();
+      expect(hooks.runAgentEnd).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          success: false,
+          error: failure.startsWith("cancelled") ? "CLI run aborted" : failure,
+        }),
+        expect.objectContaining(context.runIdentity!),
+        { unrefTimeout: false },
+      );
+      expect(persistence).toHaveBeenCalledTimes(failure.endsWith("qualification") ? 0 : 1);
+    } finally {
+      persistenceReleased.resolve();
+      persistence.mockRestore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("ends the exact blocked run once when block persistence rejects", async () => {
+    const context = buildPreparedContext({
+      sessionKey: "agent:main:main",
+      runId: "run-block-persistence-rejected",
+    });
+    context.params.agentId = "main";
+    setHostRunContract(context);
+    const failure = new Error("block persistence rejected");
+    const persistence = vi.spyOn(cliRunTranscript, "persistCliRunBlock").mockRejectedValue(failure);
+    const hooks = {
+      hasHooks: (name: string) => ["before_agent_run", "llm_input", "agent_end"].includes(name),
+      runBeforeAgentRun: vi.fn(async () => ({
+        pluginId: "policy-plugin",
+        decision: { outcome: "block" as const, message: "blocked owner turn" },
+      })),
+      runLlmInput: vi.fn(async () => undefined),
+      runAgentEnd: vi.fn(async () => undefined),
+    };
+    setHookRunnerForTest(hooks);
+    try {
+      await expect(runPreparedCliAgent(context)).rejects.toBe(failure);
+      expect(persistence).toHaveBeenCalledOnce();
+      expect(hooks.runBeforeAgentRun).toHaveBeenCalledOnce();
+      expect(hooks.runLlmInput).not.toHaveBeenCalled();
+      expect(supervisorSpawnMock).not.toHaveBeenCalled();
+      expect(hooks.runAgentEnd).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ success: false }),
+        expect.objectContaining(context.runIdentity!),
+        { unrefTimeout: false },
+      );
+    } finally {
+      persistence.mockRestore();
+    }
+  });
+
   it("blocks CLI runs before llm_input and model execution when before_agent_run blocks", async () => {
     let releaseAgentEnd: () => void = () => undefined;
     const agentEndSettled = new Promise<void>((resolve) => {
@@ -4275,6 +4402,7 @@ describe("runCliAgent reliability", () => {
     releaseAgentEnd();
     await expect(run).rejects.toThrow("rate limit exceeded");
     expect(settled).toBe(true);
+    expect(hookRunner.runAgentEnd).toHaveBeenCalledOnce();
 
     const agentEndEvent = requireRecord(
       callArg(hookRunner.runAgentEnd, 0, 0, "agent_end event"),
@@ -4393,7 +4521,7 @@ describe("runCliAgent reliability", () => {
     }
   });
 
-  it("actual Disclosure refuses an unqualified duplicate input before dispatch", async (testContext) => {
+  it("actual Disclosure refuses an unqualified changed input before dispatch", async (testContext) => {
     requireDisclosurePlugin(testContext);
     const { dir, sessionFile, sessionTarget } = createSessionFixture();
     const context = buildPreparedContext({
@@ -4536,7 +4664,7 @@ describe("runCliAgent reliability", () => {
     }
   });
 
-  it("fresh-reseeds one invalidated control-only plugin resume without duplicate hooks", async () => {
+  it("fresh-reseeds one invalidated control-only plugin resume with one terminal event", async () => {
     const hookRunner = {
       hasHooks: vi.fn((hookName: string) =>
         ["llm_input", "llm_output", "agent_end"].includes(hookName),
@@ -4608,7 +4736,13 @@ describe("runCliAgent reliability", () => {
       expect(result.payloads).toEqual([{ text: "recovered output" }]);
       expect(attempts).toBe(3);
       expect(clearBeforeRetry).toHaveBeenCalledOnce();
-      expect(hookRunner.runLlmInput).toHaveBeenCalledOnce();
+      expect(hookRunner.runLlmInput).toHaveBeenCalledTimes(2);
+      expect(callArg(hookRunner.runLlmInput, 0, 0, "initial input")).toMatchObject({
+        prompt: "hi",
+      });
+      expect(callArg(hookRunner.runLlmInput, 1, 0, "reseed input")).toMatchObject({
+        prompt: CLI_RESEED_PROMPT,
+      });
       expect(hookRunner.runLlmOutput).toHaveBeenCalledOnce();
       expect(hookRunner.runAgentEnd).toHaveBeenCalledOnce();
     } finally {

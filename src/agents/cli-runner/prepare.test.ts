@@ -3059,6 +3059,88 @@ describe("prepareCliRunContext", () => {
     },
   );
 
+  it.each(["prompt restriction", "context engine validation"] as const)(
+    "the real runner ends the exact run once after preparation fails at %s",
+    async (failure) => {
+      installTestPluginRegistry();
+      const { runCliAgent } = await import("../cli-runner.js");
+      const { dir, sessionTarget } = fixture.session;
+      const engineId = "cli-terminal-preparation-failure";
+      const cleanup = vi.fn(async () => {});
+      const prepareExecution = vi.fn(async () => ({ cleanup }));
+      const hooks = {
+        hasHooks: (name: string) =>
+          ["before_prompt_build", "before_agent_run", "llm_input", "agent_end"].includes(name),
+        runBeforePromptBuild: vi.fn(async () =>
+          failure === "prompt restriction" ? { toolsAllow: ["read"] } : undefined,
+        ),
+        runBeforeAgentRun: vi.fn(async () => undefined),
+        runLlmInput: vi.fn(async () => undefined),
+        runAgentEnd: vi.fn(async () => undefined),
+      };
+      mockGetGlobalHookRunner.mockReturnValue(hooks as never);
+      registerTestContextEngine(engineId, (): ContextEngine => ({
+        info: {
+          id: engineId,
+          name: "CLI terminal preparation fixture",
+          hostRequirements: {
+            "agent-run": {
+              requiredCapabilities: ["assemble-before-prompt"],
+              unsupportedMessage: "terminal context engine failed",
+            },
+          },
+        },
+        ingest: vi.fn(async () => ({ ingested: true })),
+        assemble: vi.fn(async ({ messages }) => ({ messages, estimatedTokens: 0 })),
+        compact: vi.fn(async () => ({ ok: true, compacted: false })),
+      }));
+      setRawCliBackendForPrepareTest({
+        ...buildDefaultTestCliBackend(),
+        nativeToolMode: "always-on",
+        prepareExecution,
+      });
+      const identity = {
+        agentId: "main",
+        runId: `run-preparation-${failure}`,
+        sessionKey: sessionTarget.sessionKey,
+        sessionId: sessionTarget.sessionId,
+      };
+      await expect(
+        wrapRunWithTestPreparedAdmission(runCliAgent)({
+          ...identity,
+          sessionKey: "main",
+          sessionTarget,
+          sessionFile: sessionTarget.sessionKey,
+          workspaceDir: dir,
+          skillsSnapshot: { prompt: "", skills: [] },
+          prompt: "owner turn",
+          provider: "test-cli",
+          model: "test-model",
+          timeoutMs: 1_000,
+          config: { plugins: { slots: { contextEngine: engineId } } },
+        }),
+      ).rejects.toThrow(
+        failure === "prompt restriction"
+          ? "cannot enforce before_prompt_build tool restrictions"
+          : "terminal context engine failed",
+      );
+      expect(hooks.runBeforePromptBuild).toHaveBeenCalledOnce();
+      expect(hooks.runBeforeAgentRun).not.toHaveBeenCalled();
+      expect(hooks.runLlmInput).not.toHaveBeenCalled();
+      expect(hooks.runAgentEnd).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ success: false }),
+        expect.objectContaining(identity),
+        { unrefTimeout: false },
+      );
+      if (failure === "context engine validation") {
+        expect(prepareExecution).toHaveBeenCalledOnce();
+        expect(cleanup).toHaveBeenCalledOnce();
+      } else {
+        expect(prepareExecution).not.toHaveBeenCalled();
+      }
+    },
+  );
+
   it("cleans up prepared CLI backend when context-engine host validation fails", async () => {
     installTestPluginRegistry();
     const engineId = `cli-cleanup-engine-${Date.now().toString(36)}`;

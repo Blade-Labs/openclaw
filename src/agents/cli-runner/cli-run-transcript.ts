@@ -115,6 +115,19 @@ export async function runCliAgentEndHook(
   runAgentEndSideEffects(hookParams);
 }
 
+/** One terminal dispatch per run, including failures while finishing another outcome. */
+export function createCliAgentEndHook(params: RunCliAgentParams) {
+  let ended = false;
+  return async (hookParams: CliAgentEndHookParams): Promise<void> => {
+    if (ended) {
+      return;
+    }
+    // Claim before dispatch: neither hook failure nor recovery may end this run again.
+    ended = true;
+    await runCliAgentEndHook(params, hookParams);
+  };
+}
+
 export async function persistApprovedCliUserTurnTranscript(
   params: RunCliAgentParams,
 ): Promise<boolean> {

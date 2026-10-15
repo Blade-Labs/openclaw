@@ -120,6 +120,7 @@ import {
 } from "../embedded-agent-runner/sandbox-skills.js";
 import { selectContextEngineForTranscriptHost } from "../harness/context-engine-logical-turn.js";
 import { drainPendingContextEngineTurnsBeforeRun } from "../harness/context-engine-turn-attempt.js";
+import type { AgentHarnessHookContext } from "../harness/hook-context.js";
 import { createAgentQuestionAnswerAuthority } from "../harness/host-private-capabilities.js";
 import type { ResolvedProviderAuth } from "../model-auth-runtime-shared.js";
 import { findModelCatalogEntry, loadManifestModelCatalog } from "../model-catalog.js";
@@ -494,6 +495,7 @@ function buildCliAuthProfileResolutionError(params: {
 /** Builds the complete context required to execute a CLI-backed agent run. */
 export async function prepareCliRunContext(
   inputParams: RunCliAgentParams,
+  onHookContext?: (context: AgentHarnessHookContext) => void,
 ): Promise<PreparedCliRunContext> {
   if (!inputParams.sessionManager && inputParams.sessionTarget) {
     const { restoreSessionColdTranscript } =
@@ -505,12 +507,13 @@ export async function prepareCliRunContext(
     inputParams.sessionManager
       ? undefined
       : inputParams.userTurnTranscriptRecorder?.getAdmissionReceipt(),
-    () => prepareCliRunContextWithinReadFence(inputParams),
+    () => prepareCliRunContextWithinReadFence(inputParams, onHookContext),
   );
 }
 
 async function prepareCliRunContextWithinReadFence(
   inputParams: RunCliAgentParams,
+  onHookContext?: (context: AgentHarnessHookContext) => void,
 ): Promise<PreparedCliRunContext> {
   let params = inputParams.config ? inputParams : { ...inputParams, config: getRuntimeConfig() };
   if (params.sessionManager) {
@@ -1066,6 +1069,8 @@ async function prepareCliRunContextWithinReadFence(
     ...buildAgentHookContextChannelFields(params),
   };
   const promptBuildHookRunner = skipsTurnPreparation ? undefined : getGlobalHookRunner();
+  // Preserve the exact resolved tuple before prompt hooks acquire run-scoped state.
+  onHookContext?.(promptBuildHookContext);
   const promptBuildHookResult = await (async () => {
     if (skipsTurnPreparation) {
       return undefined;

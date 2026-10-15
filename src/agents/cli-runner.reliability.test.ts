@@ -56,8 +56,8 @@ import { createTestAdmittedRunContext } from "./admitted-run-context.test-suppor
 import { testing as cliBackendsTesting } from "./cli-backends.test-support.js";
 import { readCliImageTurnContext, hashCliImageTurnEntryId } from "./cli-image-turn-correlation.js";
 import {
-  disclosurePluginRoot,
   disclosureRecoveryFixture,
+  requireDisclosurePlugin,
 } from "./cli-runner.disclosure.test-support.js";
 import {
   restoreCliRunnerTestDeps,
@@ -4275,179 +4275,175 @@ describe("runCliAgent reliability", () => {
     expect(callArg(hookRunner.runAgentEnd, 0, 1, "agent_end context")).toBeTypeOf("object");
   });
 
-  it.skipIf(!disclosurePluginRoot)(
-    "requalifies changed authorized reseed through actual Disclosure without repeating user persistence",
-    async () => {
-      const { dir, sessionFile, sessionTarget } = createSessionFixture();
-      const context = buildPreparedContext({
-        provider: "zeroh-claude-cli",
-        model: "claude-sonnet-4-6",
-        sessionKey: sessionTarget.sessionKey,
-        runId: "run-retry-disclosure",
-        cliSessionId: "native-predecessor",
-      });
-      context.workspaceDir = dir;
-      const recorder = createCliUserTurnRecorder({ text: "hi", sessionTarget, workspaceDir: dir });
-      const persisted = vi.spyOn(recorder, "persistApproved");
-      const clearBeforeRetry = vi.fn(async () => true);
-      context.params = {
-        ...context.params,
+  it("requalifies changed authorized reseed through actual Disclosure without repeating user persistence", async (testContext) => {
+    requireDisclosurePlugin(testContext);
+    const { dir, sessionFile, sessionTarget } = createSessionFixture();
+    const context = buildPreparedContext({
+      provider: "zeroh-claude-cli",
+      model: "claude-sonnet-4-6",
+      sessionKey: sessionTarget.sessionKey,
+      runId: "run-retry-disclosure",
+      cliSessionId: "native-predecessor",
+    });
+    context.workspaceDir = dir;
+    const recorder = createCliUserTurnRecorder({ text: "hi", sessionTarget, workspaceDir: dir });
+    const persisted = vi.spyOn(recorder, "persistApproved");
+    const clearBeforeRetry = vi.fn(async () => true);
+    context.params = {
+      ...context.params,
+      agentId: "main",
+      sessionFile,
+      sessionTarget,
+      workspaceDir: dir,
+      userTurnTranscriptRecorder: recorder,
+      onBeforeFreshCliSessionRetry: clearBeforeRetry,
+    };
+    Object.assign(context, {
+      hostRunContractVersion: 1,
+      runIdentity: Object.freeze({
         agentId: "main",
-        sessionFile,
-        sessionTarget,
-        workspaceDir: dir,
-        userTurnTranscriptRecorder: recorder,
-        onBeforeFreshCliSessionRetry: clearBeforeRetry,
+        runId: context.params.runId,
+        sessionKey: sessionTarget.sessionKey,
+        sessionId: context.params.sessionId,
+      }),
+    });
+    const admission = await admitPreparedContext(context, "plugin-harness");
+    context.params.assertCurrent = createCliRunCurrentAssertion(
+      context.params,
+      undefined,
+      context.runIdentity,
+    );
+    // Establish actual credential-scoped authority over an empty local transcript.
+    context.cliHistoryWriter = await prepareCliHistoryBoundary(context.params, {
+      credential: {
+        type: "token",
+        provider: "zeroh-claude-cli",
+        token: "synthetic-history-owner",
+      },
+    });
+    expect(context.cliHistoryWriter).toBeDefined();
+    let nativeCalls = 0;
+    const f = await disclosureRecoveryFixture(context, async function* (execution) {
+      if (++nativeCalls === 1) {
+        // Read through the real writer after the approved user row was committed.
+        const history = await sessionHistoryModule.loadCliSessionPromptContext({
+          ...context.params,
+          allowRawTranscriptReseed: true,
+          rawTranscriptReseedReason: "session-expired",
+        });
+        context.openClawHistoryPrompt = sessionHistoryModule.buildCliSessionHistoryPrompt({
+          messages: history.reseedMessages,
+          prompt: "hi",
+        });
+        expect(context.openClawHistoryPrompt).toContain("hi");
+        throw new FailoverError("session expired", { reason: "session_expired" });
+      }
+      execution.assertCurrent!();
+      expect(() => expectDefined(f.observed[0], "predecessor").assertCurrent!()).toThrow();
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: "recovered output",
+        session_id: execution.sessionId,
       };
-      Object.assign(context, {
-        hostRunContractVersion: 1,
-        runIdentity: Object.freeze({
-          agentId: "main",
-          runId: context.params.runId,
-          sessionKey: sessionTarget.sessionKey,
-          sessionId: context.params.sessionId,
-        }),
+    });
+    setHookRunnerForTest(f.hookRunner);
+    Object.assign(context, captureCliRunStartTime());
+    try {
+      const result = await runPreparedCliAgentCore(context);
+      expect(result.payloads).toEqual([{ text: "recovered output" }]);
+      expect(nativeCalls).toBe(2);
+      expect(f.late.map((x) => x.prompt)).toEqual(f.inputs.map((x) => x.prompt));
+      expect(f.inputs.map((x) => x.prompt)).toEqual(["hi", context.openClawHistoryPrompt]);
+      expect(f.late).toHaveLength(2);
+      expect(persisted).toHaveBeenCalledOnce();
+      const messages = await readTranscriptMessages(sessionTarget);
+      expect(messages.filter((m) => requireRecord(m, "message").role === "user")).toHaveLength(1);
+      expect(f.bindings).toHaveLength(2);
+      expect(clearBeforeRetry).toHaveBeenCalledWith({
+        provider: "zeroh-claude-cli",
+        reason: "session_expired",
+        sessionId: "native-predecessor",
       });
-      const admission = await admitPreparedContext(context, "plugin-harness");
-      context.params.assertCurrent = createCliRunCurrentAssertion(
-        context.params,
-        undefined,
+      expect(f.observed.map((e) => e.runIdentity)).toEqual([
         context.runIdentity,
+        context.runIdentity,
+      ]);
+      expect(f.inputs.map((x) => x.lifetime)).toEqual([f.lifetime, f.lifetime]);
+      const firstInput = expectDefined(f.inputs[0], "initial input");
+      const retryInput = expectDefined(f.inputs[1], "retry input");
+      expect(retryInput.pending.startedAt).toBe(firstInput.pending.startedAt);
+      expect(retryInput.pending).not.toBe(firstInput.pending);
+      expect(retryInput.pending.conflicting).toBe(false);
+      expect(retryInput.pending.fenced).not.toBe(true);
+      expect(() => expectDefined(f.observed[0], "predecessor").assertCurrent!()).toThrow();
+      expect(expectDefined(f.observed[0], "predecessor").abortSignal?.aborted).toBe(true);
+      expect(f.observed.map((e) => e.preparedPrompt!.logicalPrompt)).toEqual(
+        f.inputs.map((x) => x.prompt),
       );
-      // Establish actual credential-scoped authority over an empty local transcript.
-      context.cliHistoryWriter = await prepareCliHistoryBoundary(context.params, {
-        credential: {
-          type: "token",
-          provider: "zeroh-claude-cli",
-          token: "synthetic-history-owner",
-        },
-      });
-      expect(context.cliHistoryWriter).toBeDefined();
-      let nativeCalls = 0;
-      const f = await disclosureRecoveryFixture(context, async function* (execution) {
-        if (++nativeCalls === 1) {
-          // Read through the real writer after the approved user row was committed.
-          const history = await sessionHistoryModule.loadCliSessionPromptContext({
-            ...context.params,
-            allowRawTranscriptReseed: true,
-            rawTranscriptReseedReason: "session-expired",
-          });
-          context.openClawHistoryPrompt = sessionHistoryModule.buildCliSessionHistoryPrompt({
-            messages: history.reseedMessages,
-            prompt: "hi",
-          });
-          expect(context.openClawHistoryPrompt).toContain("hi");
-          throw new FailoverError("session expired", { reason: "session_expired" });
-        }
-        execution.assertCurrent!();
-        expect(() => expectDefined(f.observed[0], "predecessor").assertCurrent!()).toThrow();
+    } finally {
+      await f.cleanup();
+      admission.close();
+    }
+  });
+
+  it("actual Disclosure refuses an unqualified duplicate input before dispatch", async (testContext) => {
+    requireDisclosurePlugin(testContext);
+    const { dir, sessionFile, sessionTarget } = createSessionFixture();
+    const context = buildPreparedContext({
+      provider: "zeroh-claude-cli",
+      model: "claude-sonnet-4-6",
+      sessionKey: sessionTarget.sessionKey,
+    });
+    context.workspaceDir = dir;
+    context.params = {
+      ...context.params,
+      agentId: "main",
+      sessionFile,
+      sessionTarget,
+      workspaceDir: dir,
+    };
+    Object.assign(context, {
+      hostRunContractVersion: 1,
+      runIdentity: Object.freeze({
+        agentId: "main",
+        runId: context.params.runId,
+        sessionKey: sessionTarget.sessionKey,
+        sessionId: context.params.sessionId,
+      }),
+    });
+    const admission = await admitPreparedContext(context, "plugin-harness");
+    let nativeCalls = 0;
+    const f = await disclosureRecoveryFixture(
+      context,
+      async function* () {
+        nativeCalls++;
         yield {
           type: "result",
           subtype: "success",
           is_error: false,
-          result: "recovered output",
-          session_id: execution.sessionId,
+          result: "unexpected dispatch",
         };
-      });
-      setHookRunnerForTest(f.hookRunner);
-      Object.assign(context, captureCliRunStartTime());
-      try {
-        const result = await runPreparedCliAgentCore(context);
-        expect(result.payloads).toEqual([{ text: "recovered output" }]);
-        expect(nativeCalls).toBe(2);
-        expect(f.late.map((x) => x.prompt)).toEqual(f.inputs.map((x) => x.prompt));
-        expect(f.inputs.map((x) => x.prompt)).toEqual(["hi", context.openClawHistoryPrompt]);
-        expect(f.late).toHaveLength(2);
-        expect(persisted).toHaveBeenCalledOnce();
-        const messages = await readTranscriptMessages(sessionTarget);
-        expect(messages.filter((m) => requireRecord(m, "message").role === "user")).toHaveLength(1);
-        expect(f.bindings).toHaveLength(2);
-        expect(clearBeforeRetry).toHaveBeenCalledWith({
-          provider: "zeroh-claude-cli",
-          reason: "session_expired",
-          sessionId: "native-predecessor",
-        });
-        expect(f.observed.map((e) => e.runIdentity)).toEqual([
-          context.runIdentity,
-          context.runIdentity,
-        ]);
-        expect(f.inputs.map((x) => x.lifetime)).toEqual([f.lifetime, f.lifetime]);
-        const firstInput = expectDefined(f.inputs[0], "initial input");
-        const retryInput = expectDefined(f.inputs[1], "retry input");
-        expect(retryInput.pending.startedAt).toBe(firstInput.pending.startedAt);
-        expect(retryInput.pending).not.toBe(firstInput.pending);
-        expect(retryInput.pending.conflicting).toBe(false);
-        expect(retryInput.pending.fenced).not.toBe(true);
-        expect(() => expectDefined(f.observed[0], "predecessor").assertCurrent!()).toThrow();
-        expect(expectDefined(f.observed[0], "predecessor").abortSignal?.aborted).toBe(true);
-        expect(f.observed.map((e) => e.preparedPrompt!.logicalPrompt)).toEqual(
-          f.inputs.map((x) => x.prompt),
-        );
-      } finally {
-        await f.cleanup();
-        admission.close();
-      }
-    },
-  );
-
-  it.skipIf(!disclosurePluginRoot)(
-    "actual Disclosure refuses an unqualified duplicate input before dispatch",
-    async () => {
-      const { dir, sessionFile, sessionTarget } = createSessionFixture();
-      const context = buildPreparedContext({
-        provider: "zeroh-claude-cli",
-        model: "claude-sonnet-4-6",
-        sessionKey: sessionTarget.sessionKey,
-      });
-      context.workspaceDir = dir;
-      context.params = {
-        ...context.params,
-        agentId: "main",
-        sessionFile,
-        sessionTarget,
-        workspaceDir: dir,
-      };
-      Object.assign(context, {
-        hostRunContractVersion: 1,
-        runIdentity: Object.freeze({
-          agentId: "main",
-          runId: context.params.runId,
-          sessionKey: sessionTarget.sessionKey,
-          sessionId: context.params.sessionId,
-        }),
-      });
-      const admission = await admitPreparedContext(context, "plugin-harness");
-      let nativeCalls = 0;
-      const f = await disclosureRecoveryFixture(
-        context,
-        async function* () {
-          nativeCalls++;
-          yield {
-            type: "result",
-            subtype: "success",
-            is_error: false,
-            result: "unexpected dispatch",
-          };
-        },
-        true,
+      },
+      true,
+    );
+    setHookRunnerForTest(f.hookRunner);
+    Object.assign(context, captureCliRunStartTime());
+    try {
+      await expect(runPreparedCliAgentCore(context)).rejects.toThrow(
+        "memory-provider-admission-ambiguous",
       );
-      setHookRunnerForTest(f.hookRunner);
-      Object.assign(context, captureCliRunStartTime());
-      try {
-        await expect(runPreparedCliAgentCore(context)).rejects.toThrow(
-          "memory-provider-admission-ambiguous",
-        );
-        expect(f.inputs).toHaveLength(1);
-        expect(f.late).toHaveLength(1);
-        expect(f.bindings).toHaveLength(0);
-        expect(nativeCalls).toBe(0);
-        expect(f.warnings.join("\n")).toContain("candidate-ambiguous");
-      } finally {
-        await f.cleanup();
-        admission.close();
-      }
-    },
-  );
+      expect(f.inputs).toHaveLength(1);
+      expect(f.late).toHaveLength(1);
+      expect(f.bindings).toHaveLength(0);
+      expect(nativeCalls).toBe(0);
+      expect(f.warnings.join("\n")).toContain("candidate-ambiguous");
+    } finally {
+      await f.cleanup();
+      admission.close();
+    }
+  });
 
   it("real Claude plugin image transport equals late/input/execution and dispatches", async () => {
     const { dir, sessionFile, sessionTarget } = createSessionFixture();

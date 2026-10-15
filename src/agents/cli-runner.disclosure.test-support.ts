@@ -9,7 +9,18 @@ import type {
 import { admissionLifetimeOf } from "./admitted-run-context.js";
 import type { PreparedCliRunContext } from "./cli-runner/types.js";
 
-export const disclosurePluginRoot = process.env.LIBMEM_PLUGIN_ROOT;
+// Fork CI has no Zeroh checkout: these two cross-repository qualifications skip
+// unless explicitly opted in. A supplied root is mandatory evidence: missing or
+// broken plugin files fail normally; never discover a sibling checkout or skip it.
+const disclosurePluginRoot = process.env.LIBMEM_PLUGIN_ROOT;
+export function requireDisclosurePlugin(context: { skip: (reason: string) => never }): void {
+  if (disclosurePluginRoot === undefined) {
+    context.skip("external Disclosure qualification requires LIBMEM_PLUGIN_ROOT; fork CI skips it");
+  }
+  if (!disclosurePluginRoot?.trim()) {
+    throw new Error("LIBMEM_PLUGIN_ROOT must point to the external Zeroh plugins directory");
+  }
+}
 const nativeDispatch = vi.fn<CliBackendExecute>();
 
 /** Actual Disclosure registration, input attribution and memory-port binding.

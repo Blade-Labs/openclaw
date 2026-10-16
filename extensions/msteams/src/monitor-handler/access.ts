@@ -120,6 +120,8 @@ export async function resolveMSTeamsSenderAccess(params: {
   hasControlCommand?: boolean;
   conversationThreadId?: string;
   contextBinding?: ChannelIngressContextBinding;
+  /** False when any merged activity lacks live authentication or shares a different principal. */
+  inputProvenanceBatchEligible?: boolean;
 }) {
   const activity = params.activity;
   const msteamsCfg = params.cfg.channels?.msteams;
@@ -164,7 +166,12 @@ export async function resolveMSTeamsSenderAccess(params: {
     channelId: "msteams",
     accountId: pairing.accountId,
     source: {
-      actorKind: resolveMSTeamsActorKind(activity),
+      // Source revisions (including later steering) must qualify each activity independently;
+      // sender allowlists alone are not evidence of this callback's transport authentication.
+      actorKind:
+        params.inputProvenanceBatchEligible === false
+          ? "unknown"
+          : resolveMSTeamsActorKind(activity),
       eventKind:
         activity.type === "messageUpdate"
           ? "edit"

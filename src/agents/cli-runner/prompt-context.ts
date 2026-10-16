@@ -2,9 +2,23 @@ import {
   buildActiveNodeContextText,
   prepareActiveNodeContext,
 } from "../../infra/active-node-context.js";
-import type { CliBackendConfig, CliBackendPromptContext } from "../../plugins/cli-backend.types.js";
+import { getAgentScopedMediaLocalRoots } from "../../media/local-roots.js";
+import type {
+  CliBackendConfig,
+  CliBackendPromptContext,
+  CliBackendPreparedPrompt,
+} from "../../plugins/cli-backend.types.js";
+import { hashCliImageTurnEntryId } from "../cli-image-turn-correlation.js";
+import {
+  detectImageReferences,
+  hasHydratableMediaImages,
+} from "../embedded-agent-runner/run/images.js";
+import type { MediaImageLayout } from "../embedded-agent-runner/run/prompt-image-metadata.js";
 import { buildRuntimeContextCustomMessage } from "../embedded-agent-runner/run/runtime-context-prompt.js";
 import { buildMediaTaskRuntimeContext } from "../media-generation-task-status.js";
+import { applyPluginTextReplacements } from "../plugin-text-transforms.js";
+import { isClaudeCliBackendId, prepareCliPromptImagePayload } from "./helpers.js";
+import type { PreparedCliRunContext } from "./types.js";
 
 /** Current-turn facts stay outside native prompts that are retained across CLI turns. */
 export async function buildCliTurnAppendContext(
@@ -36,6 +50,89 @@ export async function buildCliTurnAppendContext(
 export function composeCliPromptContext(prompt: string, context?: CliBackendPromptContext): string {
   const prepended = context?.prependContext ? `${context.prependContext}\n\n${prompt}` : prompt;
   return context?.appendContext ? `${prepended}\n\n${context.appendContext}` : prepended;
+}
+
+/** Select and transform the actual attempt before readiness and input observation. */
+export function finalizeCliPreparedPrompt(
+  context: PreparedCliRunContext,
+  cliSessionIdToUse?: string,
+): CliBackendPreparedPrompt {
+  if (!cliSessionIdToUse && context.openClawHistoryPrompt) {
+    context.cliHistoryWriter?.assertReadable();
+  }
+  const replace = (text: string) =>
+    context.params.controlOperation !== undefined
+      ? text
+      : applyPluginTextReplacements(text, context.backendResolved.textTransforms?.input);
+  const prompt = replace(
+    cliSessionIdToUse
+      ? context.params.prompt
+      : (context.openClawHistoryPrompt ?? context.params.prompt),
+  );
+  const promptContext = context.promptContext
+    ? Object.freeze({
+        ...(context.promptContext.prependContext
+          ? { prependContext: replace(context.promptContext.prependContext) }
+          : {}),
+        ...(context.promptContext.appendContext
+          ? { appendContext: replace(context.promptContext.appendContext) }
+          : {}),
+      })
+    : undefined;
+  return Object.freeze({
+    version: 1,
+    prompt,
+    ...(promptContext ? { promptContext } : {}),
+    logicalPrompt: composeCliPromptContext(prompt, promptContext),
+  });
+}
+
+/** Materialize the actual image transport before the final readiness gate. */
+export async function prepareCliAttemptPrompt(
+  context: PreparedCliRunContext,
+  cliSessionIdToUse?: string,
+) {
+  const projection = finalizeCliPreparedPrompt(context, cliSessionIdToUse);
+  const params = context.params as PreparedCliRunContext["params"] & {
+    mediaImageLayout?: MediaImageLayout;
+  };
+  const nodePlacement = context.executionTarget.kind === "node";
+  if (
+    nodePlacement &&
+    ((params.images?.length ?? 0) > 0 ||
+      (params.mediaImageLayout
+        ? params.mediaImageLayout.slots.length > 0
+        : hasHydratableMediaImages(params.media)) ||
+      (params.imagePrompt ? detectImageReferences(params.imagePrompt).length > 0 : false))
+  ) {
+    throw new Error("paired-node Claude CLI sessions do not support attachments or images");
+  }
+  const imageTurnEntryId = isClaudeCliBackendId(context.backendResolved.id)
+    ? params.userTurnTranscriptRecorder?.getAdmissionReceipt()?.entryId
+    : undefined;
+  const imagePayload = nodePlacement
+    ? { prompt: projection.prompt, imagePaths: [] as string[] }
+    : await prepareCliPromptImagePayload({
+        backend: context.preparedBackend.backend,
+        prompt: projection.prompt,
+        imagePrompt: params.imagePrompt,
+        workspaceDir: context.workspaceDir,
+        localRoots: getAgentScopedMediaLocalRoots(params.config ?? {}, params.agentId),
+        images: params.images,
+        imageOrder: params.imageOrder,
+        mediaImageLayout: params.mediaImageLayout,
+        media: params.media,
+        ...(imageTurnEntryId ? { imageTurnKey: hashCliImageTurnEntryId(imageTurnEntryId) } : {}),
+      });
+  return {
+    imageTurnEntryId,
+    imagePayload,
+    preparedPrompt: Object.freeze({
+      ...projection,
+      prompt: imagePayload.prompt,
+      logicalPrompt: composeCliPromptContext(imagePayload.prompt, projection.promptContext),
+    }),
+  };
 }
 
 export async function prepareCliSystemPrompt(

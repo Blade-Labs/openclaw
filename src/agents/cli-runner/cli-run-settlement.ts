@@ -2,6 +2,7 @@ import { setReplyPayloadMetadata, type ReplyPayload } from "../../auto-reply/rep
 import { SILENT_REPLY_TOKEN } from "../../auto-reply/tokens.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
+import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
 import {
   externalCliDiscoveryForProviderAuth,
   loadAuthProfileStoreForRuntime,
@@ -22,11 +23,13 @@ import { resolveAuthProfileFailureReason } from "../embedded-agent-runner/run/au
 import { buildEmbeddedRunPayloads } from "../embedded-agent-runner/run/payloads.js";
 import { mergeAttemptToolMediaPayloads } from "../embedded-agent-runner/run/tool-media-payloads.js";
 import { coerceToFailoverError, isFailoverError } from "../failover-error.js";
+import type { AgentHarnessHookContext } from "../harness/hook-context.js";
 import { resolveReplyExpectation } from "../reply-completion.js";
 import { recordAgentCleanupFailure } from "../run-cleanup-timeout.js";
 import { CliAuthProfilePreparationError } from "./auth-profile-preparation-error.js";
 import { runCliCleanup } from "./cleanup.js";
 import { resolveCliSessionId } from "./cli-run-recovery.js";
+import { runCliAgentEndHook } from "./cli-run-transcript.js";
 import { projectCliMessagingDeliveryEvidence } from "./delivery-evidence.js";
 import { hashCliReseedPrompt } from "./reseed-envelope.js";
 import type { ClaudeCliRunDiagnosticLifecycle } from "./run-diagnostics.js";
@@ -134,6 +137,44 @@ export async function assertCliRuntimeBinding(context: PreparedCliRunContext): P
   });
   if (currentOwner !== context.runtimeOwnerFingerprint) {
     throw new Error("CLI runtime owner changed during successful inference");
+  }
+}
+
+/** Preparation can admit plugin state before a prepared context exists. */
+export async function prepareCliRunForExecution(
+  params: RunCliAgentParams,
+): Promise<PreparedCliRunContext> {
+  const started = Date.now();
+  const hookRunner = getGlobalHookRunner();
+  let hookContext: AgentHarnessHookContext = {
+    runId: params.runId,
+    agentId: params.agentId,
+    sessionKey: params.sessionKey,
+    sessionId: params.sessionId,
+    workspaceDir: params.workspaceDir,
+  };
+  try {
+    const { prepareCliRunContext } = await import("./prepare.runtime.js");
+    return await prepareCliRunContext(params, (resolved) => {
+      hookContext = resolved;
+    });
+  } catch (error) {
+    // Release even after cancellation/revocation; current-run assertions only guard work.
+    if (!params.isolatedCompletion && !params.controlOperation) {
+      await runCliAgentEndHook(params, {
+        event: {
+          messages: [],
+          success: false,
+          error: formatErrorMessage(error),
+          durationMs: Date.now() - started,
+        },
+        ctx: hookContext,
+        hookRunner,
+      });
+    }
+    params.assertCurrent?.();
+    await settleCliPreparationError(error, params);
+    throw error;
   }
 }
 

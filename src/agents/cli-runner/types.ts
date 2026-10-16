@@ -235,6 +235,12 @@ export function captureCliRunStartTime() {
 
 /** Fully prepared execution context consumed by the CLI runner executor. */
 export type PreparedCliRunContext = {
+  readonly hostRunContractVersion?: 1;
+  readonly runIdentity?: import("../../plugins/cli-backend.types.js").CliBackendRunIdentity;
+  preparedPrompt?: import("../../plugins/cli-backend.types.js").CliBackendPreparedPrompt;
+  preparedImagePayload?: Awaited<
+    ReturnType<typeof import("./helpers.js").prepareCliPromptImagePayload>
+  >;
   params: RunCliAgentParams & { admittedRunContext: AdmittedRunContext };
   /** Core-only original caller policy, bound to each native request's exact lifetime. */
   bindQuestionAnswerAuthority?: (assertActive: () => void) => PreparedQuestionAnswerAuthority;
@@ -263,8 +269,6 @@ export type PreparedCliRunContext = {
   deferContextEngineDisposalUntil?: (promise: Promise<void>) => void;
   contextEngineTurnPrompt?: string;
   promptContext?: CliBackendPromptContext;
-  /** Logical model input retained for policy/observation hooks when transport context is separate. */
-  promptForHooks?: string;
   modelId: string;
   normalizedModel: string;
   contextWindowInfo?: ContextWindowInfo;

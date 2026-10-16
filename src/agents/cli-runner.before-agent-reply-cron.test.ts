@@ -13,6 +13,7 @@ import {
   type DiagnosticEventPayload,
 } from "../infra/diagnostic-events.js";
 import type { HookRunner } from "../plugins/hooks.js";
+import { captureAdmittedRunSource } from "./admitted-run-context.js";
 import { wrapRunWithTestPreparedAdmission } from "./admitted-run-context.test-support.js";
 import {
   getOrCreateSessionMcpRuntime,
@@ -22,6 +23,7 @@ import { testing as cliBackendsTesting } from "./cli-backends.test-support.js";
 import type { CliOutput } from "./cli-output-contracts.js";
 import { CliAuthProfilePreparationError } from "./cli-runner/auth-profile-preparation-error.js";
 import { cliBackendLog } from "./cli-runner/log.js";
+import type { RunCliAgentParams } from "./cli-runner/types.js";
 import { FailoverError } from "./failover-error.js";
 
 // vi.mock factories are hoisted above imports, so any references inside them
@@ -145,10 +147,13 @@ async function captureRejectedClaudeRun(
   return { error, events };
 }
 
-function makeStubContext(params: typeof baseRunParams & { trigger?: string }) {
+async function makeStubContext(params: RunCliAgentParams) {
+  // The real preparer admits the supplied owner after runtime selection.
+  const admittedRunContext =
+    params.admittedRunContext ?? (await params.preparedRunAdmission?.admit("embedded"));
   // Stub only the prepared context shape runCliAgent needs after the hook gate.
   return {
-    params,
+    params: { ...params, admittedRunContext },
     started: Date.now(),
     startedMonotonicMs: performance.now(),
     workspaceDir: params.workspaceDir,
@@ -158,9 +163,10 @@ function makeStubContext(params: typeof baseRunParams & { trigger?: string }) {
     systemPromptReport: {},
     authEpochVersion: 0,
     backendResolved: {},
+    executionTarget: { kind: "process" },
     preparedBackend: { backend: { sessionMode: "none" } },
     reusableCliSession: { mode: "none" },
-  } as unknown;
+  };
 }
 
 beforeEach(() => {
@@ -173,9 +179,7 @@ beforeEach(() => {
   executePreparedCliRunMock.mockReset();
   executePreparedCliRunMock.mockResolvedValue({ text: "" });
   prepareCliRunContextMock.mockReset();
-  prepareCliRunContextMock.mockImplementation(async (params) =>
-    makeStubContext(params as typeof baseRunParams & { trigger?: string }),
-  );
+  prepareCliRunContextMock.mockImplementation(async (params) => makeStubContext(params));
   closeCliSessionMock.mockReset();
   closeMcpLoopbackServerMock.mockReset();
   retireSessionMcpRuntimeForSessionKeyMock.mockReset();
@@ -218,11 +222,20 @@ describe("runCliAgent before_agent_reply seam", () => {
 
       await runCliAgent({ ...baseRunParams, trigger: "user", inputProvenance });
 
-      expect(runBeforeAgentRunMock).toHaveBeenCalledOnce();
-      expect(runBeforeAgentRunMock.mock.calls[0]?.[1]).toMatchObject({
-        inputProvenance,
-        source: { completeness: "unavailable", inputs: [] },
+      const preparedContext: Awaited<ReturnType<typeof makeStubContext>> = await expectDefined(
+        prepareCliRunContextMock.mock.results[0],
+        "the hook gate must receive the prepared fixture's admitted source",
+      ).value;
+      const admittedSource = captureAdmittedRunSource(
+        preparedContext.params.admittedRunContext,
+      ).source;
+      expect(admittedSource).toMatchObject({
+        completeness: "complete",
+        inputs: [{ inputId: expect.any(String), origin: "system" }],
       });
+      expect(runBeforeAgentRunMock).toHaveBeenCalledOnce();
+      expect(runBeforeAgentRunMock.mock.calls[0]?.[1]).toMatchObject({ inputProvenance });
+      expect(runBeforeAgentRunMock.mock.calls[0]?.[1]?.source).toEqual(admittedSource);
       expect(executePreparedCliRunMock).not.toHaveBeenCalled();
     },
   );
@@ -267,7 +280,7 @@ describe("runCliAgent before_agent_reply seam", () => {
       profiles: { [profileId]: { type: "api_key", provider, key: "secret" } },
     } as const;
     prepareCliRunContextMock.mockImplementationOnce(async (params) => ({
-      ...(makeStubContext(params as typeof baseRunParams & { trigger?: string }) as object),
+      ...((await makeStubContext(params)) as object),
       effectiveAuthProfileId: profileId,
       authProfileStore: store,
       agentDir: "/tmp/agent",
@@ -359,14 +372,16 @@ describe("runCliAgent before_agent_reply seam", () => {
       },
     };
     prepareCliRunContextMock.mockImplementationOnce(async (params) => ({
-      ...(makeStubContext(params as typeof baseRunParams & { trigger?: string }) as object),
+      ...((await makeStubContext(params)) as object),
       effectiveAuthProfileId: profileId,
       authProfileStore: store,
       agentDir: "/tmp/agent",
       openClawHistoryPrompt: "history",
       reusableCliSession: { mode: "reuse", sessionId: "stale-session" },
       params: {
-        ...(params as typeof baseRunParams),
+        ...params,
+        admittedRunContext:
+          params.admittedRunContext ?? (await params.preparedRunAdmission?.admit("embedded")),
         onBeforeFreshCliSessionRetry: vi.fn(async () => true),
       },
     }));
@@ -404,7 +419,7 @@ describe("runCliAgent before_agent_reply seam", () => {
       persistBlocked: vi.fn(async (message) => ({ message })),
     } as unknown as NonNullable<Parameters<typeof runCliAgent>[0]["userTurnTranscriptRecorder"]>;
     prepareCliRunContextMock.mockImplementationOnce(async (params) => ({
-      ...(makeStubContext(params as typeof baseRunParams & { trigger?: string }) as object),
+      ...((await makeStubContext(params)) as object),
       effectiveAuthProfileId: profileId,
       authProfileStore: store,
       agentDir: "/tmp/agent",
@@ -440,7 +455,7 @@ describe("runCliAgent before_agent_reply seam", () => {
   ])("does not settle selected-profile health for local failure %#", async (error) => {
     const profileId = "claude-cli:selected";
     prepareCliRunContextMock.mockImplementationOnce(async (params) => ({
-      ...(makeStubContext(params as typeof baseRunParams & { trigger?: string }) as object),
+      ...((await makeStubContext(params)) as object),
       effectiveAuthProfileId: profileId,
       authProfileStore: {
         version: 1,

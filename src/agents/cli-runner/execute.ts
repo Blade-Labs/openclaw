@@ -11,7 +11,6 @@ import {
   LOCAL_INSTALLATION_TARGET_UNSUPPORTED,
 } from "../../infra/installation-target-context.js";
 import { compareValidSemver } from "../../infra/semver.js";
-import { getAgentScopedMediaLocalRoots } from "../../media/local-roots.js";
 import type { CliBackendThinkingLevel } from "../../plugins/cli-backend.types.js";
 import { applySkillEnvOverridesFromSnapshot } from "../../skills/runtime/env-overrides.js";
 import {
@@ -19,15 +18,8 @@ import {
   resolveCliRuntimeOwnerFingerprint,
 } from "../cli-auth-epoch.js";
 import { resolveCliExecutableIdentity } from "../cli-executable-identity.js";
-import { hashCliImageTurnEntryId } from "../cli-image-turn-correlation.js";
 import type { CliOutput } from "../cli-output-contracts.js";
-import {
-  detectImageReferences,
-  hasHydratableMediaImages,
-} from "../embedded-agent-runner/run/images.js";
-import type { MediaImageLayout } from "../embedded-agent-runner/run/prompt-image-metadata.js";
 import { resolveFastModeForElapsed } from "../fast-mode.js";
-import { applyPluginTextReplacements } from "../plugin-text-transforms.js";
 import { prepareCliBundleMcpCaptureAttempt } from "./bundle-mcp.js";
 import { runCliCleanup } from "./cleanup.js";
 import {
@@ -53,8 +45,6 @@ import { createCliRunCurrentAssertion } from "./execution-target.js";
 import {
   buildCliArgs,
   enqueueCliRun,
-  isClaudeCliBackendId,
-  prepareCliPromptImagePayload,
   resolveCliNoOutputTimeoutMs,
   resolveCliRunQueueKey,
   resolveCliRunTimeoutOverrideMs,
@@ -64,7 +54,7 @@ import {
 } from "./helpers.js";
 import { cliBackendLog, CLI_BACKEND_LOG_OUTPUT_ENV } from "./log.js";
 import { createClaudeCliModelCallDiagnostics } from "./model-call-diagnostics.js";
-import { composeCliPromptContext } from "./prompt-context.js";
+import { composeCliPromptContext, prepareCliAttemptPrompt } from "./prompt-context.js";
 import type { PreparedCliRunContext } from "./types.js";
 
 function normalizeCliBackendThinkingLevel(
@@ -121,10 +111,6 @@ type ExecutePreparedCliRunOptions = {
   onPhase?: (phase: "send" | "resolve" | "cleanup") => void;
 };
 
-type PreparedCliRunInternalParams = PreparedCliRunContext["params"] & {
-  mediaImageLayout?: MediaImageLayout;
-};
-
 /** Executes a prepared CLI run context and returns normalized CLI output. */
 export async function executePreparedCliRun(
   inputContext: PreparedCliRunContext,
@@ -143,8 +129,12 @@ export async function executePreparedCliRun(
           },
         }
       : inputContext;
-  const params = context.params as PreparedCliRunInternalParams;
-  const assertCurrent = createCliRunCurrentAssertion(params);
+  const params = context.params;
+  const assertCurrent = createCliRunCurrentAssertion(
+    params,
+    params.abortSignal,
+    context.runIdentity,
+  );
   assertCurrent();
   const backend = context.preparedBackend.backend;
   const executionTarget = context.executionTarget;
@@ -176,60 +166,22 @@ export async function executePreparedCliRun(
       : undefined;
   const nodeSystemPrompt = nodePlacement && shouldSendSystemPrompt ? systemPromptArg : undefined;
 
-  const basePrompt = cliSessionIdToUse
-    ? params.prompt
-    : (context.openClawHistoryPrompt ?? params.prompt);
-  let prompt =
-    params.controlOperation !== undefined
-      ? basePrompt
-      : applyPluginTextReplacements(basePrompt, context.backendResolved.textTransforms?.input);
-  const promptContext = context.promptContext
-    ? {
-        ...(context.promptContext.prependContext
-          ? {
-              prependContext: applyPluginTextReplacements(
-                context.promptContext.prependContext,
-                context.backendResolved.textTransforms?.input,
-              ),
-            }
-          : {}),
-        ...(context.promptContext.appendContext
-          ? {
-              appendContext: applyPluginTextReplacements(
-                context.promptContext.appendContext,
-                context.backendResolved.textTransforms?.input,
-              ),
-            }
-          : {}),
-      }
-    : undefined;
+  const transport =
+    context.preparedImagePayload && context.preparedPrompt
+      ? { preparedPrompt: context.preparedPrompt, imagePayload: context.preparedImagePayload }
+      : await prepareCliAttemptPrompt(context, cliSessionIdToUse);
+  const preparedPrompt = context.preparedPrompt ?? transport.preparedPrompt;
+  let prompt = preparedPrompt.prompt;
+  const promptContext = preparedPrompt.promptContext;
+  const imagePayload = transport.imagePayload;
   if (
-    nodePlacement &&
-    ((params.images?.length ?? 0) > 0 ||
-      (params.mediaImageLayout
-        ? params.mediaImageLayout.slots.length > 0
-        : hasHydratableMediaImages(params.media)) ||
-      (params.imagePrompt ? detectImageReferences(params.imagePrompt).length > 0 : false))
+    usePluginOwnedExecution &&
+    context.preparedPrompt &&
+    imagePayload.prompt !== preparedPrompt.prompt
   ) {
-    throw new Error("paired-node Claude CLI sessions do not support attachments or images");
+    await imagePayload.cleanupImages?.();
+    throw new Error("CLI prompt changed after readiness");
   }
-  const imageTurnEntryId = isClaudeCliBackendId(context.backendResolved.id)
-    ? params.userTurnTranscriptRecorder?.getAdmissionReceipt()?.entryId
-    : undefined;
-  const imagePayload = nodePlacement
-    ? { prompt, imagePaths: [] as string[], cleanupImages: async () => {} }
-    : await prepareCliPromptImagePayload({
-        backend,
-        prompt,
-        imagePrompt: params.imagePrompt,
-        workspaceDir: context.workspaceDir,
-        localRoots: getAgentScopedMediaLocalRoots(params.config ?? {}, params.agentId),
-        images: params.images,
-        imageOrder: params.imageOrder,
-        mediaImageLayout: params.mediaImageLayout,
-        media: params.media,
-        ...(imageTurnEntryId ? { imageTurnKey: hashCliImageTurnEntryId(imageTurnEntryId) } : {}),
-      });
   prompt = imagePayload.prompt;
   const promptInputBackend =
     params.controlOperation === "compact" && context.backendResolved.manualCompaction
@@ -358,7 +310,7 @@ export async function executePreparedCliRun(
         buildCliExecLogLine({
           provider: params.provider,
           model: context.normalizedModel,
-          promptChars: basePrompt.length,
+          promptChars: preparedPrompt.prompt.length,
           trigger: params.trigger,
           useResume,
           cliSessionId: cliSessionIdToUse,
@@ -703,7 +655,9 @@ export async function executePreparedCliRun(
   } finally {
     try {
       await cleanupOuterResource(systemPromptFile?.cleanup);
-      await cleanupOuterResource(imagePayload.cleanupImages);
+      if (!context.preparedImagePayload) {
+        await cleanupOuterResource(imagePayload.cleanupImages);
+      }
     } catch (error) {
       outerCleanupError = toErrorObject(error, "CLI outer resource cleanup failed");
     }

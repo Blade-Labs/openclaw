@@ -21,15 +21,15 @@ import {
   buildAgentHookContextChannelFields,
   buildAgentHookContextIdentityFields,
 } from "../plugins/hook-agent-context.js";
-import { resolveBlockMessage } from "../plugins/hook-decision-types.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
-import { captureAdmittedRunSource } from "./admitted-run-context.js";
+import { admissionLifetimeOf, captureAdmittedRunSource } from "./admitted-run-context.js";
 import {
   loadAuthProfileStoreForRuntime,
   markAuthProfileFailure,
   markAuthProfileSuccess,
 } from "./auth-profiles.js";
 import { resolveCliBackendConfig } from "./cli-backends.js";
+import { createCliAttemptQualifier } from "./cli-runner/attempt-qualification.js";
 import { runCliCleanup } from "./cli-runner/cleanup.js";
 import { acceptsCliLiveSession } from "./cli-runner/cli-live-session-registry.js";
 import {
@@ -45,20 +45,19 @@ import {
   cliRunSettlementDeps,
   formatCliTerminalInterruption,
   isClaudeCliBackend,
+  prepareCliRunForExecution,
   resolveCliSourceReplyMirror,
   settleCliBackendOutcome,
-  settleCliPreparationError,
   settlePreparedCliRun,
 } from "./cli-runner/cli-run-settlement.js";
 import {
   buildCliHookAssistantMessage,
   buildCliHookUserMessage,
+  createCliAgentEndHook,
   finalizeCliContextEngineTurn,
-  persistApprovedCliUserTurnTranscript,
   persistCliAssistantTranscript,
   persistCliRunBlock,
   resolveCliAssistantStopReason,
-  runCliAgentEndHook,
 } from "./cli-runner/cli-run-transcript.js";
 import {
   attachCliMessagingDeliveryEvidence,
@@ -66,6 +65,7 @@ import {
 } from "./cli-runner/delivery-evidence.js";
 import { createCliFailoverError } from "./cli-runner/exit-error.js";
 import { cliBackendLog, formatCliBackendOutputDigest } from "./cli-runner/log.js";
+import { composeCliPromptContext } from "./cli-runner/prompt-context.js";
 import {
   runClaudeCliAgentTurnWithDiagnostics,
   type ClaudeCliRunDiagnosticLifecycle,
@@ -78,12 +78,8 @@ import type { PreparedCliRunContext, RunCliAgentParams } from "./cli-runner/type
 import { claudeCliSessionTranscriptHasContent as claudeCliSessionTranscriptHasContentImpl } from "./command/attempt-execution.helpers.js";
 import type { EmbeddedAgentRunResult } from "./embedded-agent-runner.js";
 import { bootstrapHarnessContextEngine } from "./harness/context-engine-lifecycle.js";
-import { buildAgentHookContext } from "./harness/hook-context.js";
 import { buildAgentHookConversationMessages } from "./harness/hook-history.js";
-import {
-  runAgentHarnessLlmInputHook,
-  runAgentHarnessLlmOutputHook,
-} from "./harness/lifecycle-hook-helpers.js";
+import { runAgentHarnessLlmOutputHook } from "./harness/lifecycle-hook-helpers.js";
 import { resolveReplyExpectation } from "./reply-completion.js";
 
 const log = createSubsystemLogger("agents/cli-runner");
@@ -231,15 +227,7 @@ async function runCliAgentInternal(
       },
     };
   }
-  const { prepareCliRunContext } = await import("./cli-runner/prepare.runtime.js");
-  let context: PreparedCliRunContext;
-  try {
-    context = await prepareCliRunContext(params);
-  } catch (error) {
-    params.assertCurrent?.();
-    await settleCliPreparationError(error, params);
-    throw error;
-  }
+  const context = await prepareCliRunForExecution(params);
   return await settlePreparedCliRun({
     context,
     diagnosticLifecycle,
@@ -286,7 +274,10 @@ async function runPreparedCliAgentOwned(
   const hasBeforeAgentRunHooks = hookRunner?.hasHooks("before_agent_run") === true;
   const needsHookHistory = hasLlmInputHooks || hasAgentEndHooks || hasBeforeAgentRunHooks;
   let historyMessages: unknown[] = [];
-  const promptForHooks = context.promptForHooks ?? params.prompt;
+  // Terminal conversation messages retain this turn; retry reseeds already live in history.
+  const currentTurnPrompt = composeCliPromptContext(params.prompt, context.promptContext);
+  const imageCleanups = new Set<() => Promise<void>>();
+  let qualifyAttempt: ReturnType<typeof createCliAttemptQualifier> | undefined;
   const contextWindowFields = () => ({
     ...(context.contextWindowInfo?.tokens
       ? { contextTokenBudget: context.contextWindowInfo.tokens }
@@ -299,12 +290,15 @@ async function runPreparedCliAgentOwned(
       : {}),
   });
   const hookContext = {
-    runId: params.runId,
+    ...(context.runIdentity ?? {
+      runId: params.runId,
+      agentId: params.agentId,
+      sessionKey: params.sessionKey,
+      sessionId: params.sessionId,
+    }),
     jobId: params.jobId,
-    agentId: params.agentId,
-    sessionKey: params.sessionKey,
-    sessionId: params.sessionId,
-    workspaceDir: params.workspaceDir,
+    workspaceDir: context.workspaceDir,
+    admissionLifetime: admissionLifetimeOf(params.admittedRunContext.operationalRunInstance),
     trigger: params.trigger,
     inputProvenance: params.inputProvenance,
     source: captureAdmittedRunSource(context.params.admittedRunContext).source,
@@ -323,14 +317,15 @@ async function runPreparedCliAgentOwned(
     ...buildAgentHookConversationMessages({
       historyMessages,
       currentTurnMessages: [
-        buildCliHookUserMessage(promptForHooks),
+        buildCliHookUserMessage(currentTurnPrompt),
         ...(lastAssistant ? [lastAssistant] : []),
       ],
     }),
   ];
 
+  const finishAgentEndHook = createCliAgentEndHook(params);
   const finishFailedAgentEndHook = (error: unknown) =>
-    runCliAgentEndHook(params, {
+    finishAgentEndHook({
       event: {
         messages: buildAgentEndMessages(),
         success: false,
@@ -343,7 +338,7 @@ async function runPreparedCliAgentOwned(
 
   const finishBlockedRun = async (message: string, pluginId: string) => {
     await persistCliRunBlock(params, { message, pluginId });
-    await runCliAgentEndHook(params, {
+    await finishAgentEndHook({
       event: {
         messages: buildAgentHookConversationMessages({
           historyMessages,
@@ -399,6 +394,7 @@ async function runPreparedCliAgentOwned(
               persistCliSessionForkSuccessor,
             },
           };
+    await qualifyAttempt?.(attemptContext, cliSessionIdToUse);
     diagnosticLifecycle?.setPhase("send");
     const output = await executePreparedCliRun(
       attemptContext,
@@ -488,16 +484,6 @@ async function runPreparedCliAgentOwned(
   const executeRun = async (): Promise<EmbeddedAgentRunResult> => {
     ({ executePreparedCliRun } = await import("./cli-runner/execute.runtime.js"));
     historyMessages = needsHookHistory ? await loadCliSessionHistoryMessages(params) : [];
-    const llmInputEvent = {
-      runId: params.runId,
-      sessionId: params.sessionId,
-      provider: params.provider,
-      model: context.modelId,
-      systemPrompt: context.systemPrompt,
-      prompt: promptForHooks,
-      historyMessages,
-      imagesCount: params.images?.length ?? 0,
-    } as const;
     if (turnSideEffectsDisabled) {
       const reusableCliSessionId = isolatedCompletion
         ? undefined
@@ -581,7 +567,7 @@ async function runPreparedCliAgentOwned(
         const interruptionError = terminalInterruption
           ? formatCliTerminalInterruption(terminalInterruption)
           : undefined;
-        await runCliAgentEndHook(params, {
+        await finishAgentEndHook({
           event: {
             messages: buildAgentEndMessages(lastAssistant),
             success: interruptionError === undefined,
@@ -627,49 +613,29 @@ async function runPreparedCliAgentOwned(
       });
     };
 
-    if (hasBeforeAgentRunHooks && hookRunner) {
-      let beforeRunResult:
-        | Awaited<ReturnType<NonNullable<typeof hookRunner>["runBeforeAgentRun"]>>
-        | undefined;
-      try {
-        beforeRunResult = await hookRunner.runBeforeAgentRun(
-          {
-            prompt: promptForHooks,
-            systemPrompt: context.systemPrompt,
-            messages: buildAgentHookConversationMessages({
-              historyMessages,
-              currentTurnMessages: [],
-            }),
-            channelId: hookContext.channelId,
-            accountId: params.agentAccountId,
-            senderId: params.senderId ?? undefined,
-            senderIsOwner: params.senderIsOwner ?? undefined,
-          },
-          buildAgentHookContext(hookContext),
-        );
-      } catch {
-        const blockMessage = resolveBlockMessage(
-          { outcome: "block", reason: "before_agent_run hook failed" },
-          { blockedBy: "before_agent_run" },
-        );
-        return finishBlockedRun(blockMessage, "before_agent_run");
-      }
-
-      const beforeRunDecision = beforeRunResult?.decision;
-      if (beforeRunDecision?.outcome === "block") {
-        const blockMessage = resolveBlockMessage(beforeRunDecision, {
-          blockedBy: beforeRunResult?.pluginId ?? "unknown",
-        });
-        return finishBlockedRun(blockMessage, beforeRunResult?.pluginId ?? "unknown");
-      }
-    }
-
-    userTurnHandled = await persistApprovedCliUserTurnTranscript(params);
-    runAgentHarnessLlmInputHook({
-      event: llmInputEvent,
-      ctx: hookContext,
+    qualifyAttempt = createCliAttemptQualifier({
+      context,
+      hookContext,
       hookRunner,
+      hasBeforeAgentRunHooks,
+      historyMessages,
+      imageCleanups,
+      onUserTurnHandled: (handled) => {
+        userTurnHandled = handled;
+      },
     });
+    try {
+      await qualifyAttempt(context, resolveCliSessionId(context.reusableCliSession));
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        "cliBlockedBy" in error &&
+        typeof error.cliBlockedBy === "string"
+      ) {
+        return finishBlockedRun(error.message, error.cliBlockedBy);
+      }
+      throw error;
+    }
     return await runCliRecovery({
       context,
       executeAttempt: executeCliAttempt,
@@ -687,11 +653,20 @@ async function runPreparedCliAgentOwned(
   } catch (error) {
     runFailed = true;
     runError = error;
+    if (!turnSideEffectsDisabled) {
+      await finishFailedAgentEndHook(error);
+    }
   }
   let cleanupError: Error | undefined;
   try {
     await runCliCleanup(params, "cli-backend-release", async () => {
-      await context.preparedBackend.cleanup?.();
+      try {
+        for (const cleanup of imageCleanups) {
+          await cleanup();
+        }
+      } finally {
+        await context.preparedBackend.cleanup?.();
+      }
     });
   } catch (error) {
     cleanupError = error as Error;

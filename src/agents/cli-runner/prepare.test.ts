@@ -148,6 +148,7 @@ import {
   resetCliRunnerPrepareTestDeps,
   setCliRunnerPrepareTestDeps,
 } from "./prepare.test-support.js";
+import { finalizeCliPreparedPrompt } from "./prompt-context.js";
 import type { RunCliAgentParams } from "./types.js";
 
 function registerTestContextEngine(
@@ -783,6 +784,13 @@ describe("prepareCliRunContext", () => {
             .filter(Boolean)
             .join("\n");
           expect(visibleInput.match(/ISOLATED_CLI_OUTCOME_947/g)).toHaveLength(1);
+          const projection = finalizeCliPreparedPrompt(context);
+          expect(projection.logicalPrompt.indexOf("Quoted reply")).toBeLessThan(
+            projection.logicalPrompt.indexOf("What happened?"),
+          );
+          expect(projection.logicalPrompt.indexOf("What happened?")).toBeLessThan(
+            projection.logicalPrompt.indexOf("ISOLATED_CLI_OUTCOME_947"),
+          );
           expect(context.params.transcriptPrompt).toBe("What happened?");
           expect(context.systemPrompt).toBe(before.systemPrompt);
           expect(context.extraSystemPromptHash).toBe(before.extraSystemPromptHash);
@@ -2402,7 +2410,7 @@ describe("prepareCliRunContext", () => {
     });
   });
 
-  it("marks inter-session prompts after CLI prompt-build hook context is applied", async () => {
+  it("marks the inter-session user prompt before adding private CLI context", async () => {
     const hookRunner = {
       hasHooks: vi.fn((hookName: string) => hookName === "before_prompt_build"),
       runBeforePromptBuild: vi.fn(async () => ({
@@ -2425,7 +2433,7 @@ describe("prepareCliRunContext", () => {
       runId: "run-test",
     });
 
-    expect(context.params.prompt).toMatch(/^\[Inter-session message/);
+    expect(context.params.prompt).toMatch(/^trusted hook context\n\n\[Inter-session message/);
     expect(context.params.prompt).toContain("sourceSession=agent:main:slack:dm:U123");
     expect(context.params.prompt).toContain("isUser=false");
     expect(context.params.prompt).toContain("trusted hook context");
@@ -2508,9 +2516,20 @@ describe("prepareCliRunContext", () => {
       messageChannel: "discord",
       currentChannelId: "channel:room-1",
       senderId: "user-789",
+      currentInboundContext: { text: "inbound context" },
     });
 
-    expect(context.params.prompt).toBe("prompt prepend\n\nlatest ask");
+    expect(context.params.prompt).toBe("prompt prepend\n\ninbound context\n\nlatest ask");
+    context.backendResolved.textTransforms = { input: [{ from: /ask/gu, to: "ask transformed" }] };
+    const projection = finalizeCliPreparedPrompt(context);
+    expect(projection.logicalPrompt).toBe(
+      "prompt prepend\n\ninbound context\n\nlatest ask transformed",
+    );
+    context.openClawHistoryPrompt = "authorized history\nlatest ask";
+    expect(finalizeCliPreparedPrompt(context).logicalPrompt).toBe(
+      "authorized history\nlatest ask transformed",
+    );
+    expect(finalizeCliPreparedPrompt(context, "native").prompt).toBe(projection.prompt);
     expect(context.systemPrompt).toBe(
       `${wrappedPluginSystemContext("prompt prepend system")}\n\nprompt system\n\n${wrappedPluginSystemContext("prompt append system")}${SYSTEM_PROMPT_CACHE_BOUNDARY}\nCurrent model identity: test-cli/test-model. If asked what model you are, answer with this value for the current run.`,
     );
@@ -3036,6 +3055,88 @@ describe("prepareCliRunContext", () => {
           error: `Error: ${scenario === "cancelled" ? "CLI lookup cancelled" : "CLI owner retired"}`,
         });
         expect(factory).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it.each(["prompt restriction", "context engine validation"] as const)(
+    "the real runner ends the exact run once after preparation fails at %s",
+    async (failure) => {
+      installTestPluginRegistry();
+      const { runCliAgent } = await import("../cli-runner.js");
+      const { dir, sessionTarget } = fixture.session;
+      const engineId = "cli-terminal-preparation-failure";
+      const cleanup = vi.fn(async () => {});
+      const prepareExecution = vi.fn(async () => ({ cleanup }));
+      const hooks = {
+        hasHooks: (name: string) =>
+          ["before_prompt_build", "before_agent_run", "llm_input", "agent_end"].includes(name),
+        runBeforePromptBuild: vi.fn(async () =>
+          failure === "prompt restriction" ? { toolsAllow: ["read"] } : undefined,
+        ),
+        runBeforeAgentRun: vi.fn(async () => undefined),
+        runLlmInput: vi.fn(async () => undefined),
+        runAgentEnd: vi.fn(async () => undefined),
+      };
+      mockGetGlobalHookRunner.mockReturnValue(hooks as never);
+      registerTestContextEngine(engineId, (): ContextEngine => ({
+        info: {
+          id: engineId,
+          name: "CLI terminal preparation fixture",
+          hostRequirements: {
+            "agent-run": {
+              requiredCapabilities: ["assemble-before-prompt"],
+              unsupportedMessage: "terminal context engine failed",
+            },
+          },
+        },
+        ingest: vi.fn(async () => ({ ingested: true })),
+        assemble: vi.fn(async ({ messages }) => ({ messages, estimatedTokens: 0 })),
+        compact: vi.fn(async () => ({ ok: true, compacted: false })),
+      }));
+      setRawCliBackendForPrepareTest({
+        ...buildDefaultTestCliBackend(),
+        nativeToolMode: "always-on",
+        prepareExecution,
+      });
+      const identity = {
+        agentId: "main",
+        runId: `run-preparation-${failure}`,
+        sessionKey: sessionTarget.sessionKey,
+        sessionId: sessionTarget.sessionId,
+      };
+      await expect(
+        wrapRunWithTestPreparedAdmission(runCliAgent)({
+          ...identity,
+          sessionKey: "main",
+          sessionTarget,
+          sessionFile: sessionTarget.sessionKey,
+          workspaceDir: dir,
+          skillsSnapshot: { prompt: "", skills: [] },
+          prompt: "owner turn",
+          provider: "test-cli",
+          model: "test-model",
+          timeoutMs: 1_000,
+          config: { plugins: { slots: { contextEngine: engineId } } },
+        }),
+      ).rejects.toThrow(
+        failure === "prompt restriction"
+          ? "cannot enforce before_prompt_build tool restrictions"
+          : "terminal context engine failed",
+      );
+      expect(hooks.runBeforePromptBuild).toHaveBeenCalledOnce();
+      expect(hooks.runBeforeAgentRun).not.toHaveBeenCalled();
+      expect(hooks.runLlmInput).not.toHaveBeenCalled();
+      expect(hooks.runAgentEnd).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ success: false }),
+        expect.objectContaining(identity),
+        { unrefTimeout: false },
+      );
+      if (failure === "context engine validation") {
+        expect(prepareExecution).toHaveBeenCalledOnce();
+        expect(cleanup).toHaveBeenCalledOnce();
+      } else {
+        expect(prepareExecution).not.toHaveBeenCalled();
       }
     },
   );

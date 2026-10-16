@@ -9,6 +9,7 @@ function createContext(
     command: "/usr/local/bin/claude",
     args: [],
     cwd: "/tmp",
+    workspaceDir: "/tmp",
     env: {},
     prompt: "test",
     modelId: "claude-sonnet-4-6",

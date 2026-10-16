@@ -1,4 +1,4 @@
-// Microsoft Teams marks only authenticated human personal-chat messages as external user input.
+// Microsoft Teams marks authenticated human personal, group, and channel messages as external user input.
 import { createInboundDebouncer } from "openclaw/plugin-sdk/channel-inbound-debounce";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../runtime-api.js";
@@ -6,6 +6,7 @@ import { markMSTeamsAuthenticatedActivity, markMSTeamsReplayedActivity } from ".
 import { type MSTeamsActivityHandler, registerMSTeamsHandlers } from "../monitor-handler.js";
 import { createActivityHandler } from "../monitor-handler.test-helpers.js";
 import type { MSTeamsIngressLifecycle } from "../msteams-ingress.js";
+import { getMSTeamsRuntime } from "../runtime.js";
 import type { MSTeamsTurnContext } from "../sdk-types.js";
 // Preserve module setup before modules that consume it.
 // oxfmt-ignore
@@ -108,7 +109,7 @@ describe("Microsoft Teams inbound input provenance", () => {
   it.each([
     { label: "group chat", id: "19:group@thread.v2", type: "groupChat", chatType: "group" },
     { label: "channel", id: "19:channel@thread.tacv2", type: "channel", chatType: "channel" },
-  ])("leaves a $label message without provenance", async ({ id, type, chatType }) => {
+  ])("marks an authenticated $label message", async ({ id, type, chatType }) => {
     const contexts = await dispatchMessage(
       personalActivity({
         conversation: { id, conversationType: type },
@@ -117,7 +118,11 @@ describe("Microsoft Teams inbound input provenance", () => {
     );
     expect(contexts).toHaveLength(1);
     expect(contexts[0]?.ChatType).toBe(chatType);
-    expect(contexts[0]?.InputProvenance).toBeUndefined();
+    expect(contexts[0]?.SenderId).toBe(SENDER_AAD_ID);
+    expect(contexts[0]?.InputProvenance).toEqual({
+      kind: "external_user",
+      sourceChannel: "msteams",
+    });
   });
 
   it("leaves a bot-originated personal message without provenance", async () => {
@@ -233,6 +238,7 @@ describe("Microsoft Teams inbound input provenance", () => {
     // by flushing its key and awaiting the debouncer's drain, so no timer or polling decides it.
     const BATCH_KEY = `msteams:test-app:${PERSONAL_CHAT}:${SENDER_AAD_ID}`;
     let debouncers: Array<ReturnType<typeof createInboundDebouncer>> = [];
+    let lastBatchSource: unknown;
     const batchingDebounce = {
       createInboundDebouncer: ((options: Parameters<typeof createInboundDebouncer>[0]) => {
         const debouncer = createInboundDebouncer(options);
@@ -257,10 +263,13 @@ describe("Microsoft Teams inbound input provenance", () => {
 
     async function dispatchBatch(first: Activity, last: Activity) {
       const { deps } = createMessageHandlerDeps(createConfig(), batchingDebounce);
+      const observed = vi.spyOn(getMSTeamsRuntime().channel.inbound.ingress, "resolveStable");
       const handler = createMSTeamsMessageHandler(deps);
       await handler(context(first), lifecycle());
       await handler(context(last), lifecycle());
-      return await flushBatch();
+      const contexts = await flushBatch();
+      lastBatchSource = observed.mock.lastCall?.[0].source;
+      return contexts;
     }
 
     function batchActivity(
@@ -296,11 +305,12 @@ describe("Microsoft Teams inbound input provenance", () => {
       expect(contexts[0]?.InputProvenance).toBeUndefined();
     });
 
-    it("withholds provenance when an earlier constituent is unauthenticated", async () => {
+    it("withholds provenance and source authentication when an earlier constituent is unauthenticated", async () => {
       const contexts = await dispatchBatch(
         batchActivity("u-1", "bypassed", {}, { authenticated: false }),
         batchActivity("u-2", "live"),
       );
+      expect(lastBatchSource).toMatchObject({ actorKind: "unknown" });
       expect(contexts).toHaveLength(1);
       expect(contexts[0]?.InputProvenance).toBeUndefined();
     });
@@ -323,6 +333,7 @@ describe("Microsoft Teams inbound input provenance", () => {
         }),
         batchActivity("p-2", "live"),
       );
+      expect(lastBatchSource).toMatchObject({ actorKind: "unknown" });
       expect(contexts).toHaveLength(1);
       expect(contexts[0]?.InputProvenance).toBeUndefined();
     });

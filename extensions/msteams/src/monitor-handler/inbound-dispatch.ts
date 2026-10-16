@@ -148,6 +148,7 @@ export async function dispatchMSTeamsInboundTurn(params: {
     activity,
     hasControlCommand: admission.isControlCommand,
     conversationThreadId: facts.threadId,
+    inputProvenanceBatchEligible: facts.inputProvenanceBatchEligible,
     contextBinding: {
       agentId: route.agentId,
       sessionKey: route.sessionKey,
@@ -159,7 +160,6 @@ export async function dispatchMSTeamsInboundTurn(params: {
   // Set only after the transport-owned JWT fact and sender admission; core copies it into the run.
   const inputProvenance = resolveMSTeamsInboundInputProvenance({
     activity,
-    isDirectMessage,
     senderAdmitted: boundIngress.senderAccess.decision === "allow",
     batchEligible: facts.inputProvenanceBatchEligible,
   });

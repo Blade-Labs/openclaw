@@ -17,7 +17,6 @@ export function createCliAttemptQualifier({
   hasBeforeAgentRunHooks,
   historyMessages,
   imageCleanups,
-  onPromptForHooks,
   onUserTurnHandled,
 }: {
   context: PreparedCliRunContext;
@@ -27,7 +26,6 @@ export function createCliAttemptQualifier({
   hasBeforeAgentRunHooks: boolean;
   historyMessages: unknown[];
   imageCleanups: Set<() => Promise<void>>;
-  onPromptForHooks: (prompt: string) => void;
   onUserTurnHandled: (handled: boolean) => void;
 }) {
   const { params } = context;
@@ -65,7 +63,6 @@ export function createCliAttemptQualifier({
       attempt.preparedPrompt = qualifiedPrompt;
       return;
     }
-    onPromptForHooks(projection.logicalPrompt);
     if (hasBeforeAgentRunHooks && hookRunner) {
       let beforeRunResult:
         | Awaited<ReturnType<NonNullable<typeof hookRunner>["runBeforeAgentRun"]>>

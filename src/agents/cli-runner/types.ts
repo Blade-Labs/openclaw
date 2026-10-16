@@ -269,8 +269,6 @@ export type PreparedCliRunContext = {
   deferContextEngineDisposalUntil?: (promise: Promise<void>) => void;
   contextEngineTurnPrompt?: string;
   promptContext?: CliBackendPromptContext;
-  /** Logical model input retained for policy/observation hooks when transport context is separate. */
-  promptForHooks?: string;
   modelId: string;
   normalizedModel: string;
   contextWindowInfo?: ContextWindowInfo;

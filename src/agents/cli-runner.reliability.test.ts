@@ -2407,9 +2407,18 @@ describe("runCliAgent reliability", () => {
           sessionId: "stale-cli-session",
         });
         await vi.waitFor(() => {
-          expect(hookRunner.runLlmInput).toHaveBeenCalledTimes(1);
+          // Fresh recovery qualifies the history-bearing projection before dispatch.
+          expect(hookRunner.runLlmInput).toHaveBeenCalledTimes(2);
           expect(hookRunner.runLlmOutput).toHaveBeenCalledTimes(1);
           expect(hookRunner.runAgentEnd).toHaveBeenCalledTimes(1);
+        });
+        expect(callArg(hookRunner.runLlmInput, 0, 0, "resumed llm_input")).toMatchObject({
+          runId,
+          prompt: "hi",
+        });
+        expect(callArg(hookRunner.runLlmInput, 1, 0, "fresh llm_input")).toMatchObject({
+          runId,
+          prompt: result.meta.finalPromptText,
         });
         const agentEndEvent = requireRecord(
           callArg(hookRunner.runAgentEnd, 0, 0, "agent_end event"),
@@ -2485,8 +2494,16 @@ describe("runCliAgent reliability", () => {
 
       expect(supervisorSpawnMock).toHaveBeenCalledTimes(2);
       await vi.waitFor(() => {
-        expect(hookRunner.runLlmInput).toHaveBeenCalledTimes(1);
+        expect(hookRunner.runLlmInput).toHaveBeenCalledTimes(2);
         expect(hookRunner.runAgentEnd).toHaveBeenCalledTimes(1);
+      });
+      expect(callArg(hookRunner.runLlmInput, 0, 0, "resumed llm_input")).toMatchObject({
+        runId: "run-retry-failure",
+        prompt: "hi",
+      });
+      expect(callArg(hookRunner.runLlmInput, 1, 0, "fresh llm_input")).toMatchObject({
+        runId: "run-retry-failure",
+        prompt: expect.stringContaining("User: earlier context"),
       });
       const agentEndEvent = requireRecord(
         callArg(hookRunner.runAgentEnd, 0, 0, "agent_end event"),

@@ -3,7 +3,11 @@ import type { AgentMessage } from "openclaw/plugin-sdk/agent-core";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ContextEngine } from "../context-engine/types.js";
 import { createUserTurnTranscriptRecorder } from "../sessions/user-turn-transcript.js";
-import { createTestAdmittedRunContext } from "./admitted-run-context.test-support.js";
+import {
+  createTestAdmittedRunContext,
+  withTestRunAdmission,
+} from "./admitted-run-context.test-support.js";
+import { wrapPreparedCliRunWithTestAdmission } from "./cli-runner/execute.test-support.js";
 import type { PreparedCliRunContext } from "./cli-runner/types.js";
 import { waitForDeferredTurnMaintenanceForSession } from "./embedded-agent-runner/context-engine-maintenance.js";
 
@@ -23,7 +27,9 @@ const {
   prepareCliRunContextMock: vi.fn(),
 }));
 
-let runCliAgent: typeof import("./cli-runner.js").runCliAgent;
+let runCliAgent: (
+  params: PreparedCliRunContext["params"],
+) => ReturnType<typeof import("./cli-runner.js").runCliAgent>;
 let runPreparedCliAgent: typeof import("./cli-runner.js").runPreparedCliAgent;
 let restoreCliRunnerTestDeps: typeof import("./cli-runner.js").restoreCliRunnerTestDeps;
 let setCliRunnerTestDeps: typeof import("./cli-runner.js").setCliRunnerTestDeps;
@@ -180,8 +186,20 @@ function expectMessageText(message: AgentMessage | undefined, expected: string):
 
 describe("runPreparedCliAgent context engine lifecycle", () => {
   beforeAll(async () => {
-    ({ restoreCliRunnerTestDeps, runCliAgent, runPreparedCliAgent, setCliRunnerTestDeps } =
-      await import("./cli-runner.js"));
+    const cliRunner = await import("./cli-runner.js");
+    ({ restoreCliRunnerTestDeps, setCliRunnerTestDeps } = cliRunner);
+    runPreparedCliAgent = wrapPreparedCliRunWithTestAdmission(cliRunner.runPreparedCliAgent);
+    runCliAgent = (params) =>
+      withTestRunAdmission(params, async (admittedRunContext) => {
+        const original = params.admittedRunContext;
+        params.admittedRunContext = admittedRunContext;
+        try {
+          // The mocked preparer returns these same params, as real preparation does.
+          return await cliRunner.runCliAgent(params);
+        } finally {
+          params.admittedRunContext = original;
+        }
+      });
   });
 
   beforeEach(() => {

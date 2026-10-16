@@ -1,8 +1,11 @@
 /** Tests caller-boundary settlement for interrupted CLI turns with partial output. */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
-import { runPreparedCliAgent } from "./cli-runner.js";
+import { runPreparedCliAgent as runPreparedCliAgentCore } from "./cli-runner.js";
 import { buildPreparedCliRunContext } from "./cli-runner.test-helpers.js";
+import { wrapPreparedCliRunWithTestAdmission } from "./cli-runner/execute.test-support.js";
+
+const runPreparedCliAgent = wrapPreparedCliRunWithTestAdmission(runPreparedCliAgentCore);
 
 const { executePreparedCliRunMock } = vi.hoisted(() => ({
   executePreparedCliRunMock: vi.fn(),

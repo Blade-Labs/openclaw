@@ -17,6 +17,7 @@ import {
   resetCliRunnerPrepareTestDeps,
   setCliRunnerPrepareTestDeps,
 } from "./prepare.test-support.js";
+import { finalizeCliPreparedPrompt } from "./prompt-context.js";
 
 describe("CLI durable session context", () => {
   let fixture: ReturnType<typeof createCliRunnerPrepareFixture>;
@@ -150,7 +151,7 @@ describe("CLI durable session context", () => {
 
       const activeNodeText =
         "Current active computer (latest physical input, not message origin): active_node=mac-one";
-      const logicalPrompt = `Sender: ⟦openclaw:ctx⟧\nsender_id=U123 trusted hook context\n\nlatest ask\n\ntrusted hook tail\n\n${activeNodeText}`;
+      const logicalPrompt = `trusted hook context\n\nSender: ⟦openclaw:ctx⟧\nsender_id=U123 latest ask\n\ntrusted hook tail\n\n${activeNodeText}`;
       expect(context.params.prompt).toBe(
         pluginExecution ? "Sender: ⟦openclaw:ctx⟧\nsender_id=U123 latest ask" : logicalPrompt,
       );
@@ -162,7 +163,9 @@ describe("CLI durable session context", () => {
             }
           : undefined,
       );
-      expect(context.promptForHooks).toBe(pluginExecution ? logicalPrompt : undefined);
+      expect(finalizeCliPreparedPrompt(context, "existing-cli-session").logicalPrompt).toBe(
+        logicalPrompt,
+      );
       expect(context.params.transcriptPrompt).toBe("latest ask");
       expect(context.contextEngineTurnPrompt).toBe("latest ask");
       expect(hookRunner.runBeforePromptBuild).toHaveBeenCalledTimes(1);
@@ -177,13 +180,16 @@ describe("CLI durable session context", () => {
 
       setActiveNodeContext({ nodeId: "mac-two" });
       const next = await prepareTurn();
-      const nextPrompt = next.promptForHooks ?? next.params.prompt;
+      const nextPrompt = finalizeCliPreparedPrompt(next, "existing-cli-session").logicalPrompt;
       expect(nextPrompt).toContain("active_node=mac-two");
       expect(nextPrompt).not.toContain("active_node=mac-one");
 
       setActiveNodeContext({ nodeId: "mac-two" }, { isCurrent: () => false });
       const revoked = await prepareTurn();
-      const revokedPrompt = revoked.promptForHooks ?? revoked.params.prompt;
+      const revokedPrompt = finalizeCliPreparedPrompt(
+        revoked,
+        "existing-cli-session",
+      ).logicalPrompt;
       expect(revokedPrompt).toContain("active_node=unknown");
       expect(revokedPrompt).not.toContain("active_node=mac-two");
       expect(revoked.params.transcriptPrompt).toBe("latest ask");
@@ -313,7 +319,10 @@ describe("CLI durable session context", () => {
         ...(testCase.changeAccount ? { authProfileId: "history-test:other" } : {}),
       });
       try {
-        const logicalPrompt = context.promptForHooks ?? context.params.prompt;
+        const logicalPrompt = finalizeCliPreparedPrompt(
+          context,
+          testCase.resume ? "existing-native-session" : undefined,
+        ).logicalPrompt;
         if (testCase.changeAccount) {
           expect(logicalPrompt).not.toContain("RESULT-1234");
           expect(context.cliHistoryWriter).toBeUndefined();

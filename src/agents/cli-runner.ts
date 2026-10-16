@@ -65,6 +65,7 @@ import {
 } from "./cli-runner/delivery-evidence.js";
 import { createCliFailoverError } from "./cli-runner/exit-error.js";
 import { cliBackendLog, formatCliBackendOutputDigest } from "./cli-runner/log.js";
+import { composeCliPromptContext } from "./cli-runner/prompt-context.js";
 import {
   runClaudeCliAgentTurnWithDiagnostics,
   type ClaudeCliRunDiagnosticLifecycle,
@@ -273,7 +274,8 @@ async function runPreparedCliAgentOwned(
   const hasBeforeAgentRunHooks = hookRunner?.hasHooks("before_agent_run") === true;
   const needsHookHistory = hasLlmInputHooks || hasAgentEndHooks || hasBeforeAgentRunHooks;
   let historyMessages: unknown[] = [];
-  let promptForHooks = context.promptForHooks ?? params.prompt;
+  // Terminal conversation messages retain this turn; retry reseeds already live in history.
+  const currentTurnPrompt = composeCliPromptContext(params.prompt, context.promptContext);
   const imageCleanups = new Set<() => Promise<void>>();
   let qualifyAttempt: ReturnType<typeof createCliAttemptQualifier> | undefined;
   const contextWindowFields = () => ({
@@ -315,7 +317,7 @@ async function runPreparedCliAgentOwned(
     ...buildAgentHookConversationMessages({
       historyMessages,
       currentTurnMessages: [
-        buildCliHookUserMessage(promptForHooks),
+        buildCliHookUserMessage(currentTurnPrompt),
         ...(lastAssistant ? [lastAssistant] : []),
       ],
     }),
@@ -618,9 +620,6 @@ async function runPreparedCliAgentOwned(
       hasBeforeAgentRunHooks,
       historyMessages,
       imageCleanups,
-      onPromptForHooks: (prompt) => {
-        promptForHooks = prompt;
-      },
       onUserTurnHandled: (handled) => {
         userTurnHandled = handled;
       },

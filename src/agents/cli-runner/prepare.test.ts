@@ -10,6 +10,7 @@ import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { makeUserMessage } from "../../../test/helpers/user-message.js";
+import { prepareChannelRunAdmission } from "../../auto-reply/reply/channel-run-admission.js";
 import { buildGroupChatContext, buildGroupIntro } from "../../auto-reply/reply/groups.js";
 import {
   createReplyOperation,
@@ -39,6 +40,11 @@ import {
   claimHeartbeatOutcomeForRun,
   persistHeartbeatOutcome,
 } from "../../infra/heartbeat-outcome-store.js";
+import {
+  createHostChannelTurnSource,
+  createHostNonUserTurnSource,
+  projectHostTurnSource,
+} from "../../infra/host-turn-source.js";
 import { CliBackendAuthProfilePreparationError } from "../../plugins/cli-backend-errors.js";
 import type {
   CliBackendExecute,
@@ -2551,6 +2557,75 @@ describe("prepareCliRunContext", () => {
         assertHostActive: expect.any(Function),
       },
     );
+  });
+
+  it("gives before_prompt_build the prepared run's host turn source before admission", async () => {
+    const hookRunner = {
+      hasHooks: vi.fn((hookName: string) => hookName === "before_prompt_build"),
+      runBeforePromptBuild: vi.fn<HookRunner["runBeforePromptBuild"]>(async () => undefined),
+    };
+    mockGetGlobalHookRunner.mockReturnValue(hookRunner as never);
+    const turnSource = createHostChannelTurnSource({
+      actor: {
+        channel: "msteams",
+        accountId: "default",
+        senderId: "aad-owner",
+        actorKind: "human",
+      },
+      message: {
+        messageId: "activity-1",
+        conversationId: "teams-dm",
+        conversationKind: "direct",
+        eventKind: "message",
+      },
+    });
+    const preparedRunAdmission = prepareChannelRunAdmission({
+      cfg: {},
+      runId: "run-test",
+      agentId: "main",
+      ingressKind: "channel",
+      boundary: "test",
+      turnSource,
+      sessionKey: "agent:main:msteams:direct:aad-owner",
+    });
+
+    await fixture
+      .prepare({ sessionKey: "agent:main:msteams:direct:aad-owner", preparedRunAdmission })
+      .finally(preparedRunAdmission.close);
+
+    const promptContext = hookRunner.runBeforePromptBuild.mock.calls[0]?.[1];
+    expect(promptContext?.source).toEqual(
+      projectHostTurnSource(turnSource, "run-test", "agent:main:msteams:direct:aad-owner", 0),
+    );
+    expect(promptContext?.source?.completeness).toBe("complete");
+    expect(promptContext?.source?.inputs[0]).toMatchObject({
+      origin: "user",
+      actor: { channel: "msteams", senderId: "aad-owner", actorKind: "human" },
+    });
+  });
+
+  it("gives before_prompt_build an unavailable source for a non-user prepared run", async () => {
+    const hookRunner = {
+      hasHooks: vi.fn((hookName: string) => hookName === "before_prompt_build"),
+      runBeforePromptBuild: vi.fn<HookRunner["runBeforePromptBuild"]>(async () => undefined),
+    };
+    mockGetGlobalHookRunner.mockReturnValue(hookRunner as never);
+    // A gateway chat.send turn carries no channel admission source.
+    const preparedRunAdmission = prepareChannelRunAdmission({
+      cfg: {},
+      runId: "run-test",
+      agentId: "main",
+      ingressKind: "channel",
+      boundary: "test",
+      turnSource: createHostNonUserTurnSource("unknown"),
+      sessionKey: "agent:main:msteams:direct:aad-owner",
+    });
+
+    await fixture.prepare({ preparedRunAdmission }).finally(preparedRunAdmission.close);
+
+    const promptContext = hookRunner.runBeforePromptBuild.mock.calls[0]?.[1];
+    expect(promptContext?.source?.completeness).toBe("unavailable");
+    expect(promptContext?.source?.inputs.map((input) => input.origin)).toEqual(["unknown"]);
   });
 
   it("preserves the base prompt when prompt-build hooks fail", async () => {

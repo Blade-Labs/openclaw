@@ -5,6 +5,7 @@ import {
   type ExecutionIdentityAdmissionWork,
 } from "../audit/execution-identity-admission.js";
 import { withPostAdmissionExecutionOwnerBinding } from "../audit/execution-owner-binding.js";
+import { prepareChannelRunAdmission } from "../auto-reply/reply/channel-run-admission.js";
 import {
   rotateAgentRunRegistryLifecycleGeneration,
   validateAgentRunDelegatedAuthority,
@@ -660,5 +661,63 @@ describe("prepared run admission", () => {
     expect(validateAgentRunDelegatedAuthority(authority!)).toBe(false);
     releaseHook?.();
     await expect(admission).rejects.toThrow("closed during admission");
+  });
+});
+
+describe("prepared channel run source projection", () => {
+  it.each(["channel", "system", "schedule"] as const)(
+    "readSource() before admission equals the admitted projection when %s ingress omits the source",
+    async (ingressKind) => {
+      const prepared = prepareChannelRunAdmission({
+        cfg: {},
+        runId: `run-omitted-${ingressKind}`,
+        agentId: "main",
+        ingressKind,
+        boundary: "test",
+        sessionKey: "agent:main:msteams:direct:aad-owner",
+      });
+      try {
+        const before = prepared.readSource?.();
+        const admitted = await prepared.admit("embedded");
+        expect(before).toEqual(captureAdmittedRunSource(admitted).source);
+        expect(prepared.readSource?.()).toEqual(before);
+      } finally {
+        prepared.close();
+      }
+    },
+  );
+
+  it("readSource() before admission equals the admitted projection for a supplied channel source", async () => {
+    const turnSource = createHostChannelTurnSource({
+      actor: {
+        channel: "msteams",
+        accountId: "default",
+        senderId: "aad-owner",
+        actorKind: "human",
+      },
+      message: {
+        messageId: "activity-1",
+        conversationId: "teams-dm",
+        conversationKind: "direct",
+        eventKind: "message",
+      },
+    });
+    const prepared = prepareChannelRunAdmission({
+      cfg: {},
+      runId: "run-supplied",
+      agentId: "main",
+      ingressKind: "channel",
+      boundary: "test",
+      turnSource,
+      sessionKey: "agent:main:msteams:direct:aad-owner",
+    });
+    try {
+      const before = prepared.readSource?.();
+      expect(before?.completeness).toBe("complete");
+      const admitted = await prepared.admit("embedded");
+      expect(before).toEqual(captureAdmittedRunSource(admitted).source);
+    } finally {
+      prepared.close();
+    }
   });
 });

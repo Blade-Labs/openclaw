@@ -115,6 +115,11 @@ export type PreparedAgentRunAdmission = Readonly<{
   assertSourceCurrent: () => void;
   /** Host-only source restriction available before the runtime prepares its tools. */
   readOperatorAuthority?: () => AdmittedRunOperatorAuthority | undefined;
+  /**
+   * The run's turn-source projection before admission, so prompt-build hooks see
+   * the same facts the admitted context will project at revision 0.
+   */
+  readSource?: () => TurnSourceProvenance;
   /** Idempotently closes the exact delegated approval lease, if admission occurred. */
   close: () => void;
 }>;
@@ -464,14 +469,7 @@ export function prepareAgentRunAdmission(params: {
 }): PreparedAgentRunAdmission {
   const operationalRunInstance = params.operationalRunInstance;
   const turnSource =
-    params.turnSource ??
-    createHostNonUserTurnSource(
-      params.facts.ingress.kind === "schedule"
-        ? "cron"
-        : params.facts.ingress.kind === "system"
-          ? "system"
-          : "unknown",
-    );
+    params.turnSource ?? createDefaultAdmissionTurnSource(params.facts.ingress.kind);
   if (operationalRunInstance.runId !== params.facts.runId) {
     throw new Error("operational run instance disagrees with prepared admission");
   }
@@ -505,6 +503,13 @@ export function prepareAgentRunAdmission(params: {
   return Object.freeze({
     operationalRunInstance,
     assertSourceCurrent: () => assertSourceCurrent?.(),
+    readSource: () =>
+      projectHostTurnSource(
+        closed ? undefined : turnSource,
+        operationalRunInstance.runId,
+        params.sessionKey ?? null,
+        0,
+      ),
     readOperatorAuthority: () => {
       if (operatorAuthority) {
         if (closed) {
@@ -568,6 +573,19 @@ export function prepareAgentRunAdmission(params: {
       return admitted;
     },
   });
+}
+
+/**
+ * The non-user source an admission uses when its caller supplies none. Callers
+ * that project a source before admission must create it once and pass it on,
+ * so the projection and the admitted context share the same facts.
+ */
+export function createDefaultAdmissionTurnSource(
+  ingressKind: ExecutionIdentityAdmissionFacts["ingress"]["kind"],
+): HostTurnSource {
+  return createHostNonUserTurnSource(
+    ingressKind === "schedule" ? "cron" : ingressKind === "system" ? "system" : "unknown",
+  );
 }
 
 /** Resolves a host-only continuation or validates an already-admitted internal caller. */

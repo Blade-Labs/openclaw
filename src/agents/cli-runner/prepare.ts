@@ -57,6 +57,7 @@ import type { SkillUsagePath } from "../../skills/types.js";
 import { resolveUserPath } from "../../utils.js";
 import { normalizeMessageChannel } from "../../utils/message-channel.js";
 import {
+  captureAdmittedRunSource,
   resolveAdmittedRunActiveAssertion,
   resolvePreparedRunAdmission,
 } from "../admitted-run-context.js";
@@ -1011,6 +1012,11 @@ async function prepareCliRunContextWithinReadFence(
     openClawHistoryMessages ??= await loadCliSessionHistoryMessages(params);
     return openClawHistoryMessages;
   };
+  // The same host turn source the agent-run hook projects, so prompt-build
+  // plugins can qualify the turn before preparing a memory-bearing prompt.
+  const promptBuildTurnSource = params.admittedRunContext
+    ? captureAdmittedRunSource(params.admittedRunContext).source
+    : params.preparedRunAdmission?.readSource?.();
   const promptBuildHookContext = {
     runId: params.runId,
     agentId: sessionAgentId,
@@ -1021,6 +1027,7 @@ async function prepareCliRunContextWithinReadFence(
     modelId,
     trigger: params.trigger,
     inputProvenance: params.inputProvenance,
+    ...(promptBuildTurnSource ? { source: promptBuildTurnSource } : {}),
     ...buildAgentHookContextChannelFields(params),
   };
   const promptBuildHookRunner = skipsTurnPreparation ? undefined : getGlobalHookRunner();
